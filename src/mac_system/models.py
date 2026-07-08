@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Field as SQLField, SQLModel, JSON, Column
 
 
@@ -120,8 +120,7 @@ class ProjectOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ApprovalResponse(BaseModel):
