@@ -1,0 +1,123 @@
+{
+  "task_type": "bug_fix",
+  "description": "Bug 修复流程",
+  "initial_state": "BUG_ANALYSIS",
+  "states": {
+    "INIT": {
+      "type": "system_action",
+      "action": "create_project",
+      "display": "初始化",
+      "next_states": {
+        "start": "BUG_ANALYSIS"
+      }
+    },
+    "BUG_ANALYSIS": {
+      "type": "agent_execution",
+      "agent": "planner",
+      "stage": "bug_analysis",
+      "display": "Bug 分析中",
+      "next_states": {
+        "complete": "BUG_FIX_CONFIRM_PENDING",
+        "fail": "FAILED"
+      }
+    },
+    "BUG_FIX_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认修复方案",
+      "next_states": {
+        "confirm": "CODING",
+        "reject": "BUG_ANALYSIS"
+      }
+    },
+    "CODING": {
+      "type": "agent_execution",
+      "agent": "coder",
+      "display": "修复代码中",
+      "next_states": {
+        "complete": "TESTING",
+        "fail": "FAILED",
+        "clarify": "CLARIFICATION_PENDING",
+        "conflict": "CONFLICT_PENDING",
+        "bug_analysis_question": "BUG_ANALYSIS"
+      }
+    },
+    "CLARIFICATION_PENDING": {
+      "type": "human_input",
+      "input_purpose": "clarification",
+      "display": "等待澄清",
+      "next_states": {
+        "answer": "CODING",
+        "needs_bug_analysis_change": "BUG_ANALYSIS"
+      }
+    },
+    "CONFLICT_PENDING": {
+      "type": "human_input",
+      "input_purpose": "conflict_resolution",
+      "display": "等待冲突裁决",
+      "next_states": {
+        "resolve": "CODING",
+        "needs_bug_analysis_change": "BUG_ANALYSIS"
+      }
+    },
+    "TESTING": {
+      "type": "agent_execution",
+      "agent": "tester",
+      "display": "测试中",
+      "next_states": {
+        "complete": "REVIEW",
+        "fail": "CODING",
+        "fail_max_retries": "FAILED"
+      }
+    },
+    "REVIEW": {
+      "type": "agent_execution",
+      "agent": "reviewer",
+      "display": "Review 中",
+      "next_states": {
+        "complete": "ACCEPTANCE_PENDING",
+        "fail": "CODING",
+        "fail_max_retries": "FAILED"
+      }
+    },
+    "ACCEPTANCE_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待验收",
+      "next_states": {
+        "confirm": "MERGING",
+        "reject": "CODING",
+        "reject_to_analysis": "BUG_ANALYSIS"
+      }
+    },
+    "MERGING": {
+      "type": "system_action",
+      "action": "git_commit_push",
+      "display": "提交代码中",
+      "next_states": {
+        "complete": "COMPLETED",
+        "fail": "FAILED"
+      }
+    },
+    "COMPLETED": {
+      "type": "terminal",
+      "success": true,
+      "display": "已完成"
+    },
+    "FAILED": {
+      "type": "terminal",
+      "success": false,
+      "display": "失败"
+    },
+    "CANCELLED": {
+      "type": "terminal",
+      "success": false,
+      "display": "已取消"
+    },
+    "PAUSED": {
+      "type": "idle",
+      "display": "已暂停",
+      "next_states": {
+        "resume": "<previous_state>"
+      }
+    }
+  }
+}

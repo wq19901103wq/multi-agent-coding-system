@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/bug_analysis.json",
+  "title": "BUG_ANALYSIS.json",
+  "type": "object",
+  "required": ["summary", "root_cause", "fix_strategy", "affected_files"],
+  "additionalProperties": false,
+  "properties": {
+    "summary": {"type": "string"},
+    "root_cause": {"type": "string"},
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": {"type": "string"},
+        "expected": {"type": "string"},
+        "actual": {"type": "string"}
+      }
+    },
+    "fix_strategy": {"type": "string"},
+    "affected_files": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "risks": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

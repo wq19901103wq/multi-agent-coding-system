@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/acceptance_evaluator_output.json",
+  "title": "Acceptance Evaluator Output",
+  "type": "object",
+  "required": ["success", "next_state_event", "result", "summary", "evidence"],
+  "additionalProperties": false,
+  "properties": {
+    "success": {"type": "boolean"},
+    "next_state_event": {"type": "string"},
+    "result": {"enum": ["pending_human_review", "pass", "fail"]},
+    "summary": {"type": "string"},
+    "evidence": {
+      "type": "object",
+      "required": ["tests_passed", "review_result", "meets_requirements"],
+      "properties": {
+        "tests_passed": {"type": "boolean"},
+        "coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "review_result": {"enum": ["pass", "fail"]},
+        "meets_requirements": {"type": "boolean"}
+      }
+    },
+    "recommendation": {
+      "type": "object",
+      "properties": {
+        "action": {"enum": ["confirm", "reject_to_coding", "reject_to_specs", "reject_to_architecture", "reject_to_requirements"]},
+        "reason": {"type": "string"}
+      }
+    }
+  }
+}

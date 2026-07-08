@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/architecture.json",
+  "title": "ARCHITECTURE.json",
+  "type": "object",
+  "required": ["summary", "tech_stack", "modules", "decisions"],
+  "additionalProperties": false,
+  "properties": {
+    "summary": {"type": "string"},
+    "tech_stack": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "responsibility", "files"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "responsibility": {"type": "string"},
+          "files": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "topic", "options", "recommended", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "topic": {"type": "string"},
+          "options": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "required": ["key", "label"],
+              "additionalProperties": false,
+              "properties": {
+                "key": {"type": "string"},
+                "label": {"type": "string"},
+                "description": {"type": "string"}
+              }
+            }
+          },
+          "recommended": {"type": "string"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "resolved_decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["decision_id", "chosen_key"],
+        "properties": {
+          "decision_id": {"type": "string"},
+          "chosen_key": {"type": "string"}
+        }
+      }
+    }
+  }
+}

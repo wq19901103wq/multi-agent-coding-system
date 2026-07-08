@@ -1,0 +1,113 @@
+{
+  "task_type": "documentation",
+  "description": "文档编写/更新流程",
+  "initial_state": "DOC_OUTLINE",
+  "states": {
+    "INIT": {
+      "type": "system_action",
+      "action": "create_project",
+      "display": "初始化",
+      "next_states": {
+        "start": "DOC_OUTLINE"
+      }
+    },
+    "DOC_OUTLINE": {
+      "type": "agent_execution",
+      "agent": "planner",
+      "stage": "doc_outline",
+      "display": "大纲设计中",
+      "next_states": {
+        "complete": "OUTLINE_CONFIRM_PENDING",
+        "fail": "FAILED"
+      }
+    },
+    "OUTLINE_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认大纲",
+      "next_states": {
+        "confirm": "CODING",
+        "reject": "DOC_OUTLINE"
+      }
+    },
+    "CODING": {
+      "type": "agent_execution",
+      "agent": "coder",
+      "display": "文档编写中",
+      "next_states": {
+        "complete": "REVIEW",
+        "fail": "FAILED",
+        "clarify": "CLARIFICATION_PENDING",
+        "conflict": "CONFLICT_PENDING",
+        "outline_question": "DOC_OUTLINE"
+      }
+    },
+    "CLARIFICATION_PENDING": {
+      "type": "human_input",
+      "input_purpose": "clarification",
+      "display": "等待澄清",
+      "next_states": {
+        "answer": "CODING",
+        "needs_outline_change": "DOC_OUTLINE"
+      }
+    },
+    "CONFLICT_PENDING": {
+      "type": "human_input",
+      "input_purpose": "conflict_resolution",
+      "display": "等待冲突裁决",
+      "next_states": {
+        "resolve": "CODING",
+        "needs_outline_change": "DOC_OUTLINE"
+      }
+    },
+    "REVIEW": {
+      "type": "agent_execution",
+      "agent": "reviewer",
+      "display": "Review 中",
+      "next_states": {
+        "complete": "ACCEPTANCE_PENDING",
+        "fail": "CODING",
+        "fail_max_retries": "FAILED"
+      }
+    },
+    "ACCEPTANCE_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待验收",
+      "next_states": {
+        "confirm": "MERGING",
+        "reject": "CODING",
+        "reject_to_outline": "DOC_OUTLINE"
+      }
+    },
+    "MERGING": {
+      "type": "system_action",
+      "action": "git_commit_push",
+      "display": "提交文档中",
+      "next_states": {
+        "complete": "COMPLETED",
+        "fail": "FAILED"
+      }
+    },
+    "COMPLETED": {
+      "type": "terminal",
+      "success": true,
+      "display": "已完成"
+    },
+    "FAILED": {
+      "type": "terminal",
+      "success": false,
+      "display": "失败"
+    },
+    "CANCELLED": {
+      "type": "terminal",
+      "success": false,
+      "display": "已取消"
+    },
+    "PAUSED": {
+      "type": "idle",
+      "display": "已暂停",
+      "next_states": {
+        "resume": "<previous_state>"
+      }
+    }
+  }
+}

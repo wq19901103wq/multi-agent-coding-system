@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/state.json",
+  "title": "STATE.json",
+  "type": "object",
+  "required": ["version", "project_id", "current_state", "context", "history"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "project_id": {
+      "type": "string"
+    },
+    "current_state": {
+      "type": "string"
+    },
+    "previous_state": {
+      "type": ["string", "null"]
+    },
+    "pending_approval": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["approval_id", "type", "state", "question", "options"],
+          "additionalProperties": false,
+          "properties": {
+            "approval_id": {"type": "string"},
+            "type": {"enum": ["confirmation", "input"]},
+            "state": {"type": "string"},
+            "question": {"type": "string"},
+            "options": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["action", "label", "next_state"],
+                "additionalProperties": false,
+                "properties": {
+                  "action": {"type": "string"},
+                  "label": {"type": "string"},
+                  "next_state": {"type": "string"}
+                }
+              }
+            },
+            "payload": {"type": "object"}
+          }
+        }
+      ]
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "task_type": {"type": "string"},
+        "description": {"type": "string"},
+        "approval_mode": {"type": "string"},
+        "retry_counts": {"type": "object"}
+      }
+    },
+    "history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["state", "entered_at"],
+        "additionalProperties": false,
+        "properties": {
+          "state": {"type": "string"},
+          "entered_at": {"type": "string", "format": "date-time"}
+        }
+      }
+    }
+  }
+}

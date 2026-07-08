@@ -1,0 +1,93 @@
+{
+  "version": "1.0",
+  "approval_modes_path": "specs/approval_modes.json",
+  "agents": {
+    "planner": {
+      "model": "claude-sonnet-4-20250514",
+      "description": "负责需求分析、架构设计和 Spec 拆分",
+      "skills": [
+        "brainstorming",
+        "grill-me",
+        "spec-kit"
+      ],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "stages": {
+        "requirements": {
+          "prompt_file": "prompts/planner_requirements.md",
+          "output_file": "REQUIREMENTS.json",
+          "output_schema": "specs/schemas/requirements.json",
+          "skills": ["brainstorming", "grill-me"]
+        },
+        "architecture": {
+          "prompt_file": "prompts/planner_architecture.md",
+          "output_file": "ARCHITECTURE.json",
+          "output_schema": "specs/schemas/architecture.json",
+          "skills": ["spec-kit"]
+        },
+        "specs": {
+          "prompt_file": "prompts/planner_specs.md",
+          "output_file": "SPECS.json",
+          "output_schema": "specs/schemas/specs.json",
+          "skills": ["spec-kit"]
+        },
+        "bug_analysis": {
+          "prompt_file": "prompts/planner_bug_analysis.md",
+          "output_file": "BUG_ANALYSIS.json",
+          "output_schema": "specs/schemas/bug_analysis.json",
+          "skills": ["grill-me"]
+        },
+        "doc_outline": {
+          "prompt_file": "prompts/planner_doc_outline.md",
+          "output_file": "DOC_OUTLINE.json",
+          "output_schema": "specs/schemas/doc_outline.json",
+          "skills": ["brainstorming"]
+        }
+      }
+    },
+    "coder": {
+      "model": "claude-sonnet-4-20250514",
+      "description": "根据 Spec 编写代码或文档",
+      "skills": [],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "prompt_file": "prompts/coder.md",
+      "output_file": "TASK.json",
+      "output_schema": "specs/schemas/coder_output.json"
+    },
+    "tester": {
+      "model": "claude-sonnet-4-20250514",
+      "description": "运行测试并验证实现",
+      "skills": [],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "prompt_file": "prompts/tester.md",
+      "output_file": "TASK.json",
+      "output_schema": "specs/schemas/tester_output.json"
+    },
+    "reviewer": {
+      "model": "claude-sonnet-4-20250514",
+      "description": "Review 代码并给出验收结论",
+      "skills": ["chinese-code-review"],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "prompt_file": "prompts/reviewer.md",
+      "output_file": "TASK.json",
+      "output_schema": "specs/schemas/reviewer_output.json"
+    },
+    "acceptance_evaluator": {
+      "model": "claude-sonnet-4-20250514",
+      "description": "根据测试和 Review 结果给出最终验收建议",
+      "skills": [],
+      "default_allowed_tools": ["Read"],
+      "prompt_file": "prompts/acceptance_evaluator.md",
+      "output_file": "TASK.json",
+      "output_schema": "specs/schemas/acceptance_evaluator_output.json"
+    },
+    "project_manager": {
+      "model": "claude-sonnet-4-20250514",
+      "description": "处理用户追问、生成确认摘要、推荐下一步动作",
+      "skills": [],
+      "default_allowed_tools": ["Read"],
+      "prompt_file": "prompts/project_manager.md",
+      "output_file": "TASK.json",
+      "output_schema": "specs/schemas/project_manager_output.json"
+    }
+  }
+}

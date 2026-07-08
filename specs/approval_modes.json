@@ -1,0 +1,56 @@
+{
+  "version": "1.0",
+  "timezone": "Asia/Shanghai",
+  "modes": {
+    "strict": {
+      "description": "所有关键节点都需要人工确认",
+      "require_confirmation_for": [
+        "REQUIREMENT_CONFIRM_PENDING",
+        "ARCHITECTURE_CONFIRM_PENDING",
+        "SPEC_CONFIRM_PENDING",
+        "CLARIFICATION_PENDING",
+        "CONFLICT_PENDING",
+        "ACCEPTANCE_PENDING"
+      ],
+      "auto_resolve_clarification": false,
+      "auto_resolve_conflict": false,
+      "auto_resolve_strategy": "none"
+    },
+    "normal": {
+      "description": "默认模式，关键确认点需要人工，澄清/冲突需要人工",
+      "require_confirmation_for": [
+        "REQUIREMENT_CONFIRM_PENDING",
+        "ARCHITECTURE_CONFIRM_PENDING",
+        "SPEC_CONFIRM_PENDING",
+        "ACCEPTANCE_PENDING"
+      ],
+      "auto_resolve_clarification": false,
+      "auto_resolve_conflict": false,
+      "auto_resolve_strategy": "none"
+    },
+    "night": {
+      "description": "夜间自动放宽，仅需求和验收需要确认",
+      "require_confirmation_for": [
+        "REQUIREMENT_CONFIRM_PENDING",
+        "ACCEPTANCE_PENDING"
+      ],
+      "auto_resolve_clarification": true,
+      "auto_resolve_conflict": true,
+      "auto_resolve_strategy": "project_manager_default",
+      "night_window": {
+        "start_time": "23:00",
+        "end_time": "08:00",
+        "timezone": "Asia/Shanghai"
+      }
+    },
+    "auto": {
+      "description": "高信任度任务，仅最终验收需要确认",
+      "require_confirmation_for": [
+        "ACCEPTANCE_PENDING"
+      ],
+      "auto_resolve_clarification": true,
+      "auto_resolve_conflict": true,
+      "auto_resolve_strategy": "project_manager_default"
+    }
+  }
+}

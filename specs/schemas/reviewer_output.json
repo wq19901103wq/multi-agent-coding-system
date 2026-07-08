@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/reviewer_output.json",
+  "title": "Reviewer Output",
+  "type": "object",
+  "required": ["success", "next_state_event", "result"],
+  "additionalProperties": false,
+  "properties": {
+    "success": {"type": "boolean"},
+    "next_state_event": {"type": "string"},
+    "result": {"enum": ["pass", "fail"]},
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "description"],
+        "properties": {
+          "severity": {"enum": ["minor", "major", "critical"]},
+          "file": {"type": "string"},
+          "line": {"type": "integer"},
+          "description": {"type": "string"}
+        }
+      }
+    },
+    "summary": {"type": "string"},
+    "notes": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}
