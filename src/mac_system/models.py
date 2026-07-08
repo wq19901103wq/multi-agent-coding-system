@@ -91,6 +91,14 @@ class EventLog(SQLModel, table=True):
     created_at: datetime = SQLField(default_factory=datetime.utcnow)
 
 
+class ProjectUser(SQLModel, table=True):
+    __tablename__ = "project_users"
+
+    project_id: str = SQLField(foreign_key="projects.id", primary_key=True)
+    open_id: str = SQLField(primary_key=True)
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
 # Pydantic API schemas
 
 class ProjectCreate(BaseModel):

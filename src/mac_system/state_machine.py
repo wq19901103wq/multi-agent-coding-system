@@ -46,6 +46,9 @@ class StateMachine:
     def is_system_action(self, name: str) -> bool:
         return self.state_type(name) == "system_action"
 
+    def is_idle(self, name: str) -> bool:
+        return self.state_type(name) == "idle"
+
     def display_name(self, name: str) -> str:
         return self.get_state(name).get("display", name)
 
