@@ -14,7 +14,7 @@ class WorktreeManagerError(Exception):
 
 class WorktreeManager:
     def __init__(self, projects_dir: Path):
-        self.projects_dir = Path(projects_dir)
+        self.projects_dir = Path(projects_dir).resolve()
 
     def create_worktree(
         self,
@@ -30,7 +30,7 @@ class WorktreeManager:
             name_parts.append(stage)
         name_parts.extend([task_id, timestamp])
         worktree_name = "_".join(name_parts)
-        worktree_path = workspace / "worktrees" / worktree_name
+        worktree_path = (workspace / "worktrees" / worktree_name).resolve()
 
         branch_name = f"mac/{project_id}/{agent_type}/{task_id}"
 
