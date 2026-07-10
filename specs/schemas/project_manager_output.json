@@ -7,10 +7,25 @@
   "additionalProperties": false,
   "properties": {
     "success": {"type": "boolean"},
+    "next_state_event": {"type": "string"},
     "reply": {"type": "string"},
     "suggested_action": {
-      "enum": ["none", "continue", "rollback_to_requirements", "rollback_to_architecture", "rollback_to_specs", "rollback_to_coding", "escalate_to_human"]
+      "enum": [
+        "none",
+        "confirm",
+        "reject",
+        "answer",
+        "continue",
+        "rollback_to_requirements",
+        "rollback_to_architecture",
+        "rollback_to_specs",
+        "rollback_to_coding",
+        "rollback_to_analysis",
+        "rollback_to_outline",
+        "escalate_to_human"
+      ]
     },
+    "clarification_answer": {"type": "string"},
     "updated_summary": {"type": "string"},
     "notes": {
       "type": "array",

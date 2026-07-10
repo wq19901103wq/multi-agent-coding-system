@@ -1,0 +1,204 @@
+"""Interactive menu cards for the Feishu bot.
+
+All menu buttons set ``value.action`` to ``"menu"`` and put the actual semantic
+in ``value.option_key``. This lets the shared card-action handler distinguish
+menu clicks from approval/decision buttons.
+"""
+
+from typing import Any
+
+
+def _plain_text(content: str) -> dict[str, Any]:
+    return {"tag": "plain_text", "content": content}
+
+
+def _lark_md(content: str) -> dict[str, Any]:
+    return {"tag": "lark_md", "content": content}
+
+
+def _header(title: str, color: str = "blue") -> dict[str, Any]:
+    return {"title": _plain_text(title), "template": color}
+
+
+def _menu_button(
+    label: str,
+    option_key: str,
+    button_type: str = "default",
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "action": "menu",
+        "option_key": option_key,
+        "state": "",
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+    }
+    return {
+        "tag": "button",
+        "text": _plain_text(label),
+        "type": button_type,
+        "value": value,
+    }
+
+
+def build_main_menu_card(
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Main entry menu."""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header("MAC System 助手", "blue"),
+        "elements": [
+            {"tag": "div", "text": _lark_md("请选择你要执行的操作：")},
+            {
+                "tag": "action",
+                "actions": [
+                    _menu_button("创建项目", "create_prompt", "primary", chat_id, chat_type),
+                    _menu_button("查看我的项目", "list_projects_status", chat_id=chat_id, chat_type=chat_type),
+                    _menu_button("绑定到项目", "list_projects_bind", chat_id=chat_id, chat_type=chat_type),
+                ],
+            },
+        ],
+    }
+
+
+def build_project_list_card(
+    projects: list[dict[str, Any]],
+    mode: str = "status",
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """List projects as clickable buttons.
+
+    ``mode`` is either ``status`` (view status) or ``bind`` (bind user).
+    """
+    if not projects:
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": _header("暂无项目", "grey"),
+            "elements": [
+                {"tag": "div", "text": _lark_md("还没有项目，点击“创建项目”开始。")},
+                {"tag": "action", "actions": [_menu_button("返回", "show_menu", chat_id=chat_id, chat_type=chat_type)]},
+            ],
+        }
+
+    elements: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+    for p in projects:
+        project_id = p["id"]
+        label = f"{p.get('name') or project_id} ({p['current_state']})"
+        if mode == "status":
+            actions.append(_menu_button(label, f"status:{project_id}", chat_id=chat_id, chat_type=chat_type))
+        else:
+            actions.append(_menu_button(label, f"bind:{project_id}", chat_id=chat_id, chat_type=chat_type))
+
+    # Feishu action rows look best with a few buttons; group into rows of 2.
+    rows: list[dict[str, Any]] = []
+    for i in range(0, len(actions), 2):
+        rows.append({"tag": "action", "actions": actions[i : i + 2]})
+
+    title = "选择项目查看状态" if mode == "status" else "选择项目绑定"
+    elements.append({"tag": "div", "text": _lark_md("点击一个项目：")})
+    elements.extend(rows)
+    elements.append({"tag": "action", "actions": [_menu_button("返回", "show_menu", chat_id=chat_id, chat_type=chat_type)]})
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header(title, "blue"),
+        "elements": elements,
+    }
+
+
+def build_create_prompt_card(
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Prompt the user to reply with a description."""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header("创建项目", "blue"),
+        "elements": [
+            {
+                "tag": "div",
+                "text": _lark_md(
+                    "请直接回复一句话描述这个项目的需求。\n\n"
+                    "例如：实现一个 config-validator CLI"
+                ),
+            },
+            {"tag": "action", "actions": [_menu_button("返回", "show_menu", chat_id=chat_id, chat_type=chat_type)]},
+        ],
+    }
+
+
+def build_intent_confirm_card(
+    task_type: str,
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Ask the user to confirm or override the inferred task type."""
+    all_types = ["feature", "bug_fix", "documentation"]
+    actions: list[dict[str, Any]] = [
+        _menu_button(
+            f"是，{task_type}",
+            f"intent_confirm:{task_type}",
+            "primary",
+            chat_id,
+            chat_type,
+        ),
+    ]
+    for other in all_types:
+        if other != task_type:
+            actions.append(
+                _menu_button(
+                    f"否，是 {other}",
+                    f"intent_confirm:{other}",
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                )
+            )
+    actions.append(_menu_button("重新描述", "create_prompt", chat_id=chat_id, chat_type=chat_type))
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header("确认任务类型", "orange"),
+        "elements": [
+            {
+                "tag": "div",
+                "text": _lark_md(
+                    f"这看起来是一个 **{task_type}** 任务，对吗？"
+                ),
+            },
+            {"tag": "action", "actions": actions},
+        ],
+    }
+
+
+def build_restart_type_card(
+    project_id: str,
+    description: str,
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Ask the user to pick a new task type when restarting a project."""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header("重新归类创建", "orange"),
+        "elements": [
+            {
+                "tag": "div",
+                "text": _lark_md(
+                    f"项目 **{project_id}** 当前要重新归类。\n\n"
+                    f"原始描述：{description[:200]}"
+                ),
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    _menu_button("Feature", f"restart_with_type:{project_id}:feature", "primary", chat_id, chat_type),
+                    _menu_button("Bug Fix", f"restart_with_type:{project_id}:bug_fix", chat_id=chat_id, chat_type=chat_type),
+                    _menu_button("Documentation", f"restart_with_type:{project_id}:documentation", chat_id=chat_id, chat_type=chat_type),
+                ],
+            },
+        ],
+    }

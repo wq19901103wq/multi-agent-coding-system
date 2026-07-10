@@ -43,6 +43,9 @@ class Project(SQLModel, table=True):
     updated_at: datetime = SQLField(default_factory=datetime.utcnow)
     context: dict = SQLField(default_factory=dict, sa_column=Column(JSON))
     approval_config: dict = SQLField(default_factory=dict, sa_column=Column(JSON))
+    total_cost_usd: Optional[float] = SQLField(default=0.0, nullable=True)
+    feishu_chat_id: Optional[str] = SQLField(default=None, nullable=True)
+    feishu_chat_type: str = SQLField(default="p2p", nullable=True)
 
 
 class Task(SQLModel, table=True):
@@ -99,6 +102,25 @@ class ProjectUser(SQLModel, table=True):
     created_at: datetime = SQLField(default_factory=datetime.utcnow)
 
 
+class PendingIntent(SQLModel, table=True):
+    __tablename__ = "pending_intents"
+
+    open_id: str = SQLField(primary_key=True)
+    description: Optional[str] = None
+    stage: str  # awaiting_description | awaiting_type_confirm
+    chat_id: Optional[str] = SQLField(default=None, nullable=True)
+    chat_type: str = SQLField(default="p2p", nullable=True)
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class ProcessedEvent(SQLModel, table=True):
+    __tablename__ = "processed_events"
+
+    event_id: str = SQLField(primary_key=True)
+    event_type: str  # message | card
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
 # Pydantic API schemas
 
 class ProjectCreate(BaseModel):
@@ -106,6 +128,9 @@ class ProjectCreate(BaseModel):
     task_type: TaskType
     description: str
     approval_mode: str = "normal"  # strict, normal, night, auto
+    creator_open_id: Optional[str] = None
+    feishu_chat_id: Optional[str] = None
+    feishu_chat_type: str = "p2p"
 
 
 class ProjectOut(BaseModel):
@@ -117,6 +142,7 @@ class ProjectOut(BaseModel):
     current_state: str
     previous_state: Optional[str]
     workspace_path: str
+    total_cost_usd: Optional[float]
     created_at: datetime
     updated_at: datetime
 
@@ -135,8 +161,9 @@ class UserCommand(BaseModel):
     message: Optional[str] = None
 
 
-class IntentResult(BaseModel):
-    intent: str
+class RouteDecision(BaseModel):
+    task_type: str | None
+    initial_state: str | None
     confidence: float
-    target_state: Optional[str] = None
-    reason: Optional[str] = None
+    needs_disambiguation: bool
+    reason: str | None = None

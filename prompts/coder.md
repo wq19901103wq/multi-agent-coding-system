@@ -9,6 +9,12 @@
 - 写出的代码必须能通过 pytest
 - 实现完成后写入 TASK.json 的 output 字段
 
+## 文件目录约定（必须遵守）
+- 所有业务代码必须放在 `src/` 目录下，例如 `src/hello.py`
+- 所有测试代码必须放在 `tests/` 目录下，例如 `tests/test_hello.py`
+- 严禁在 workspace 根目录直接创建 `.py` 文件
+- 如果 `SPECS.json` 中 `affected_files` 已经指定路径，必须严格按该路径创建
+
 ## 输入
 {{context_files}}
 
@@ -21,16 +27,19 @@
 
 ## 输出要求
 
-将结果写入 `{{worktree_path}}/.mac/TASK.json` 的 `output` 字段：
+将结果写入 `{{worktree_path}}/.mac/TASK.json` 的 `output` 字段，字段格式必须严格符合 JSON Schema：`{{output_schema_path}}`
+
+最终回复必须是**合法的 JSON 对象，且只能是 JSON，不要添加 markdown 代码块、不要添加任何解释性文字**。示例：
 
 ```json
 {
   "success": true,
   "next_state_event": "complete",
   "modified_files": [
-    {"path": "src/...", "description": "..."}
+    {"path": "src/hello.py", "description": "实现 hello 功能"},
+    {"path": "tests/test_hello.py", "description": "对应测试"}
   ],
-  "notes": ["..."]
+  "notes": []
 }
 ```
 

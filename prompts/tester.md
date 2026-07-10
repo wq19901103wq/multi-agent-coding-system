@@ -5,9 +5,14 @@
 ## 规则
 - 只能在 `{{worktree_path}}` 内写入文件
 - 不能修改 `STATE.json`
-- 可以补充测试用例
+- 可以补充测试用例，但新增的测试文件必须放在 `tests/` 目录
 - 运行 `pytest` 并收集结果
 - 结果写入 TASK.json 的 output 字段
+
+## 文件目录约定（必须遵守）
+- 新增或修改的测试文件必须放在 `tests/` 目录下
+- 业务代码读取自 `src/` 目录
+- 严禁在 workspace 根目录直接创建 `.py` 文件
 
 ## 输入
 {{context_files}}
@@ -21,14 +26,16 @@
 
 ## 输出要求
 
-将结果写入 `{{worktree_path}}/.mac/TASK.json` 的 `output` 字段：
+将结果写入 `{{worktree_path}}/.mac/TASK.json` 的 `output` 字段，字段格式必须严格符合 JSON Schema：`{{output_schema_path}}`
+
+最终回复必须是**合法的 JSON 对象，且只能是 JSON，不要添加 markdown 代码块、不要添加任何解释性文字**。示例：
 
 ```json
 {
   "success": true,
   "next_state_event": "complete",
   "passed": true,
-  "test_files": ["tests/test_xxx.py"],
+  "test_files": ["tests/test_hello.py"],
   "coverage": 0.85,
   "failures": [],
   "report": "pytest 输出摘要",

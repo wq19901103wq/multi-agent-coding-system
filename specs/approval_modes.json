@@ -4,26 +4,16 @@
   "modes": {
     "strict": {
       "description": "所有关键节点都需要人工确认",
-      "require_confirmation_for": [
-        "REQUIREMENT_CONFIRM_PENDING",
-        "ARCHITECTURE_CONFIRM_PENDING",
-        "SPEC_CONFIRM_PENDING",
-        "CLARIFICATION_PENDING",
-        "CONFLICT_PENDING",
-        "ACCEPTANCE_PENDING"
-      ],
+      "require_confirmation_for": [],
+      "require_confirmation_for_types": ["human_confirmation", "human_input"],
       "auto_resolve_clarification": false,
       "auto_resolve_conflict": false,
       "auto_resolve_strategy": "none"
     },
     "normal": {
       "description": "默认模式，关键确认点需要人工，澄清/冲突需要人工",
-      "require_confirmation_for": [
-        "REQUIREMENT_CONFIRM_PENDING",
-        "ARCHITECTURE_CONFIRM_PENDING",
-        "SPEC_CONFIRM_PENDING",
-        "ACCEPTANCE_PENDING"
-      ],
+      "require_confirmation_for": [],
+      "require_confirmation_for_types": ["human_confirmation"],
       "auto_resolve_clarification": false,
       "auto_resolve_conflict": false,
       "auto_resolve_strategy": "none"
@@ -34,6 +24,7 @@
         "REQUIREMENT_CONFIRM_PENDING",
         "ACCEPTANCE_PENDING"
       ],
+      "require_confirmation_for_types": [],
       "auto_resolve_clarification": true,
       "auto_resolve_conflict": true,
       "auto_resolve_strategy": "project_manager_default",
@@ -48,6 +39,7 @@
       "require_confirmation_for": [
         "ACCEPTANCE_PENDING"
       ],
+      "require_confirmation_for_types": [],
       "auto_resolve_clarification": true,
       "auto_resolve_conflict": true,
       "auto_resolve_strategy": "project_manager_default"

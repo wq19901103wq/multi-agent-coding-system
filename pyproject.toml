@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.6.0",
     "sqlmodel>=0.0.22",
     "click>=8.1.0",
+    "pexpect>=4.9.0",
 ]
 
 [project.optional-dependencies]

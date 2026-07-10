@@ -91,14 +91,42 @@ class WorktreeManager:
         with open(worktree / ".mac" / "TASK.json", "w", encoding="utf-8") as f:
             json.dump(task_doc, f, ensure_ascii=False, indent=2)
 
+    def commit_worktree_changes(
+        self,
+        worktree: Path,
+        message: str,
+    ) -> None:
+        """Stage and commit agent changes inside a worktree.
+
+        .mac/ files are orchestrator-managed and should not be committed into
+        the agent branch, otherwise merging the branch pollutes the workspace
+        .mac directory and causes subsequent merges to conflict.
+        """
+        worktree = Path(worktree).resolve()
+        repo = Repo(worktree)
+        if repo.is_dirty(untracked_files=True):
+            repo.git.add("-A")
+            # Unstage orchestrator-managed and generated files.
+            repo.git.reset("--", ".mac", "__pycache__", ".coverage")
+            # If nothing remains staged, there is nothing to commit.
+            if not repo.index.diff("HEAD", staged=True):
+                return
+            repo.git.commit("-m", message)
+
     def merge_worktree(
         self,
         project_id: str,
         task_id: str,
         agent_type: str,
+        worktree: Path | None = None,
     ) -> None:
         workspace = self._workspace(project_id)
         branch_name = f"mac/{project_id}/{agent_type}/{task_id}"
+
+        if worktree is not None:
+            self.commit_worktree_changes(
+                worktree, f"[{agent_type}] {task_id} agent changes"
+            )
 
         repo = Repo(workspace)
         try:
@@ -139,6 +167,41 @@ class WorktreeManager:
             capture_output=True,
             text=True,
         )
+
+    def remove_all_worktrees(self, project_id: str) -> None:
+        """Remove every worktree and matching branch for a project.
+
+        Used when a project is cancelled/restarted so that orphan worktrees do
+        not accumulate.
+        """
+        workspace = self._workspace(project_id)
+        if not workspace.exists():
+            return
+
+        for wt in self.list_worktrees(project_id):
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "-f", str(wt)],
+                    cwd=workspace,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                pass
+
+        # Clean up any leftover mac/ branches.
+        try:
+            repo = Repo(workspace)
+            prefix = f"mac/{project_id}/"
+            for branch in list(repo.branches):
+                if branch.name.startswith(prefix):
+                    try:
+                        repo.git.branch("-D", branch.name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def list_worktrees(self, project_id: str) -> list[Path]:
         workspace = self._workspace(project_id)

@@ -19,8 +19,7 @@
 
 ## 输出要求
 
-将分析结果写入 `{{worktree_path}}/.mac/REQUIREMENTS.json`，格式必须符合 JSON Schema：
-`{{workspace_path}}/specs/schemas/requirements.json`
+将分析结果写入 `{{worktree_path}}/.mac/REQUIREMENTS.json`，格式必须符合 JSON Schema：`{{workspace_path}}/specs/schemas/requirements.json`
 
 输出字段：
 - `summary`：一句话摘要
@@ -31,7 +30,9 @@
 - `assumptions`：假设
 - `out_of_scope`：范围外事项
 
-同时在 `{{worktree_path}}/.mac/TASK.json` 的 `output` 字段写入：
+同时在 `{{worktree_path}}/.mac/TASK.json` 的 `output` 字段写入，字段格式必须严格符合 JSON Schema：`{{output_schema_path}}`
+
+最终回复必须是**合法的 JSON 对象，且只能是 JSON，不要添加 markdown 代码块、不要添加任何解释性文字**。示例：
 
 ```json
 {

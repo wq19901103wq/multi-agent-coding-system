@@ -29,10 +29,14 @@
 
 ## 按状态的事件语义
 
-### `INIT` → `PLANNING_REQUIREMENTS`
+### `INIT` → 任务类型对应的初始状态
 
 - **事件**：`start`
 - **触发**：创建项目后 Orchestrator 自动触发。
+- **目标状态**：
+  - `feature` 任务 → `PLANNING_REQUIREMENTS`
+  - `bug_fix` 任务 → `BUG_ANALYSIS`
+  - `documentation` 任务 → `DOC_OUTLINE`
 - **副作用**：
   - 初始化 `projects/{project_id}/` 目录
   - 执行 `git init`
@@ -148,9 +152,17 @@ Agent：`reviewer`
 
 - **`confirm`**：进入 `MERGING`
 - **`reject`**：回到 `CODING`（默认实现层问题）
-- **`reject_to_requirements`**：回到 `PLANNING_REQUIREMENTS`
-- **`reject_to_architecture`**：回到 `PLANNING_ARCHITECTURE`
-- **`reject_to_specs`**：回到 `PLANNING_SPECS`
+
+按任务类型提供的回退选项：
+
+- **`feature`**：
+  - `reject_to_requirements`：回到 `PLANNING_REQUIREMENTS`
+  - `reject_to_architecture`：回到 `PLANNING_ARCHITECTURE`
+  - `reject_to_specs`：回到 `PLANNING_SPECS`
+- **`bug_fix`**：
+  - `reject_to_analysis`：回到 `BUG_ANALYSIS`
+- **`documentation`**：
+  - `reject_to_outline`：回到 `DOC_OUTLINE`
 
 > 用户驳回时，系统通过 `acceptance_evaluator` 或 `project_manager` Agent 生成根因分析，推荐回退阶段，但最终由用户选择。
 
@@ -197,8 +209,10 @@ Agent：`reviewer`
 当状态进入 `human_confirmation` 或 `human_input` 类型时：
 
 1. 查询当前 `approval_mode` 配置。
-2. 若当前状态在 `require_confirmation_for` 列表中：发送飞书卡片，等待用户决策。
-3. 若当前状态不在列表中：
+2. 若当前状态需要确认，则发送飞书卡片，等待用户决策。状态需要确认的条件是：
+   - 状态名在 `require_confirmation_for` 列表中；或
+   - 状态类型在 `require_confirmation_for_types` 列表中（如 `human_confirmation`、`human_input`）。
+3. 若当前状态不需要确认：
    - `human_confirmation`：直接触发 `confirm` 事件，记录 `auto_resolved` 决策日志。
    - `human_input`（如 `CLARIFICATION_PENDING`）：
      - 调用 `project_manager` Agent 基于上下文生成默认回答

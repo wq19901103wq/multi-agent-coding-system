@@ -108,7 +108,10 @@ class ProjectService:
    - `context = {task_type, description, approval_mode, retry_counts: {}}`
 7. 创建 `Project` 数据库记录
 8. 若提供了 `creator_open_id`，创建 `project_users` 绑定
-9. 自动触发 `INIT.start` → `PLANNING_REQUIREMENTS`
+9. 自动触发 `INIT.start` → 任务类型对应的初始状态：
+   - `feature` → `PLANNING_REQUIREMENTS`
+   - `bug_fix` → `BUG_ANALYSIS`
+   - `documentation` → `DOC_OUTLINE`
 
 ## 状态转换流程
 

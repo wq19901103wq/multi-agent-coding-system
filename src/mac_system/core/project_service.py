@@ -8,8 +8,17 @@ from sqlmodel import Session, select
 
 from mac_system.config import get_agent_config, get_settings
 from mac_system.database import session_scope
-from mac_system.models import Approval, EventLog, Project, ProjectUser, Task
+from mac_system.models import (
+    Approval,
+    EventLog,
+    PendingIntent,
+    ProcessedEvent,
+    Project,
+    ProjectUser,
+    Task,
+)
 from mac_system.state_machine import StateMachine
+from mac_system.core.worktree_manager import WorktreeManager
 
 
 def generate_id(prefix: str) -> str:
@@ -49,6 +58,8 @@ class ProjectService:
         description: str,
         approval_mode: str = "normal",
         creator_open_id: str | None = None,
+        feishu_chat_id: str | None = None,
+        feishu_chat_type: str = "p2p",
     ) -> Project:
         project_id = generate_id("proj")
         workspace_path = self.settings.projects_dir / project_id
@@ -59,6 +70,27 @@ class ProjectService:
         (workspace_path / "src").mkdir()
         (workspace_path / "tests").mkdir()
         (workspace_path / "worktrees").mkdir()
+
+        # Ignore generated directories so they are not committed as embedded repos
+        (workspace_path / ".gitignore").write_text(
+            "worktrees/\n.mac/\n__pycache__/\n*.pyc\n*.pyo\n*.egg-info/\n.coverage\n",
+            encoding="utf-8",
+        )
+
+        # Minimal Python project config so pytest can discover src/ packages
+        (workspace_path / "pyproject.toml").write_text(
+            '[build-system]\n'
+            'requires = ["hatchling"]\n'
+            'build-backend = "hatchling.build"\n\n'
+            '[project]\n'
+            'name = "generated-project"\n'
+            'version = "0.1.0"\n'
+            'requires-python = ">=3.10"\n\n'
+            '[tool.pytest.ini_options]\n'
+            'pythonpath = ["src"]\n'
+            'testpaths = ["tests"]\n',
+            encoding="utf-8",
+        )
 
         # Git init
         import subprocess
@@ -74,8 +106,20 @@ class ProjectService:
             cwd=workspace_path,
             check=True,
         )
+        # Stage project skeleton and create an initial commit so worktrees
+        # have a valid HEAD to branch from and merge back into.
+        subprocess.run(
+            ["git", "add", ".gitignore", "pyproject.toml", "src", "tests"],
+            cwd=workspace_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "Initial commit"],
+            cwd=workspace_path,
+            check=True,
+        )
 
-        approval_config = self._load_approval_mode_config(approval_mode)
+        approval_config = self._resolve_approval_config(approval_mode)
 
         project = Project(
             id=project_id,
@@ -93,6 +137,8 @@ class ProjectService:
                 "retry_counts": {},
             },
             approval_config=approval_config,
+            feishu_chat_id=feishu_chat_id,
+            feishu_chat_type=feishu_chat_type,
         )
         self.session.add(project)
         self.session.flush()
@@ -117,6 +163,65 @@ class ProjectService:
 
         self.session.commit()
         return project
+
+    async def restart_project_with_type(
+        self,
+        project_id: str,
+        target_task_type: str,
+        triggered_by: str = "user",
+    ) -> Project:
+        """Cancel the original project and create a new one with a different task_type.
+
+        This is used when the user discovers at acceptance time that the project
+        was classified into the wrong pipeline (e.g. a bug_fix is actually a
+        feature). The new project keeps the same description and creator binding.
+        """
+        project = self.require_project(project_id)
+        if project.status == "cancelled":
+            raise ValueError(f"Project {project_id} is already cancelled")
+
+        # Cancel the original project.
+        project.status = "cancelled"
+        project.updated_at = _now()
+
+        # Remove any lingering worktrees for the old project.
+        try:
+            WorktreeManager(self.settings.projects_dir).remove_all_worktrees(project_id)
+        except Exception:
+            pass
+
+        await self.log_event(
+            project_id=project_id,
+            level="INFO",
+            message=f"Project cancelled for restart as {target_task_type}",
+            meta={"target_task_type": target_task_type},
+        )
+
+        # Preserve creator binding if any.
+        creator_open_id = None
+        existing_binding = self.session.exec(
+            select(ProjectUser).where(ProjectUser.project_id == project_id)
+        ).first()
+        if existing_binding:
+            creator_open_id = existing_binding.open_id
+
+        new_project = await self.create_project(
+            name=project.name,
+            task_type=target_task_type,
+            description=project.description or "",
+            approval_mode=project.context.get("approval_mode", "normal"),
+            creator_open_id=creator_open_id,
+            feishu_chat_id=project.feishu_chat_id,
+            feishu_chat_type=project.feishu_chat_type,
+        )
+
+        await self.log_event(
+            project_id=project_id,
+            level="INFO",
+            message=f"Restarted project as {new_project.id} ({target_task_type})",
+            meta={"new_project_id": new_project.id, "target_task_type": target_task_type},
+        )
+        return new_project
 
     def get_project(self, project_id: str) -> Project | None:
         return self.session.get(Project, project_id)
@@ -154,6 +259,7 @@ class ProjectService:
             "current_state": project.current_state,
             "display": state_machine.display_name(project.current_state),
             "status": project.status,
+            "total_cost_usd": project.total_cost_usd,
             "pending_approval": {
                 "approval_id": pending_approval.id,
                 "type": pending_approval.approval_type,
@@ -278,6 +384,11 @@ class ProjectService:
         if cost_info:
             task.cost_usd = cost_info.get("estimated_cost_usd")
         task.updated_at = _now()
+
+        project = self.session.get(Project, task.project_id)
+        if project is not None and task.cost_usd is not None:
+            project.total_cost_usd = (project.total_cost_usd or 0.0) + task.cost_usd
+
         self.session.commit()
         return task
 
@@ -291,6 +402,17 @@ class ProjectService:
         task.updated_at = _now()
         self.session.commit()
         return task
+
+    def recover_stale_tasks(self) -> list[Task]:
+        """Mark all 'running' tasks as failed, typically on service startup."""
+        tasks = self.session.exec(select(Task).where(Task.status == "running")).all()
+        for task in tasks:
+            task.status = "failed"
+            task.error_message = "service restarted while task was running"
+            task.updated_at = _now()
+        if tasks:
+            self.session.commit()
+        return list(tasks)
 
     async def create_approval(
         self,
@@ -326,13 +448,19 @@ class ProjectService:
         self.session.commit()
         return approval
 
+    def get_approval(self, approval_id: str) -> Approval:
+        approval = self.session.get(Approval, approval_id)
+        if approval is None:
+            raise ApprovalNotFoundError(approval_id)
+        return approval
+
     async def respond_approval(
         self,
         approval_id: str,
         response: str,
         responded_by: str,
     ) -> Approval:
-        approval = self.session.get(Approval, approval_id)
+        approval = self.get_approval(approval_id)
         if approval is None:
             raise ApprovalNotFoundError(approval_id)
         if approval.status != "pending":
@@ -402,6 +530,47 @@ class ProjectService:
             "payload": approval.payload,
         }
 
+    def get_pending_intent(self, open_id: str) -> PendingIntent | None:
+        """Return a non-expired pending intent for the user, or None."""
+        from datetime import timedelta
+
+        intent = self.session.get(PendingIntent, open_id)
+        if intent is None:
+            return None
+        if intent.created_at < _now() - timedelta(hours=1):
+            self.session.delete(intent)
+            self.session.commit()
+            return None
+        return intent
+
+    def upsert_pending_intent(
+        self,
+        open_id: str,
+        description: str | None,
+        stage: str,
+        chat_id: str | None = None,
+        chat_type: str = "p2p",
+    ) -> PendingIntent:
+        """Create or replace the pending intent for the user."""
+        intent = self.session.get(PendingIntent, open_id)
+        if intent is None:
+            intent = PendingIntent(open_id=open_id)
+            self.session.add(intent)
+        intent.description = description
+        intent.stage = stage
+        intent.chat_id = chat_id
+        intent.chat_type = chat_type
+        intent.created_at = _now()
+        self.session.commit()
+        return intent
+
+    def delete_pending_intent(self, open_id: str) -> None:
+        """Remove the pending intent for the user."""
+        intent = self.session.get(PendingIntent, open_id)
+        if intent is not None:
+            self.session.delete(intent)
+            self.session.commit()
+
     def _load_approval_mode_config(self, mode: str) -> dict:
         agent_config = get_agent_config()
         modes_path_str = agent_config.get("approval_modes_path", "specs/approval_modes.json")
@@ -411,3 +580,45 @@ class ProjectService:
         with open(modes_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data.get("modes", {}).get(mode, {"mode": mode})
+
+    def _resolve_approval_config(self, mode: str) -> dict:
+        """Return the effective approval config, resolving night-mode window."""
+        config = self._load_approval_mode_config(mode)
+        if mode == "night":
+            window = config.get("night_window")
+            if window and not self._in_night_window(window):
+                # Outside the night window, new night-mode projects behave like normal.
+                config = self._load_approval_mode_config("normal")
+        return config
+
+    @staticmethod
+    def _in_night_window(window: dict, now: datetime | None = None) -> bool:
+        """Return True if ``now`` (or current time) is inside the configured night window."""
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+
+        tz_name = window.get("timezone", "Asia/Shanghai")
+        tz = ZoneInfo(tz_name)
+        current = now if now is not None else _dt.now(tz)
+        if isinstance(current, datetime) and current.tzinfo is None:
+            current = current.replace(tzinfo=tz)
+        current_time = current.time()
+        start = _dt.strptime(window["start_time"], "%H:%M").time()
+        end = _dt.strptime(window["end_time"], "%H:%M").time()
+        if start < end:
+            return start <= current_time < end
+        return current_time >= start or current_time < end
+
+    def is_event_processed(self, event_id: str) -> bool:
+        """Return True if a Feishu event has already been processed."""
+        if not event_id:
+            return False
+        return self.session.get(ProcessedEvent, event_id) is not None
+
+    def mark_event_processed(self, event_id: str, event_type: str) -> None:
+        """Record a Feishu event as processed so duplicates can be dropped."""
+        if not event_id:
+            return
+        self.session.merge(
+            ProcessedEvent(event_id=event_id, event_type=event_type, created_at=_now())
+        )

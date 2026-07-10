@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,7 +25,15 @@ class Settings(BaseSettings):
 
     # Claude Code
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    anthropic_auth_token: str | None = Field(default=None, alias="ANTHROPIC_AUTH_TOKEN")
     claude_bin: Path = Field(default=Path("/Users/yihanwang/.local/node/bin/claude"), alias="CLAUDE_BIN")
+    claude_model: str | None = Field(default=None, validation_alias=AliasChoices("CLAUDE_MODEL", "ANTHROPIC_MODEL"))
+    anthropic_base_url: str | None = Field(default=None, alias="ANTHROPIC_BASE_URL")
+    anthropic_default_opus_model: str | None = Field(default=None, alias="ANTHROPIC_DEFAULT_OPUS_MODEL")
+    anthropic_default_sonnet_model: str | None = Field(default=None, alias="ANTHROPIC_DEFAULT_SONNET_MODEL")
+    anthropic_default_haiku_model: str | None = Field(default=None, alias="ANTHROPIC_DEFAULT_HAIKU_MODEL")
+    claude_code_effort_level: str | None = Field(default=None, alias="CLAUDE_CODE_EFFORT_LEVEL")
+    api_timeout_ms: int | None = Field(default=None, alias="API_TIMEOUT_MS")
 
     # Feishu
     feishu_app_id: str | None = Field(default=None, alias="FEISHU_APP_ID")
@@ -33,6 +41,8 @@ class Settings(BaseSettings):
     feishu_verification_token: str | None = Field(default=None, alias="FEISHU_VERIFICATION_TOKEN")
     feishu_encrypt_key: str | None = Field(default=None, alias="FEISHU_ENCRYPT_KEY")
     feishu_event_prefix: str = Field(default="/feishu/events", alias="FEISHU_EVENT_PREFIX")
+    feishu_transport: str = Field(default="websocket", alias="FEISHU_TRANSPORT")
+    feishu_test_mode: bool = Field(default=False, alias="FEISHU_TEST_MODE")
 
     # Git
     git_remote_url: str | None = Field(default=None, alias="GIT_REMOTE_URL")
@@ -44,6 +54,10 @@ class Settings(BaseSettings):
     max_test_retries: int = Field(default=2, alias="MAX_TEST_RETRIES")
     max_review_retries: int = Field(default=2, alias="MAX_REVIEW_RETRIES")
     agent_timeout_seconds: int = Field(default=600, alias="AGENT_TIMEOUT_SECONDS")
+
+    # Intent router
+    intent_high_threshold: float = Field(default=0.85, alias="INTENT_HIGH_THRESHOLD")
+    intent_low_threshold: float = Field(default=0.5, alias="INTENT_LOW_THRESHOLD")
 
 
 @lru_cache

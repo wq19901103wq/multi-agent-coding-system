@@ -112,3 +112,12 @@ def test_remove_worktree(manager, tmp_project):
     )
     manager.remove_worktree("proj_test", "task_001", "coder", worktree)
     assert not worktree.exists()
+
+
+def test_remove_all_worktrees(manager, tmp_project):
+    wt1 = manager.create_worktree("proj_test", "task_001", "coder")
+    wt2 = manager.create_worktree("proj_test", "task_002", "reviewer")
+    manager.remove_all_worktrees("proj_test")
+    assert not wt1.exists()
+    assert not wt2.exists()
+    assert manager.list_worktrees("proj_test") == []

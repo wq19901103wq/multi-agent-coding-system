@@ -19,8 +19,7 @@
 
 ## 输出要求
 
-将方案写入 `{{worktree_path}}/.mac/ARCHITECTURE.json`，格式必须符合 JSON Schema：
-`{{workspace_path}}/specs/schemas/architecture.json`
+将方案写入 `{{worktree_path}}/.mac/ARCHITECTURE.json`，格式必须符合 JSON Schema：`{{workspace_path}}/specs/schemas/architecture.json`
 
 输出字段：
 - `summary`：方案摘要
@@ -30,7 +29,9 @@
 - `risks`：风险列表
 - `dependencies`：依赖列表
 
-同时在 `{{worktree_path}}/.mac/TASK.json` 的 `output` 字段写入：
+同时在 `{{worktree_path}}/.mac/TASK.json` 的 `output` 字段写入，字段格式必须严格符合 JSON Schema：`{{output_schema_path}}`
+
+最终回复必须是**合法的 JSON 对象，且只能是 JSON，不要添加 markdown 代码块、不要添加任何解释性文字**。示例：
 
 ```json
 {

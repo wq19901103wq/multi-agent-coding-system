@@ -63,6 +63,8 @@ class PromptRenderer:
         state: str,
         worktree: Path,
         context_files: list[Path],
+        task_id: str | None = None,
+        output_schema_path: str | None = None,
     ) -> str:
         agent_cfg = self.get_agent_config(agent_type)
         stage_cfg = self.get_stage_config(agent_type, stage)
@@ -81,14 +83,14 @@ class PromptRenderer:
 
         variables = {
             "project_id": project.id,
-            "task_id": "{{task_id}}",  # replaced by orchestrator
+            "task_id": task_id or "",
             "agent_type": agent_type,
             "state": state,
             "task_type": project.task_type,
             "description": project.description or "",
             "state_json_path": str(worktree / ".mac" / "STATE.json"),
             "task_json_path": str(worktree / ".mac" / "TASK.json"),
-            "output_schema_path": "{{output_schema_path}}",  # replaced by orchestrator
+            "output_schema_path": output_schema_path or "",
             "worktree_path": str(worktree),
             "workspace_path": str(project.workspace_path),
             "context_files": context_files_md,
