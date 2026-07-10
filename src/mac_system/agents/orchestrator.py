@@ -664,18 +664,34 @@ class AgentOrchestrator:
             creator_open_id = self._get_creator_open_id(project.id)
 
             # Feishu interactive card JSON is best kept under ~30 KB and the
-            # mobile client renders long lark_md blocks poorly.  If the summary
-            # is long we send a compact card with a preview + action buttons,
-            # then stream the full content as plain text messages (a la
-            # feishu-connect) split at Markdown section boundaries.
+            # mobile client renders long lark_md blocks poorly.  When the summary
+            # is long we split it into multiple display cards (a la feishu-connect)
+            # and keep the action buttons on the final confirmation card so the
+            # user reads the full content before deciding.
             CARD_SUMMARY_LIMIT = 900
             is_long = len(summary_text) > CARD_SUMMARY_LIMIT
 
             if is_long:
-                preview = summary_text[:CARD_SUMMARY_LIMIT].rsplit("\n", 1)[0].strip()
-                if len(preview) < 100:
-                    preview = summary_text[:CARD_SUMMARY_LIMIT].strip()
-                card_summary = preview + "\n\n（完整内容见下方消息）"
+                chunks = _split_markdown_sections(summary_text, max_chars=1600)
+                total = len(chunks)
+                for idx, chunk in enumerate(chunks, start=1):
+                    try:
+                        await self.feishu_bridge.send_content_card(
+                            open_id=receive_id,
+                            title=title,
+                            content=chunk,
+                            page=idx,
+                            total=total,
+                            color="blue",
+                            receive_id_type=receive_id_type,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to send summary content card for %s: %s", project.id, exc
+                        )
+                        break
+                # Final card only carries metadata and action buttons.
+                card_summary = "请查看上方完整内容后选择操作"
             else:
                 card_summary = summary_text
 
@@ -695,26 +711,6 @@ class AgentOrchestrator:
                 logger.warning(
                     "Failed to send confirmation card for %s: %s", project.id, exc
                 )
-
-            # Send the full summary as clean plain-text messages when it is long.
-            if is_long:
-                chunks = _split_markdown_sections(summary_text, max_chars=1600)
-                prefix = _mention_prefix(creator_open_id) if receive_id_type == "chat_id" else ""
-                total = len(chunks)
-                for idx, chunk in enumerate(chunks, start=1):
-                    header = f"{prefix}📄 {question}（{idx}/{total}）\n"
-                    body = chunk
-                    try:
-                        await self.feishu_bridge.send_text(
-                            receive_id,
-                            header + body,
-                            receive_id_type=receive_id_type,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to send summary chunk for %s: %s", project.id, exc
-                        )
-                        break
 
     async def _handle_human_input(
         self,
@@ -766,13 +762,30 @@ class AgentOrchestrator:
             creator_open_id = self._get_creator_open_id(project.id)
             context_text = self._build_summary_for_state(project, state)
 
-            # Keep the input card compact; stream long context as text messages.
+            # Keep the input card compact; stream long context as display cards.
             INPUT_CONTEXT_LIMIT = 800
-            if len(context_text) > INPUT_CONTEXT_LIMIT:
-                card_context = context_text[:INPUT_CONTEXT_LIMIT].rsplit("\n", 1)[0].strip()
-                if len(card_context) < 80:
-                    card_context = context_text[:INPUT_CONTEXT_LIMIT].strip()
-                card_context += "\n\n（完整上下文见下方消息）"
+            is_long_context = len(context_text) > INPUT_CONTEXT_LIMIT
+
+            if is_long_context:
+                chunks = _split_markdown_sections(context_text, max_chars=1600)
+                total = len(chunks)
+                for idx, chunk in enumerate(chunks, start=1):
+                    try:
+                        await self.feishu_bridge.send_content_card(
+                            open_id=receive_id,
+                            title=question,
+                            content=chunk,
+                            page=idx,
+                            total=total,
+                            color="orange",
+                            receive_id_type=receive_id_type,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to send input context card for %s: %s", project.id, exc
+                        )
+                        break
+                card_context = "请查看上方完整上下文后回复"
             else:
                 card_context = context_text
 
@@ -786,24 +799,6 @@ class AgentOrchestrator:
                 chat_id=project.feishu_chat_id,
                 chat_type=project.feishu_chat_type,
             )
-
-            if len(context_text) > INPUT_CONTEXT_LIMIT:
-                chunks = _split_markdown_sections(context_text, max_chars=1600)
-                prefix = _mention_prefix(creator_open_id) if receive_id_type == "chat_id" else ""
-                total = len(chunks)
-                for idx, chunk in enumerate(chunks, start=1):
-                    header = f"{prefix}📄 {question}（{idx}/{total}）\n"
-                    try:
-                        await self.feishu_bridge.send_text(
-                            receive_id,
-                            header + chunk,
-                            receive_id_type=receive_id_type,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to send input context chunk for %s: %s", project.id, exc
-                        )
-                        break
 
     async def _execute_system_action(
         self,
@@ -1346,6 +1341,7 @@ class AgentOrchestrator:
         sm = StateMachine(project.task_type)
         from_display = sm.display_name(from_state)
         to_display = sm.display_name(project.current_state)
+        from_state_type = sm.state_type(from_state)
         from_agent = self._agent_label_for_state(from_state)
         to_agent = self._agent_label_for_state(project.current_state)
         name = project.name or project.id
@@ -1362,6 +1358,7 @@ class AgentOrchestrator:
             from_agent=from_agent,
             to_agent=to_agent,
             status_note=summary_note,
+            from_state_type=from_state_type,
         )
         receive_id, receive_id_type = self._resolve_project_recipient(project)
         try:
@@ -1385,17 +1382,52 @@ class AgentOrchestrator:
             "DOC_OUTLINE": "DOC_OUTLINE.json",
         }
         filename = file_map.get(state)
-        if not filename:
-            # For CODING/TESTING/REVIEW, check the task output.
+        if filename:
+            path = mac / filename
+            if path.exists():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    return ""
+                summary = data.get("summary", "")
+                if summary and len(summary) > 120:
+                    summary = summary[:120] + "…"
+                return summary
             return ""
-        path = mac / filename
-        if not path.exists():
+
+        # For CODING/TESTING/REVIEW, read the most recent completed task output.
+        agent_type_map = {
+            "CODING": "coder",
+            "TESTING": "tester",
+            "REVIEW": "reviewer",
+        }
+        agent_type = agent_type_map.get(state)
+        if not agent_type:
             return ""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+
+        from sqlmodel import select
+        task = self.project_service.session.exec(
+            select(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.agent_type == agent_type,
+                Task.status == "completed",
+            )
+            .order_by(Task.updated_at.desc())
+            .limit(1)
+        ).first()
+        if not task or not task.output_data:
             return ""
-        summary = data.get("summary", "")
+
+        out = task.output_data
+        candidates = [
+            out.get("summary", ""),
+            out.get("result", ""),
+            out.get("report", ""),
+        ]
+        if out.get("notes") and isinstance(out["notes"], list):
+            candidates.append(" ".join(str(n) for n in out["notes"] if n))
+        summary = next((s for s in candidates if s), "")
         if summary and len(summary) > 120:
             summary = summary[:120] + "…"
         return summary

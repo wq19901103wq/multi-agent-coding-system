@@ -62,7 +62,7 @@ class ProjectService:
         feishu_chat_type: str = "p2p",
     ) -> Project:
         project_id = generate_id("proj")
-        workspace_path = self.settings.projects_dir / project_id
+        workspace_path = (self.settings.projects_dir / project_id).resolve()
         workspace_path.mkdir(parents=True, exist_ok=False)
 
         # Create subdirectories

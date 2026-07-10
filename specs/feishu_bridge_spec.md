@@ -45,6 +45,17 @@ class FeishuBridge:
     async def send_text(self, open_id: str, text: str) -> str:
         """发送文本消息，返回 message_id。"""
 
+    async def send_content_card(
+        self,
+        open_id: str,
+        title: str,
+        content: str,
+        page: int = 1,
+        total: int = 1,
+        color: str = "blue",
+    ) -> str:
+        """发送内容展示卡片，用于长内容分片。"""
+
     async def send_confirmation_card(
         self,
         open_id: str,
@@ -53,8 +64,9 @@ class FeishuBridge:
         summary: str,
         details: dict,
         options: list[dict],
+        show_actions: bool = True,
     ) -> str:
-        """发送确认卡片，返回 message_id。"""
+        """发送确认卡片，返回 message_id。show_actions=False 可用于只展示内容。"""
 
     async def send_input_card(
         self,
@@ -184,7 +196,25 @@ class FeishuBridge:
 }
 ```
 
-### 6.3 主菜单卡片
+### 6.3 内容展示卡片
+
+用于长内容分片展示（参考 feishu-connect 的“拆段多发”思路，但使用卡片以支持 markdown 渲染）。
+
+```json
+{
+  "config": {"wide_screen_mode": true},
+  "header": {
+    "title": {"tag": "plain_text", "content": "请确认需求理解 — config-validator CLI（2/3）"},
+    "template": "blue"
+  },
+  "elements": [
+    {"tag": "div", "text": {"tag": "lark_md", "content": "**目标**\n• 读取 config.json\n• 校验必填/类型/范围"}},
+    {"tag": "note", "elements": [{"tag": "plain_text", "content": "第 2/3 页"}]}
+  ]
+}
+```
+
+### 6.4 主菜单卡片
 
 ```json
 {
@@ -206,7 +236,55 @@ class FeishuBridge:
 
 ---
 
-## 7. 事件解析
+## 7. 长内容分片策略
+
+当确认/输入卡片的摘要或上下文超过长度限制时：
+
+1. 先按 Markdown 章节拆成多张**内容展示卡片**（`build_content_card`）顺序发出。
+2. 最后发一张**操作卡片**（`build_confirmation_card` / `build_input_card`），只保留标题、必要元数据和操作按钮。
+3. 操作按钮必须放在最后一张卡片上，确保用户读完内容后再做决策。
+
+### 7.1 状态流转卡片
+
+Agent 执行完成后发送，文案避免“已完成：需求分析中”的歧义：
+
+```json
+{
+  "config": {"wide_screen_mode": true},
+  "header": {
+    "title": {"tag": "plain_text", "content": "状态流转"},
+    "template": "blue"
+  },
+  "elements": [
+    {"tag": "div", "text": {"tag": "lark_md", "content": "**config-validator CLI**"}},
+    {"tag": "hr"},
+    {"tag": "div", "text": {"tag": "lark_md", "content": "✅ 需求分析 已完成"}},
+    {"tag": "div", "text": {"tag": "lark_md", "content": "🔄 进入 方案设计中"}},
+    {"tag": "hr"},
+    {"tag": "div", "text": {"tag": "lark_md", "content": "需求分析师 → 需求分析师"}},
+    {"tag": "div", "text": {"tag": "lark_md", "content": "**结论**：完成需求梳理，输出 JSON 配置校验器 CLI 需求文档"}}
+  ]
+}
+```
+
+### 7.2 操作反馈卡片
+
+用户点击确认/驳回等按钮后，立即发送反馈卡片告知已选择的操作：
+
+```json
+{
+  "config": {"wide_screen_mode": true},
+  "header": {
+    "title": {"tag": "plain_text", "content": "操作确认 — config-validator CLI"},
+    "template": "green"
+  },
+  "elements": [
+    {"tag": "div", "text": {"tag": "lark_md", "content": "你选择了「确认」\n\n项目继续执行。"}}
+  ]
+}
+```
+
+## 8. 事件解析
 
 ### 7.1 文本消息
 
@@ -261,7 +339,7 @@ ButtonAction(
 
 ---
 
-## 8. 用户-项目绑定
+## 9. 用户-项目绑定
 
 ### 8.1 创建项目时绑定
 
@@ -279,7 +357,7 @@ ButtonAction(
 
 ---
 
-## 9. 文本指令（Fallback）
+## 10. 文本指令（Fallback）
 
 | 指令 | 说明 |
 |------|------|
@@ -291,7 +369,7 @@ ButtonAction(
 
 ---
 
-## 10. 调试
+## 11. 调试
 
 - 服务启动后检查日志是否有 `connected to wss://...`。
 - 收到事件会打印：
@@ -301,7 +379,7 @@ ButtonAction(
 
 ---
 
-## 11. 扩展指南
+## 12. 扩展指南
 
 新增菜单按钮：
 

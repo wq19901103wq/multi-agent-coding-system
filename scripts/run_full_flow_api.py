@@ -193,6 +193,8 @@ async def main() -> int:
                 self.captured = []
             async def send_confirmation_card(self, **kwargs):
                 self.captured.append(("card", kwargs))
+            async def send_content_card(self, **kwargs):
+                self.captured.append(("content", kwargs))
             async def send_text(self, *args, **kwargs):
                 self.captured.append(("text", args[1]))
 
@@ -213,6 +215,9 @@ async def main() -> int:
                 print(f"Summary:\n{payload['summary'][:800]}")
                 print(f"Details: {payload['details']}")
                 print(f"Options: {[o['label'] for o in payload['options']]}")
+            elif kind == "content":
+                print(f"\nContent card ({payload.get('page', 1)}/{payload.get('total', 1)}): {payload['title']}")
+                print(f"{payload['content'][:600]}...")
             elif kind == "text":
                 print(f"\nFollow-up text:\n{payload[:600]}...")
 

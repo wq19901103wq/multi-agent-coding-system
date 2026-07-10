@@ -8,6 +8,7 @@ import httpx
 
 from mac_system.feishu.card import (
     build_confirmation_card,
+    build_content_card,
     build_input_card,
     build_status_card,
 )
@@ -170,6 +171,20 @@ class FeishuBridge:
         """Convenience helper to send an interactive card to a chat."""
         return await self._send_interactive(chat_id, card, receive_id_type="chat_id")
 
+    async def send_content_card(
+        self,
+        open_id: str,
+        title: str,
+        content: str,
+        page: int = 1,
+        total: int = 1,
+        color: str = "blue",
+        receive_id_type: str = "open_id",
+    ) -> str:
+        """Send a plain display card for a chunk of markdown content."""
+        card = build_content_card(title, content, page=page, total=total, color=color)
+        return await self._send_interactive(open_id, card, receive_id_type=receive_id_type)
+
     async def send_confirmation_card(
         self,
         open_id: str,
@@ -181,11 +196,12 @@ class FeishuBridge:
         receive_id_type: str = "open_id",
         chat_id: str | None = None,
         chat_type: str = "p2p",
+        show_actions: bool = True,
     ) -> str:
         state = details.get("state", "")
         card = build_confirmation_card(
             title, summary, details, options, approval_id, state,
-            chat_id=chat_id, chat_type=chat_type,
+            chat_id=chat_id, chat_type=chat_type, show_actions=show_actions,
         )
         return await self._send_interactive(open_id, card, receive_id_type=receive_id_type)
 

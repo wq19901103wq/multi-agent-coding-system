@@ -26,6 +26,10 @@ class CaptureBridge(NullFeishuBridge):
         self.captured.append(("confirmation_card", kwargs))
         return "msg_capture"
 
+    async def send_content_card(self, **kwargs):
+        self.captured.append(("content_card", kwargs))
+        return "msg_capture"
+
     async def send_input_card(self, **kwargs):
         self.captured.append(("input_card", kwargs))
         return "msg_capture"
@@ -77,6 +81,22 @@ async def main(project_id: str):
                 state=kwargs.get('state', ''),
                 chat_id=kwargs.get('chat_id'),
                 chat_type=kwargs.get('chat_type', 'p2p'),
+                show_actions=kwargs.get('show_actions', True),
+            )
+            print(json.dumps(card, ensure_ascii=False, indent=2))
+        elif kind == "content_card":
+            kwargs = item[1]
+            print("-" * 60)
+            print(f"CONTENT CARD ({kwargs.get('page', 1)}/{kwargs.get('total', 1)}): {kwargs['title']}")
+            print(f"CONTENT:\n{kwargs['content']}")
+            print("\nCARD JSON:")
+            from mac_system.feishu.card import build_content_card
+            card = build_content_card(
+                title=kwargs['title'],
+                content=kwargs['content'],
+                page=kwargs.get('page', 1),
+                total=kwargs.get('total', 1),
+                color=kwargs.get('color', 'blue'),
             )
             print(json.dumps(card, ensure_ascii=False, indent=2))
         elif kind == "text":

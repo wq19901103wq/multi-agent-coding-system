@@ -17,7 +17,7 @@ from mac_system.core.project_service import (
     ProjectService,
 )
 from mac_system.feishu.bridge import FeishuBridge
-from mac_system.feishu.card import build_status_card
+from mac_system.feishu.card import build_feedback_card, build_status_card
 from mac_system.feishu.menu import (
     build_create_prompt_card,
     build_intent_confirm_card,
@@ -301,7 +301,7 @@ async def _create_project(
     # waiting for the (potentially long) first agent tick to complete.
     await ctx.bridge.send_text(
         receive_id,
-        f"已创建项目 {project.id}（{task_type}），正在启动...",
+        f"已创建项目 {project.id}（{task_type}），Agent 开始执行，后续状态变化将通过卡片通知。",
         receive_id_type=receive_id_type,
     )
     try:
@@ -522,11 +522,32 @@ async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) ->
         )
         return
 
+    # Map the chosen action back to its human-readable label for feedback.
+    selected_label = chosen
+    for opt in approval.payload.get("options", []):
+        if opt.get("action") == chosen:
+            if chosen == "select_option" and action.option_key:
+                if opt.get("option_key") != action.option_key:
+                    continue
+            selected_label = opt.get("label", chosen)
+            break
+
+    is_rejection = chosen == "reject"
+
+    # Confirm the user's choice with a card before continuing.
+    feedback_card = build_feedback_card(
+        project_name=project.name or project.id,
+        selected_label=selected_label,
+        is_rejection=is_rejection,
+        note="项目继续执行。" if not is_rejection else "",
+    )
+    await ctx.bridge._send_interactive(
+        receive_id, feedback_card, receive_id_type=receive_id_type
+    )
+
     await ctx.service.respond_approval(
         approval.id, chosen, responded_by=open_id
     )
-
-    is_rejection = chosen == "reject"
 
     await ctx.service.transition_state(
         project.id, chosen, triggered_by="feishu"
@@ -534,19 +555,6 @@ async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) ->
 
     # Tick repeatedly so cards are sent for every confirmation stage.
     await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
-
-    if is_rejection:
-        await ctx.bridge.send_text(
-            receive_id,
-            f"已驳回，项目 {project.id} 返回上一阶段。\n请直接回复你的修改意见或补充说明，Agent 会据此重新规划。",
-            receive_id_type=receive_id_type,
-        )
-    else:
-        await ctx.bridge.send_text(
-            receive_id,
-            f"已处理，项目 {project.id} 继续执行",
-            receive_id_type=receive_id_type,
-        )
 
 
 
