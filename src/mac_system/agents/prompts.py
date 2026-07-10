@@ -65,6 +65,7 @@ class PromptRenderer:
         context_files: list[Path],
         task_id: str | None = None,
         output_schema_path: str | None = None,
+        rejection_note: str = "",
     ) -> str:
         agent_cfg = self.get_agent_config(agent_type)
         stage_cfg = self.get_stage_config(agent_type, stage)
@@ -94,9 +95,20 @@ class PromptRenderer:
             "worktree_path": str(worktree),
             "workspace_path": str(project.workspace_path),
             "context_files": context_files_md,
+            "rejection_note": rejection_note or "无",
         }
 
-        return self._replace_variables(template, variables)
+        prompt = self._replace_variables(template, variables)
+
+        # If the user rejected a previous result and provided concrete feedback,
+        # append an explicit instruction so the agent cannot ignore it.
+        if rejection_note:
+            prompt += (
+                "\n\n## 用户驳回反馈（必须纳入本次输出）\n\n"
+                f"用户针对上一版结果提出了以下修改意见，请在本次输出中充分体现：\n\n{rejection_note}\n"
+            )
+
+        return prompt
 
     def _replace_variables(self, template: str, variables: dict[str, str]) -> str:
         result = template

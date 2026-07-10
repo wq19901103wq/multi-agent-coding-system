@@ -181,8 +181,11 @@ class AgentOrchestrator:
             )
             return
 
-        # Include any rejection feedback the user provided.
-        rejection_note = project.context.pop("latest_rejection_feedback", "")
+        # Include any rejection feedback the user provided, then clear it so it
+        # is not reused for unrelated downstream stages.
+        new_context = dict(project.context)
+        rejection_note = new_context.pop("latest_rejection_feedback", "")
+        project.context = new_context
 
         # Create task
         task = await self.project_service.create_task(
@@ -243,6 +246,7 @@ class AgentOrchestrator:
                 context_files=self._context_files_for_state(project, state),
                 task_id=task.id,
                 output_schema_path=str(output_schema),
+                rejection_note=rejection_note,
             )
             allowed_tools = self.prompt_renderer.get_allowed_tools(agent_type)
         except Exception as e:
