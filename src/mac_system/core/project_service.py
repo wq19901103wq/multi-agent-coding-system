@@ -299,21 +299,25 @@ class ProjectService:
 
         # Update context if payload provided rollback/resolved decisions
         if payload:
+            new_context = dict(project.context)
             if "resolved_decisions" in payload:
-                project.context.setdefault("resolved_decisions", []).extend(
-                    payload["resolved_decisions"]
-                )
+                resolved = list(new_context.get("resolved_decisions", []))
+                resolved.extend(payload["resolved_decisions"])
+                new_context["resolved_decisions"] = resolved
             if "clarification_answer" in payload:
-                project.context["clarification_answer"] = payload["clarification_answer"]
+                new_context["clarification_answer"] = payload["clarification_answer"]
             if "conflict_resolution" in payload:
-                project.context["conflict_resolution"] = payload["conflict_resolution"]
+                new_context["conflict_resolution"] = payload["conflict_resolution"]
+            project.context = new_context
 
         # Reset retry counts when leaving TESTING/REVIEW successfully
         if previous_state in ("TESTING", "REVIEW") and next_state not in (
             "CODING",
             "FAILED",
         ):
-            project.context.setdefault("retry_counts", {})[previous_state] = 0
+            retry_counts = dict(project.context.get("retry_counts", {}))
+            retry_counts[previous_state] = 0
+            project.context = {**project.context, "retry_counts": retry_counts}
 
         self._write_state_json(project)
 
@@ -505,7 +509,7 @@ class ProjectService:
         # Append current state to history
         history = state_doc["history"]
         history.append({"state": project.current_state, "entered_at": _now().isoformat()})
-        project.context["history"] = history
+        project.context = {**project.context, "history": history}
 
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(state_doc, f, ensure_ascii=False, indent=2)

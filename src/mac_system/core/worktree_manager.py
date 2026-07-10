@@ -1,4 +1,5 @@
 import json
+import logging
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -6,6 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from git import Repo
+
+
+logger = logging.getLogger(__name__)
 
 
 class WorktreeManagerError(Exception):
@@ -129,7 +133,15 @@ class WorktreeManager:
             )
 
         repo = Repo(workspace)
+        stashed = False
         try:
+            # A dirty main workspace (uncommitted changes or untracked files) can
+            # cause merge failures when the agent branch adds the same paths.
+            # Stash workspace changes before merging; try to restore afterwards.
+            if repo.is_dirty(untracked_files=True):
+                repo.git.stash("push", "-u", "-m", f"[mac] pre-merge cleanup for {branch_name}")
+                stashed = True
+
             # Merge the branch into the current branch (main/master)
             repo.git.merge(branch_name, no_ff=True, m=f"Merge {branch_name}")
         except Exception as e:
@@ -139,6 +151,21 @@ class WorktreeManager:
             except Exception:
                 pass
             raise WorktreeManagerError(f"Merge failed for {branch_name}: {e}") from e
+        finally:
+            if stashed:
+                try:
+                    repo.git.stash("pop")
+                except Exception as exc:
+                    logger.warning(
+                        "Could not restore stashed workspace changes for %s: %s. "
+                        "Dropping stash to keep workspace consistent.",
+                        project_id,
+                        exc,
+                    )
+                    try:
+                        repo.git.stash("drop")
+                    except Exception:
+                        pass
 
     def remove_worktree(
         self,

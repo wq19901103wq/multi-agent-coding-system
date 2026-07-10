@@ -132,18 +132,62 @@ def build_input_card(
     }
 
 
+# Display names used in transition cards.  Use noun forms so the wording
+# "XX 已完成" makes sense (e.g. "需求分析 已完成", not "需求分析中 已完成").
+_TRANSITION_DISPLAY_NAMES: dict[str, str] = {
+    "PLANNING_REQUIREMENTS": "需求分析",
+    "PLANNING_ARCHITECTURE": "方案设计",
+    "PLANNING_SPECS": "Spec 拆分",
+    "BUG_ANALYSIS": "Bug 分析",
+    "DOC_OUTLINE": "文档大纲",
+    "CODING": "编码",
+    "TESTING": "测试",
+    "REVIEW": "Review",
+    "MERGING": "提交代码",
+    "REQUIREMENT_CONFIRM_PENDING": "需求确认",
+    "ARCHITECTURE_CONFIRM_PENDING": "方案确认",
+    "SPEC_CONFIRM_PENDING": "Spec 确认",
+    "BUG_FIX_CONFIRM_PENDING": "修复方案确认",
+    "OUTLINE_CONFIRM_PENDING": "文档大纲确认",
+    "ACCEPTANCE_PENDING": "验收确认",
+}
+
+
+def _transition_display(state: str) -> str:
+    return _TRANSITION_DISPLAY_NAMES.get(state, state)
+
+
 def build_transition_card(
     project_name: str,
-    from_display: str,
-    to_display: str,
+    from_state: str,
+    to_state: str,
+    from_state_type: str,
+    to_state_type: str,
     from_agent: str,
     to_agent: str,
     status_note: str = "",
-    from_state_type: str = "",
+    round_number: int | None = None,
 ) -> dict[str, Any]:
-    """Build a card for state transitions showing stage change and agent handoff."""
+    """Build a card for state transitions showing stage change and agent handoff.
+
+    Semantics:
+    - Agent state whose result needs human confirmation -> result produced, waiting.
+    - Human confirmation state after user confirms -> round completed.
+    - Agent/system state that does not need confirmation -> completed.
+    """
+    from_display = _transition_display(from_state)
+    to_display = _transition_display(to_state)
+
     if from_state_type == "human_confirmation":
-        from_line = f"✅ 已确认：{from_display}"
+        if round_number and round_number > 1:
+            from_line = f"✅ 第{round_number}轮 {from_display} 已完成"
+        else:
+            from_line = f"✅ {from_display} 已完成"
+    elif from_state_type in ("agent_execution", "system_action"):
+        if to_state_type == "human_confirmation":
+            from_line = f"✅ {from_display} 结果已产出，等待确认"
+        else:
+            from_line = f"✅ {from_display} 已完成"
     else:
         from_line = f"✅ {from_display} 已完成"
 
@@ -189,6 +233,25 @@ def build_feedback_card(
         "header": _header(f"操作确认 — {project_name}", "green"),
         "elements": [
             {"tag": "div", "text": _lark_md(content)},
+        ],
+    }
+
+
+def build_rejection_summary_card(
+    project_name: str,
+    state_display: str,
+    feedback: str,
+    round_number: int,
+) -> dict[str, Any]:
+    """Build a card summarizing the user's rejection feedback before re-planning."""
+    title = f"第{round_number}轮 {state_display} 修改意见"
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header(title, "orange"),
+        "elements": [
+            {"tag": "div", "text": _lark_md(f"**项目**：{project_name}")},
+            {"tag": "div", "text": _lark_md(f"**意见**：{feedback}")},
+            {"tag": "div", "text": _lark_md("Agent 会根据以上意见重新规划。")},
         ],
     }
 

@@ -17,7 +17,12 @@ from mac_system.core.project_service import (
     ProjectService,
 )
 from mac_system.feishu.bridge import FeishuBridge
-from mac_system.feishu.card import build_feedback_card, build_status_card
+from mac_system.feishu.card import (
+    build_feedback_card,
+    build_rejection_summary_card,
+    build_status_card,
+    build_transition_card,
+)
 from mac_system.feishu.menu import (
     build_create_prompt_card,
     build_intent_confirm_card,
@@ -186,13 +191,28 @@ async def _handle_rejection_feedback(
     """Store the user's rejection feedback and trigger the planner."""
     receive_id, receive_id_type = _reply_target(ctx, open_id)
 
-    project.context["latest_rejection_feedback"] = text
+    project.context = {**project.context, "latest_rejection_feedback": text}
     ctx.service.session.commit()
 
-    await ctx.bridge.send_text(
-        receive_id,
-        f"已收到你的反馈，Agent 会根据说明重新规划。",
-        receive_id_type=receive_id_type,
+    # Summarize the feedback in a card before re-planning.
+    sm = StateMachine(project.task_type)
+    rejected_state = project.context.get("rejected_confirmation_state")
+    if rejected_state:
+        state_display = sm.display_name(rejected_state)
+        rounds = project.context.get("confirmation_rounds", {})
+        # The round we are about to re-do is the next attempt.
+        round_number = rounds.get(rejected_state, 0) + 1
+    else:
+        state_display = sm.display_name(project.current_state)
+        round_number = 1
+    summary_card = build_rejection_summary_card(
+        project_name=project.name or project.id,
+        state_display=state_display,
+        feedback=text,
+        round_number=round_number,
+    )
+    await ctx.bridge._send_interactive(
+        receive_id, summary_card, receive_id_type=receive_id_type
     )
     await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
 
@@ -549,8 +569,36 @@ async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) ->
         approval.id, chosen, responded_by=open_id
     )
 
+    from_state = project.current_state
     await ctx.service.transition_state(
         project.id, chosen, triggered_by="feishu"
+    )
+
+    if is_rejection:
+        # Remember which confirmation state was rejected so the feedback summary
+        # card can show the correct round and name.
+        project.context = {**project.context, "rejected_confirmation_state": from_state}
+        ctx.service.session.commit()
+        # For rejection we wait for the user's free-form feedback text before
+        # re-running the agent.  Do not advance here.
+        return
+
+    # For confirmation, show a transition card before continuing to the next stage.
+    project = ctx.service.require_project(project.id)
+    sm = StateMachine(project.task_type)
+    round_number = approval.payload.get("round_number", 1)
+    transition_card = build_transition_card(
+        project_name=project.name or project.id,
+        from_state=from_state,
+        to_state=project.current_state,
+        from_state_type="human_confirmation",
+        to_state_type=sm.state_type(project.current_state),
+        from_agent="",
+        to_agent=ctx.orchestrator._agent_label_for_state(project.current_state),
+        round_number=round_number,
+    )
+    await ctx.bridge._send_interactive(
+        receive_id, transition_card, receive_id_type=receive_id_type
     )
 
     # Tick repeatedly so cards are sent for every confirmation stage.

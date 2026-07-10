@@ -540,7 +540,7 @@ class AgentOrchestrator:
         error: str,
     ) -> None:
         retry_key = state
-        retry_count = project.context.setdefault("retry_counts", {}).get(retry_key, 0)
+        retry_count = project.context.get("retry_counts", {}).get(retry_key, 0)
         max_retries = self._max_retries_for_state(state)
 
         await self.project_service.log_event(
@@ -596,6 +596,12 @@ class AgentOrchestrator:
         # Build question/options based on state
         question, options = self._build_confirmation_question(project, state)
 
+        # Track how many times this confirmation state has been entered.
+        rounds = dict(project.context.get("confirmation_rounds", {}))
+        round_number = rounds.get(state, 0) + 1
+        rounds[state] = round_number
+        project.context = {**project.context, "confirmation_rounds": rounds}
+
         task = (
             self.project_service.session.exec(
                 select(Task)
@@ -612,6 +618,7 @@ class AgentOrchestrator:
             approval_type="confirmation",
             question=question,
             options=options,
+            payload={"round_number": round_number},
         )
 
         # Auto-resolve if state does not require confirmation
@@ -1315,50 +1322,52 @@ class AgentOrchestrator:
             )
 
     async def _notify_state_transition(
-        self, project: Project, task: Task, from_state: str
+        self, project: Project, task: Task | None, from_state: str
     ) -> None:
         """Send a rich card notification when the project transitions between stages.
 
-        The card includes the previous agent's output summary and the new stage info.
+        The card reflects the correct semantics: a stage is only "completed" when
+        no human confirmation is required, or when the user has already confirmed.
         """
         if self.feishu_bridge is None:
             return
 
         # Only notify for meaningful transitions.
-        skip_states = {"INIT", "PAUSED"}
+        skip_states = {"INIT", "PAUSED", "CANCELLED"}
         if from_state in skip_states:
             return
 
-        # Notify when an agent_execution state completes (regardless of the next state).
-        agent_states = {
-            "PLANNING_REQUIREMENTS", "PLANNING_ARCHITECTURE", "PLANNING_SPECS",
-            "BUG_ANALYSIS", "DOC_OUTLINE", "CODING", "TESTING", "REVIEW",
-            "MERGING", "COMPLETED", "FAILED",
-        }
-        if from_state not in agent_states:
-            return
-
         sm = StateMachine(project.task_type)
-        from_display = sm.display_name(from_state)
-        to_display = sm.display_name(project.current_state)
+        to_state = project.current_state
         from_state_type = sm.state_type(from_state)
+        to_state_type = sm.state_type(to_state)
         from_agent = self._agent_label_for_state(from_state)
-        to_agent = self._agent_label_for_state(project.current_state)
+        to_agent = self._agent_label_for_state(to_state)
         name = project.name or project.id
 
+        # Round number for confirmation states.
+        round_number = None
+        if from_state_type == "human_confirmation":
+            rounds = project.context.get("confirmation_rounds", {})
+            round_number = rounds.get(from_state, 1)
+
         # Read the previous agent's output for a brief summary.
-        summary_note = self._agent_output_brief(project, from_state)
+        summary_note = ""
+        if from_state_type == "agent_execution":
+            summary_note = self._agent_output_brief(project, from_state)
 
         from mac_system.feishu.card import build_transition_card
 
         card = build_transition_card(
             project_name=name,
-            from_display=from_display,
-            to_display=to_display,
+            from_state=from_state,
+            to_state=to_state,
+            from_state_type=from_state_type,
+            to_state_type=to_state_type,
             from_agent=from_agent,
             to_agent=to_agent,
             status_note=summary_note,
-            from_state_type=from_state_type,
+            round_number=round_number,
         )
         receive_id, receive_id_type = self._resolve_project_recipient(project)
         try:

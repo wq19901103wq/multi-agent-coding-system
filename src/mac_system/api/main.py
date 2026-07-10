@@ -20,8 +20,8 @@ from mac_system.core.project_service import (
 from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.database import get_session, init_db, session_scope
 from mac_system.feishu import FeishuBridge, NullFeishuBridge
-from mac_system.feishu.handlers import FeishuHandlerContext, handle_card_action
-from mac_system.feishu.models import ButtonAction
+from mac_system.feishu.handlers import FeishuHandlerContext, handle_card_action, handle_text_message
+from mac_system.feishu.models import ButtonAction, TextMessage
 from mac_system.feishu.ws_client import FeishuWebSocketClient
 from mac_system.models import ProjectCreate, ProjectOut
 from mac_system.state_machine import StateMachine
@@ -480,6 +480,48 @@ async def inject_card_action(
 
         logging.getLogger(__name__).exception("inject_card_action failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"inject_card_action failed: {exc}")
+    return {"status": "ok"}
+
+
+class InjectTextMessageRequest(BaseModel):
+    open_id: str
+    text: str
+    chat_id: str | None = None
+    chat_type: str = "p2p"
+
+
+@app.post("/test/inject_text_message")
+async def inject_text_message(
+    req: InjectTextMessageRequest,
+    orchestrator: AgentOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    """Test-only endpoint to simulate a Feishu text message."""
+    settings = get_settings()
+    if not settings.feishu_test_mode:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    ctx = FeishuHandlerContext(
+        bridge=orchestrator.feishu_bridge or NullFeishuBridge(),
+        service=orchestrator.project_service,
+        orchestrator=orchestrator,
+        chat_id=req.chat_id,
+        chat_type=req.chat_type,
+    )
+    msg = TextMessage(
+        open_id=req.open_id,
+        message_id="msg_test",
+        text=req.text,
+        is_command=req.text.startswith("/"),
+        chat_id=req.chat_id,
+        chat_type=req.chat_type or "p2p",
+    )
+    try:
+        await handle_text_message(ctx, msg)
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).exception("inject_text_message failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"inject_text_message failed: {exc}")
     return {"status": "ok"}
 
 
