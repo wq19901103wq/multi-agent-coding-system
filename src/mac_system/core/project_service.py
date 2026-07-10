@@ -588,7 +588,10 @@ class ProjectService:
             window = config.get("night_window")
             if window and not self._in_night_window(window):
                 # Outside the night window, new night-mode projects behave like normal.
-                config = self._load_approval_mode_config("normal")
+                # In test mode, skip the window check so E2E tests can exercise
+                # night-mode behaviour regardless of the time of day.
+                if not self.settings.feishu_test_mode:
+                    config = self._load_approval_mode_config("normal")
         return config
 
     @staticmethod

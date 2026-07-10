@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlmodel import select
@@ -26,6 +27,7 @@ from mac_system.feishu.menu import (
 )
 from mac_system.feishu.models import ButtonAction, TextMessage
 from mac_system.models import Project, ProjectUser, RouteDecision
+from mac_system.state_machine import StateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +117,13 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         await _show_menu(ctx, open_id)
         return
 
+    # Before treating free-form text as a new project, check whether the user
+    # has an active project that was recently rejected and needs feedback.
+    active_project = _find_rejected_project_for_feedback(ctx, open_id)
+    if active_project is not None:
+        await _handle_rejection_feedback(ctx, open_id, active_project, text)
+        return
+
     # Default: treat free-form text as a project creation request.
     await _route_and_create(ctx, open_id, text)
 
@@ -126,6 +135,66 @@ async def _show_menu(ctx: FeishuHandlerContext, open_id: str) -> None:
         build_main_menu_card(chat_id=ctx.chat_id, chat_type=ctx.chat_type),
         receive_id_type=receive_id_type,
     )
+
+
+def _find_rejected_project_for_feedback(
+    ctx: FeishuHandlerContext, open_id: str
+) -> Project | None:
+    """Return the user's most recent active project that was just in a planning state."""
+    from sqlmodel import select
+
+    from mac_system.models import ProjectUser
+
+    user_projects = ctx.service.session.exec(
+        select(ProjectUser).where(ProjectUser.open_id == open_id)
+    ).all()
+    project_ids = {up.project_id for up in user_projects}
+    if not project_ids:
+        return None
+
+    # Find the most recently updated active project that is in a planning state
+    # (meaning it was just rolled back from a confirmation rejection).
+    planning_states = {
+        "PLANNING_REQUIREMENTS", "PLANNING_ARCHITECTURE", "PLANNING_SPECS",
+        "BUG_ANALYSIS", "DOC_OUTLINE",
+    }
+    projects = ctx.service.session.exec(
+        select(Project)
+        .where(Project.id.in_(project_ids))
+        .where(Project.status == "active")
+        .where(Project.current_state.in_(planning_states))
+        .order_by(Project.updated_at.desc())
+    ).all()
+
+    for project in projects:
+        # Only consider recently updated (within 10 min).
+        from datetime import timedelta
+
+        age = (datetime.utcnow() - project.updated_at.replace(tzinfo=None)).total_seconds()
+        if age < 600:
+            return project
+
+    return None
+
+
+async def _handle_rejection_feedback(
+    ctx: FeishuHandlerContext,
+    open_id: str,
+    project: Project,
+    text: str,
+) -> None:
+    """Store the user's rejection feedback and trigger the planner."""
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+
+    project.context["latest_rejection_feedback"] = text
+    ctx.service.session.commit()
+
+    await ctx.bridge.send_text(
+        receive_id,
+        f"已收到你的反馈，Agent 会根据说明重新规划。",
+        receive_id_type=receive_id_type,
+    )
+    await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
 
 
 async def _bind_project(
@@ -205,6 +274,8 @@ async def _create_project(
     receive_id, receive_id_type = _reply_target(ctx, open_id)
     project_chat_id = chat_id if chat_id is not None else ctx.chat_id
     project_chat_type = chat_type if chat_type is not None else ctx.chat_type
+    if not name:
+        name = suggest_name(description)
     try:
         project = await ctx.service.create_project(
             name=name,
@@ -234,12 +305,43 @@ async def _create_project(
         receive_id_type=receive_id_type,
     )
     try:
-        await ctx.orchestrator.tick(project.id)
+        await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
     except Exception as exc:
         logger.exception("Orchestrator tick failed after Feishu project creation")
         await ctx.bridge.send_text(
             receive_id, f"项目启动失败：{exc}", receive_id_type=receive_id_type
         )
+
+
+async def _advance_until_confirm(
+    ctx: FeishuHandlerContext,
+    project: Project,
+    receive_id: str,
+    receive_id_type: str,
+    max_ticks: int = 10,
+) -> None:
+    """Tick repeatedly until the project needs human input AND the card is sent.
+
+    Human_confirmation states need an explicit tick to create the approval card.
+    This helper keeps ticking through agent_execution states, then ticks the
+    human_confirmation state so the card is actually delivered, then returns.
+    """
+    last_state: str | None = None
+    for _ in range(max_ticks):
+        await ctx.orchestrator.tick(project.id)
+        project = ctx.service.require_project(project.id)
+        if project.current_state == last_state:
+            return  # Tick did not change state; avoid spinning forever.
+        last_state = project.current_state
+        sm = StateMachine(project.task_type)
+        st = sm.state_type(project.current_state)
+        if st in ("human_confirmation", "human_input"):
+            # We just arrived at a confirmation state; tick once more so the
+            # orchestrator creates the approval and sends the card.
+            await ctx.orchestrator.tick(project.id)
+            return
+        if st in ("terminal", "idle"):
+            return
 
 
 async def _route_and_create(
@@ -423,15 +525,29 @@ async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) ->
     await ctx.service.respond_approval(
         approval.id, chosen, responded_by=open_id
     )
+
+    is_rejection = chosen == "reject"
+
     await ctx.service.transition_state(
         project.id, chosen, triggered_by="feishu"
     )
-    await ctx.orchestrator.tick(project.id)
-    await ctx.bridge.send_text(
-        receive_id,
-        f"已处理，项目 {project.id} 继续执行",
-        receive_id_type=receive_id_type,
-    )
+
+    # Tick repeatedly so cards are sent for every confirmation stage.
+    await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
+
+    if is_rejection:
+        await ctx.bridge.send_text(
+            receive_id,
+            f"已驳回，项目 {project.id} 返回上一阶段。\n请直接回复你的修改意见或补充说明，Agent 会据此重新规划。",
+            receive_id_type=receive_id_type,
+        )
+    else:
+        await ctx.bridge.send_text(
+            receive_id,
+            f"已处理，项目 {project.id} 继续执行",
+            receive_id_type=receive_id_type,
+        )
+
 
 
 async def _handle_menu_action(

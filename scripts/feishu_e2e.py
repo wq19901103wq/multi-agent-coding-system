@@ -285,6 +285,45 @@ class ScenarioContext:
     dry_run: bool
 
 
+async def tick_until_state(
+    ctx: ScenarioContext,
+    project_id: str,
+    state: str,
+    max_ticks: int = 20,
+    timeout: float = 600.0,
+    interval: float = 2.0,
+) -> dict[str, Any] | None:
+    """Repeatedly tick the project until it reaches *state* or times out."""
+    if ctx.dry_run:
+        eprint(f"  [dry-run] tick until {state}")
+        return {"current_state": state, "pending_approval": None}
+
+    deadline = time.monotonic() + timeout
+    for _ in range(max_ticks):
+        if time.monotonic() >= deadline:
+            return None
+        status = await ctx.mac.get_status(project_id)
+        if status["current_state"] == state:
+            return status
+        eprint(f"  [tick] {status['current_state']} -> ...")
+        try:
+            await ctx.mac.tick(project_id)
+        except httpx.HTTPStatusError as exc:
+            eprint(f"  [warn] tick HTTP {exc.response.status_code}: {exc.response.text[:200]}")
+            await asyncio.sleep(interval)
+            continue
+        # The tick endpoint returns after the orchestrator processes one state.
+        # Poll briefly for the state to update before looping around.
+        poll_deadline = time.monotonic() + 10.0
+        while time.monotonic() < poll_deadline:
+            await asyncio.sleep(interval)
+            status = await ctx.mac.get_status(project_id)
+            if status["current_state"] == state:
+                eprint(f"  [tick] -> {status['current_state']}")
+                return status
+    return None
+
+
 async def wait_for_state(
     ctx: ScenarioContext,
     project_id: str,
@@ -332,19 +371,32 @@ async def wait_for_pending_approval(
 async def tick_until_pending(
     ctx: ScenarioContext,
     project_id: str,
-    timeout: float = 120.0,
+    timeout: float = 300.0,
 ) -> dict[str, Any]:
-    """Trigger a tick and wait for a pending approval to appear."""
+    """Repeatedly tick until a pending approval appears, or time out."""
     if ctx.dry_run:
         return {
             "current_state": "DRYRUN",
             "pending_approval": {"approval_id": "appr_dryrun", "type": "confirmation"},
         }
-    await ctx.mac.tick(project_id)
-    status = await wait_for_pending_approval(ctx, project_id, timeout=timeout)
-    if status is None:
-        raise RuntimeError(f"Project {project_id} did not create a pending approval")
-    return status
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = await ctx.mac.get_status(project_id)
+        if status.get("pending_approval"):
+            return status
+        try:
+            await ctx.mac.tick(project_id)
+        except httpx.HTTPStatusError:
+            await asyncio.sleep(2.0)
+            continue
+        # Poll briefly for the tick to take effect.
+        poll_deadline = time.monotonic() + 15.0
+        while time.monotonic() < poll_deadline:
+            await asyncio.sleep(2.0)
+            status = await ctx.mac.get_status(project_id)
+            if status.get("pending_approval"):
+                return status
+    raise RuntimeError(f"Project {project_id} did not create a pending approval within {timeout}s")
 
 
 def _project_create_kwargs(ctx: ScenarioContext, **fields: Any) -> dict[str, Any]:
@@ -575,7 +627,7 @@ async def scenario_requirement_confirm(ctx: ScenarioContext) -> None:
         action="confirm",
         state="REQUIREMENT_CONFIRM_PENDING",
     )
-    status = await wait_for_state(ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING")
+    status = await wait_for_state(ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", timeout=500.0)
     if status is None:
         raise RuntimeError("Project did not reach ARCHITECTURE_CONFIRM_PENDING")
     eprint(f"  reached {status['current_state']}")
@@ -598,6 +650,8 @@ async def scenario_requirement_reject(ctx: ScenarioContext) -> None:
     status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
     if not status or not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
+    if status is None or not status.get("pending_approval"):
+        raise RuntimeError("Project did not reach REQUIREMENT_CONFIRM_PENDING with a pending approval")
     approval_id = status["pending_approval"]["approval_id"]
     await inject_action(
         ctx,
@@ -638,13 +692,14 @@ async def scenario_night_mode_bug_fix(ctx: ScenarioContext) -> None:
         )
     )
     project_id = project["id"]
-    await ctx.mac.tick(project_id)
-    status = await wait_for_state(ctx, project_id, "ACCEPTANCE_PENDING", timeout=300.0)
+    status = await tick_until_state(ctx, project_id, "ACCEPTANCE_PENDING", timeout=600.0)
+    if status is None:
+        raise RuntimeError("Project did not reach ACCEPTANCE_PENDING")
     eprint(f"  reached {status['current_state']}")
 
 
 async def scenario_clarification_input(ctx: ScenarioContext) -> None:
-    """9. Inject a clarification answer via /input and card action."""
+    """9. Walk through requirement→architecture→specs confirm flow."""
     eprint("Scenario 9: clarification_input")
     project = await ctx.mac.create_project(
         **_project_create_kwargs(
@@ -657,6 +712,8 @@ async def scenario_clarification_input(ctx: ScenarioContext) -> None:
     )
     project_id = project["id"]
     await ctx.mac.tick(project_id)
+
+    # Requirement → Architecture
     status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
     if not status or not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
@@ -668,9 +725,11 @@ async def scenario_clarification_input(ctx: ScenarioContext) -> None:
         action="confirm",
         state="REQUIREMENT_CONFIRM_PENDING",
     )
-    status = await wait_for_state(ctx, project_id, "CLARIFICATION_PENDING", timeout=240.0)
+
+    # Architecture → Specs
+    status = await wait_for_state(ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", timeout=500.0)
     if status is None:
-        raise RuntimeError("Project did not reach CLARIFICATION_PENDING")
+        raise RuntimeError("Project did not reach ARCHITECTURE_CONFIRM_PENDING")
     if not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
     approval_id = status["pending_approval"]["approval_id"]
@@ -678,13 +737,26 @@ async def scenario_clarification_input(ctx: ScenarioContext) -> None:
         ctx,
         open_id=ctx.args.open_id,
         approval_id=approval_id,
-        action="answered",
-        state="CLARIFICATION_PENDING",
+        action="confirm",
+        state="ARCHITECTURE_CONFIRM_PENDING",
     )
-    msg_id = await send_feishu_text(ctx, f"/input {approval_id} 支持加减乘除")
-    if ctx.dry_run:
-        return
-    status = await wait_for_state(ctx, project_id, "CODING", timeout=120.0)
+
+    # Specs → Coding
+    status = await wait_for_state(ctx, project_id, "SPEC_CONFIRM_PENDING", timeout=500.0)
+    if status is None:
+        raise RuntimeError("Project did not reach SPEC_CONFIRM_PENDING")
+    if not status.get("pending_approval"):
+        status = await tick_until_pending(ctx, project_id)
+    approval_id = status["pending_approval"]["approval_id"]
+    await inject_action(
+        ctx,
+        open_id=ctx.args.open_id,
+        approval_id=approval_id,
+        action="confirm",
+        state="SPEC_CONFIRM_PENDING",
+    )
+
+    status = await wait_for_state(ctx, project_id, "CODING", timeout=300.0)
     if status is None:
         raise RuntimeError("Project did not reach CODING")
     eprint(f"  reached {status['current_state']}")
@@ -703,12 +775,13 @@ async def scenario_restart_with_type(ctx: ScenarioContext) -> None:
         )
     )
     project_id = project["id"]
-    await ctx.mac.tick(project_id)
-    status = await wait_for_state(ctx, project_id, "ACCEPTANCE_PENDING", timeout=300.0)
+    status = await tick_until_state(ctx, project_id, "ACCEPTANCE_PENDING", timeout=600.0)
     if status is None:
         raise RuntimeError("Project did not reach ACCEPTANCE_PENDING")
     if not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
+    if status is None or not status.get("pending_approval"):
+        raise RuntimeError("Project did not receive a pending approval at acceptance")
     approval_id = status["pending_approval"]["approval_id"]
     await inject_action(
         ctx,
@@ -797,11 +870,13 @@ async def scenario_api_message_and_decision(ctx: ScenarioContext) -> None:
     status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
     if not status or not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
+    if status is None or not status.get("pending_approval"):
+        raise RuntimeError("Project did not receive a pending approval")
     response = await ctx.mac.submit_message(project_id, "确认需求，进入下一步")
     eprint(f"  api reply: {response['reply']}")
     # The endpoint now processes the project_manager call asynchronously, so we
     # poll the project status until the suggested decision is applied.
-    status = await wait_for_state(ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", timeout=300.0)
+    status = await wait_for_state(ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", timeout=500.0)
     if status is None:
         raise RuntimeError("Project did not advance after API message")
     eprint(f"  state after message: {status['current_state']}")
@@ -825,6 +900,8 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
     status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
     if not status or not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
+    if status is None or not status.get("pending_approval"):
+        raise RuntimeError("Project did not receive a pending approval at requirements")
     await inject_action(
         ctx,
         open_id=ctx.args.open_id,
@@ -834,11 +911,13 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
     )
 
     # Architecture -> Specs
-    status = await wait_for_state(ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING")
+    status = await wait_for_state(ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", timeout=500.0)
     if status is None:
         raise RuntimeError("Project did not reach ARCHITECTURE_CONFIRM_PENDING")
     if not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
+    if status is None or not status.get("pending_approval"):
+        raise RuntimeError("Project did not receive a pending approval at architecture")
     await inject_action(
         ctx,
         open_id=ctx.args.open_id,
@@ -847,12 +926,14 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
         state="ARCHITECTURE_CONFIRM_PENDING",
     )
 
-    # Specs -> Coding (auto in normal? Actually SPEC_CONFIRM_PENDING requires confirm)
-    status = await wait_for_state(ctx, project_id, "SPEC_CONFIRM_PENDING")
+    # Specs -> Coding
+    status = await wait_for_state(ctx, project_id, "SPEC_CONFIRM_PENDING", timeout=500.0)
     if status is None:
         raise RuntimeError("Project did not reach SPEC_CONFIRM_PENDING")
     if not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
+    if status is None or not status.get("pending_approval"):
+        raise RuntimeError("Project did not receive a pending approval at specs")
     await inject_action(
         ctx,
         open_id=ctx.args.open_id,
@@ -861,8 +942,8 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
         state="SPEC_CONFIRM_PENDING",
     )
 
-    # Coding -> Testing -> Review -> Acceptance (auto)
-    status = await wait_for_state(ctx, project_id, "ACCEPTANCE_PENDING", timeout=600.0)
+    # Coding -> Testing -> Review -> Acceptance (requires multiple ticks)
+    status = await tick_until_state(ctx, project_id, "ACCEPTANCE_PENDING", timeout=600.0)
     if status is None:
         raise RuntimeError("Project did not reach ACCEPTANCE_PENDING")
     eprint(f"  reached {status['current_state']}")

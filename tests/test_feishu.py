@@ -97,7 +97,7 @@ async def test_text_message_routes_pending_description(feishu_ctx):
 
     assert feishu_ctx.service.get_pending_intent("ou_1") is None
     assert any("已创建项目" in c[2] for c in feishu_ctx.bridge.sent if c[0] == "text")
-    assert len(feishu_ctx.orchestrator.ticked) == 1
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
 
 
 async def test_intent_confirm_creates_project(feishu_ctx):
@@ -121,7 +121,7 @@ async def test_intent_confirm_creates_project(feishu_ctx):
 
     assert feishu_ctx.service.get_pending_intent("ou_1") is None
     assert any("已创建项目" in c[2] for c in feishu_ctx.bridge.sent if c[0] == "text")
-    assert len(feishu_ctx.orchestrator.ticked) == 1
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
 
 
 def test_verify_signature():

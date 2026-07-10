@@ -102,6 +102,40 @@ def build_input_card(
     }
 
 
+def build_transition_card(
+    project_name: str,
+    from_display: str,
+    to_display: str,
+    from_agent: str,
+    to_agent: str,
+    status_note: str = "",
+) -> dict[str, Any]:
+    """Build a card for state transitions showing stage change and agent handoff."""
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": _lark_md(f"**{project_name}**")},
+        {"tag": "hr"},
+        {"tag": "div", "text": _lark_md(f"✅ 已完成：{from_display}")},
+        {"tag": "div", "text": _lark_md(f"🔄 开始：{to_display}")},
+        {"tag": "hr"},
+    ]
+    if from_agent and to_agent and from_agent != to_agent:
+        elements.append(
+            {"tag": "div", "text": _lark_md(f"{from_agent} → {to_agent}")}
+        )
+    elif to_agent:
+        elements.append(
+            {"tag": "div", "text": _lark_md(f"执行者：{to_agent}")}
+        )
+    if status_note:
+        elements.append({"tag": "div", "text": _lark_md(status_note)})
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header("状态流转", "blue"),
+        "elements": elements,
+    }
+
+
 def build_status_card(
     title: str,
     project_id: str,

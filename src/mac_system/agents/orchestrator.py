@@ -23,6 +23,99 @@ class OrchestratorError(Exception):
 logger = logging.getLogger(__name__)
 
 
+def _flatten_item(item: Any) -> str:
+    """Convert a dict/list item to a readable string, never raw JSON repr."""
+    if isinstance(item, dict):
+        # Decision objects: use topic + selected option.
+        topic = item.get("topic") or item.get("decision") or ""
+        if topic:
+            options = item.get("options", [])
+            if isinstance(options, list) and options:
+                chosen = options[0]
+                if isinstance(chosen, dict):
+                    label = chosen.get("label") or chosen.get("key") or str(chosen)
+                    return f"{topic}：{label}"
+            return topic
+
+        # Module objects: name + responsibility.
+        name = item.get("name") or ""
+        resp = item.get("responsibility") or ""
+        if name and resp:
+            return f"{name} — {resp}"
+        if name:
+            return str(name)
+
+        # Generic: show key-value pairs compactly, skip large nested values.
+        parts = []
+        for k, v in item.items():
+            if isinstance(v, (dict, list)):
+                continue
+            parts.append(f"{k}: {v}")
+        return "; ".join(parts) if parts else str(item)
+    if isinstance(item, list):
+        return ", ".join(str(i) for i in item)
+    return str(item)
+
+
+def _split_markdown_sections(text: str, max_chars: int = 1600) -> list[str]:
+    """Split Markdown text into readable chunks at section boundaries.
+
+    Tries to keep sections together; only splits a section if it alone exceeds
+    ``max_chars``.  Returns at least one chunk.
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    # Split on lines that look like section headers (**title** or ## title).
+    import re
+    header_pattern = re.compile(r"^(\*\*[^*]+\*\*|#{1,6}\s+.+)$", re.MULTILINE)
+    sections: list[str] = []
+    last = 0
+    for m in header_pattern.finditer(text):
+        if m.start() > last:
+            sections.append(text[last:m.start()].strip())
+        last = m.start()
+    if last < len(text):
+        sections.append(text[last:].strip())
+
+    # Drop empty leading chunk if the text started with a header.
+    sections = [s for s in sections if s]
+
+    chunks: list[str] = []
+    current = ""
+    for section in sections:
+        if len(section) > max_chars:
+            # Flush current first.
+            if current:
+                chunks.append(current)
+                current = ""
+            # Hard-split oversized section by paragraphs.
+            paragraphs = [p for p in section.split("\n\n") if p.strip()]
+            for para in paragraphs:
+                if len(current) + len(para) + 2 > max_chars:
+                    if current:
+                        chunks.append(current)
+                    current = para
+                else:
+                    current = f"{current}\n\n{para}".strip() if current else para
+        else:
+            if current and len(current) + len(section) + 2 > max_chars:
+                chunks.append(current)
+                current = section
+            else:
+                current = f"{current}\n\n{section}".strip() if current else section
+    if current:
+        chunks.append(current)
+    return chunks if chunks else [text]
+
+
+def _mention_prefix(open_id: str | None) -> str:
+    """Return a Feishu @ mention tag for use in group text messages."""
+    if not open_id:
+        return ""
+    return f'<at user_id="{open_id}">@用户</at> '
+
+
 class AgentOrchestrator:
     def __init__(
         self,
@@ -88,12 +181,19 @@ class AgentOrchestrator:
             )
             return
 
+        # Include any rejection feedback the user provided.
+        rejection_note = project.context.pop("latest_rejection_feedback", "")
+
         # Create task
         task = await self.project_service.create_task(
             project_id=project.id,
             agent_type=agent_type,
             state=state,
-            input_data={"description": project.description, "state": state},
+            input_data={
+                "description": project.description,
+                "state": state,
+                "rejection_note": rejection_note,
+            },
         )
 
         # Create worktree
@@ -380,7 +480,9 @@ class AgentOrchestrator:
         state = project.current_state
         event = output.get("next_state_event", "complete")
 
-        # For planner stages, write the output JSON to .mac/ file
+        # For planner stages, copy the .mac/ output files written by the agent
+        # from the worktree back to the main workspace.  (Coder/tester/reviewer
+        # stages go through a full git merge later in this method.)
         if state in (
             "PLANNING_REQUIREMENTS",
             "PLANNING_ARCHITECTURE",
@@ -388,7 +490,7 @@ class AgentOrchestrator:
             "BUG_ANALYSIS",
             "DOC_OUTLINE",
         ):
-            self._write_planner_output(project, state, output)
+            self._copy_mac_outputs(project, worktree, output, state)
 
         # For coder/tester/reviewer, merge worktree changes
         if state in ("CODING", "TESTING", "REVIEW") and event == "complete":
@@ -411,9 +513,13 @@ class AgentOrchestrator:
 
         # Transition state
         payload = self._build_transition_payload(output)
+        from_state = project.current_state
         await self.project_service.transition_state(
             project.id, event, payload=payload, triggered_by="agent"
         )
+
+        # Send a brief status notification so the user can follow progress.
+        await self._notify_state_transition(project, task, from_state)
 
         # Clean up the now-unneeded worktree for non-merge states.
         if state not in ("CODING", "TESTING", "REVIEW"):
@@ -527,6 +633,8 @@ class AgentOrchestrator:
                 await self.project_service.transition_state(
                     project.id, chosen, triggered_by="system_auto"
                 )
+                # Notify the user that the system auto-resolved this step.
+                await self._notify_auto_resolve(project, state, chosen)
                 return
 
         # Enrich acceptance cards with an evaluator recommendation.
@@ -536,21 +644,77 @@ class AgentOrchestrator:
 
         # Otherwise, send notification and wait
         if self.feishu_bridge:
-            details = {"state": state}
+            sm = StateMachine(project.task_type)
+            state_display = sm.display_name(state)
+            project_name = project.name or project.id
+            title = f"{question} — {project_name}"
+
+            state_details = self._build_details_for_state(project, state)
+            details: dict[str, Any] = {"当前阶段": state_display}
+            if state_details:
+                details.update(state_details)
             if acceptance_recommendation:
-                details["acceptance_recommendation"] = acceptance_recommendation
+                rec_summary = acceptance_recommendation.get("reason") or acceptance_recommendation.get("summary", "")
+                if rec_summary:
+                    details["验收评估"] = rec_summary[:200]
+                if acceptance_recommendation.get("action") == "confirm":
+                    details["建议操作"] = "验收通过"
+            summary_text = self._build_summary_for_state(project, state)
             receive_id, receive_id_type = self._resolve_project_recipient(project)
-            await self.feishu_bridge.send_confirmation_card(
-                open_id=receive_id,
-                approval_id=approval.id,
-                title=question,
-                summary=self._build_summary_for_state(project, state),
-                details=details,
-                options=options,
-                receive_id_type=receive_id_type,
-                chat_id=project.feishu_chat_id,
-                chat_type=project.feishu_chat_type,
-            )
+            creator_open_id = self._get_creator_open_id(project.id)
+
+            # Feishu interactive card JSON is best kept under ~30 KB and the
+            # mobile client renders long lark_md blocks poorly.  If the summary
+            # is long we send a compact card with a preview + action buttons,
+            # then stream the full content as plain text messages (a la
+            # feishu-connect) split at Markdown section boundaries.
+            CARD_SUMMARY_LIMIT = 900
+            is_long = len(summary_text) > CARD_SUMMARY_LIMIT
+
+            if is_long:
+                preview = summary_text[:CARD_SUMMARY_LIMIT].rsplit("\n", 1)[0].strip()
+                if len(preview) < 100:
+                    preview = summary_text[:CARD_SUMMARY_LIMIT].strip()
+                card_summary = preview + "\n\n（完整内容见下方消息）"
+            else:
+                card_summary = summary_text
+
+            try:
+                await self.feishu_bridge.send_confirmation_card(
+                    open_id=receive_id,
+                    approval_id=approval.id,
+                    title=title,
+                    summary=card_summary,
+                    details=details,
+                    options=options,
+                    receive_id_type=receive_id_type,
+                    chat_id=project.feishu_chat_id,
+                    chat_type=project.feishu_chat_type,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to send confirmation card for %s: %s", project.id, exc
+                )
+
+            # Send the full summary as clean plain-text messages when it is long.
+            if is_long:
+                chunks = _split_markdown_sections(summary_text, max_chars=1600)
+                prefix = _mention_prefix(creator_open_id) if receive_id_type == "chat_id" else ""
+                total = len(chunks)
+                for idx, chunk in enumerate(chunks, start=1):
+                    header = f"{prefix}📄 {question}（{idx}/{total}）\n"
+                    body = chunk
+                    try:
+                        await self.feishu_bridge.send_text(
+                            receive_id,
+                            header + body,
+                            receive_id_type=receive_id_type,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to send summary chunk for %s: %s", project.id, exc
+                        )
+                        break
 
     async def _handle_human_input(
         self,
@@ -599,16 +763,47 @@ class AgentOrchestrator:
 
         if self.feishu_bridge:
             receive_id, receive_id_type = self._resolve_project_recipient(project)
+            creator_open_id = self._get_creator_open_id(project.id)
+            context_text = self._build_summary_for_state(project, state)
+
+            # Keep the input card compact; stream long context as text messages.
+            INPUT_CONTEXT_LIMIT = 800
+            if len(context_text) > INPUT_CONTEXT_LIMIT:
+                card_context = context_text[:INPUT_CONTEXT_LIMIT].rsplit("\n", 1)[0].strip()
+                if len(card_context) < 80:
+                    card_context = context_text[:INPUT_CONTEXT_LIMIT].strip()
+                card_context += "\n\n（完整上下文见下方消息）"
+            else:
+                card_context = context_text
+
             await self.feishu_bridge.send_input_card(
                 open_id=receive_id,
                 approval_id=approval.id,
                 title=question,
                 question=question,
-                context=self._build_summary_for_state(project, state),
+                context=card_context,
                 receive_id_type=receive_id_type,
                 chat_id=project.feishu_chat_id,
                 chat_type=project.feishu_chat_type,
             )
+
+            if len(context_text) > INPUT_CONTEXT_LIMIT:
+                chunks = _split_markdown_sections(context_text, max_chars=1600)
+                prefix = _mention_prefix(creator_open_id) if receive_id_type == "chat_id" else ""
+                total = len(chunks)
+                for idx, chunk in enumerate(chunks, start=1):
+                    header = f"{prefix}📄 {question}（{idx}/{total}）\n"
+                    try:
+                        await self.feishu_bridge.send_text(
+                            receive_id,
+                            header + chunk,
+                            receive_id_type=receive_id_type,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to send input context chunk for %s: %s", project.id, exc
+                        )
+                        break
 
     async def _execute_system_action(
         self,
@@ -698,6 +893,41 @@ class AgentOrchestrator:
                 files.append(mac / "ARCHITECTURE.json")
 
         return [f for f in files if f.exists()]
+
+    def _copy_mac_outputs(
+        self, project: Project, worktree: Path, output: dict[str, Any], state: str
+    ) -> None:
+        """Copy .mac/ output files from the worktree to the main workspace.
+
+        The real agent writes REQUIREMENTS.json / ARCHITECTURE.json / etc.
+        inside the worktree; for FakeRuntime (tests) no files are on disk so
+        we fall back to writing the output dict directly.
+        """
+        import shutil
+
+        mapping = {
+            "PLANNING_REQUIREMENTS": "REQUIREMENTS.json",
+            "PLANNING_ARCHITECTURE": "ARCHITECTURE.json",
+            "PLANNING_SPECS": "SPECS.json",
+            "BUG_ANALYSIS": "BUG_ANALYSIS.json",
+            "DOC_OUTLINE": "DOC_OUTLINE.json",
+        }
+        filename = mapping.get(state)
+        if filename is None:
+            return
+
+        dst_mac = Path(project.workspace_path) / ".mac"
+        dst_mac.mkdir(parents=True, exist_ok=True)
+        src_file = worktree / ".mac" / filename
+
+        if src_file.is_file():
+            shutil.copy2(src_file, dst_mac / filename)
+            logger.debug("Copied %s from worktree to workspace", filename)
+        else:
+            # Fallback: write the output dict (used by FakeRuntime in tests).
+            with open(dst_mac / filename, "w", encoding="utf-8") as f:
+                json.dump(output, f, ensure_ascii=False, indent=2)
+            logger.debug("Wrote %s from agent output (fallback)", filename)
 
     def _write_planner_output(self, project: Project, state: str, output: dict[str, Any]) -> None:
         workspace = Path(project.workspace_path)
@@ -821,8 +1051,376 @@ class AgentOrchestrator:
         return f"请输入 {state}"
 
     def _build_summary_for_state(self, project: Project, state: str) -> str:
-        # Simplified summary
-        return f"Project {project.id} at {state}"
+        """Read the relevant .mac/ output file and return a human-readable summary.
+
+        The output is pure plain text / lark-md — no JSON key-value pairs.
+        """
+        if state == "ACCEPTANCE_PENDING":
+            return self._build_acceptance_summary(project)
+
+        workspace = Path(project.workspace_path)
+        mac = workspace / ".mac"
+
+        file_map = {
+            "REQUIREMENT_CONFIRM_PENDING": "REQUIREMENTS.json",
+            "ARCHITECTURE_CONFIRM_PENDING": "ARCHITECTURE.json",
+            "SPEC_CONFIRM_PENDING": "SPECS.json",
+            "BUG_FIX_CONFIRM_PENDING": "BUG_ANALYSIS.json",
+            "OUTLINE_CONFIRM_PENDING": "DOC_OUTLINE.json",
+        }
+        filename = file_map.get(state)
+        if filename is None:
+            return self._fallback_summary(project, state)
+
+        path = mac / filename
+        if not path.exists():
+            return self._fallback_summary(project, state)
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return self._fallback_summary(project, state)
+
+        parts: list[str] = []
+
+        # SPECS.json has a "specs" list instead of a single summary.
+        if data.get("specs") and isinstance(data["specs"], list):
+            spec_parts = []
+            for spec in data["specs"]:
+                if isinstance(spec, dict):
+                    name = spec.get("name") or spec.get("title") or ""
+                    desc = spec.get("description") or spec.get("summary") or ""
+                    if name and desc:
+                        spec_parts.append(f"• {name}：{desc}")
+                    elif name:
+                        spec_parts.append(f"• {name}")
+                elif isinstance(spec, str):
+                    spec_parts.append(f"• {spec}")
+            if spec_parts:
+                parts.append("**详细规格**\n" + "\n".join(spec_parts))
+
+        if data.get("summary"):
+            parts.append(data["summary"])
+        if data.get("goals"):
+            parts.append("**目标**\n" + "\n".join(f"• {g}" for g in data["goals"]))
+        if data.get("acceptance_criteria"):
+            parts.append("**验收标准**\n" + "\n".join(f"• {a}" for a in data["acceptance_criteria"]))
+        if data.get("root_cause"):
+            parts.append(f"**根因分析**\n{data['root_cause']}")
+        if data.get("fix_strategy"):
+            parts.append(f"**修复方案**\n{data['fix_strategy']}")
+        if data.get("affected_files"):
+            parts.append("**涉及文件**\n" + "\n".join(f"• {f}" for f in data["affected_files"]))
+        if data.get("tech_stack"):
+            parts.append(f"**技术栈**\n{', '.join(data['tech_stack'])}")
+        if data.get("modules"):
+            parts.append("**模块划分**\n" + "\n".join(
+                f"• {_flatten_item(m)}" for m in data["modules"]
+            ))
+        if data.get("decisions"):
+            parts.append("**关键决策**\n" + "\n".join(
+                f"• {_flatten_item(d)}" for d in data["decisions"]
+            ))
+        if data.get("risks"):
+            parts.append("**风险**\n" + "\n".join(
+                f"• {_flatten_item(r)}" for r in data["risks"]
+            ))
+
+        if not parts:
+            return self._fallback_summary(project, state)
+        return "\n\n".join(parts)
+
+    def _build_acceptance_summary(self, project: Project) -> str:
+        """Build a human-readable summary for the acceptance gate.
+
+        Combines the latest completed coder/tester/reviewer/acceptance_evaluator
+        task outputs so the user sees what was built, tested, reviewed and
+        recommended without reading raw JSON.
+        """
+        from sqlmodel import select
+
+        parts: list[str] = []
+
+        # Load task outputs from DB, newest first.
+        tasks = self.project_service.session.exec(
+            select(Task)
+            .where(Task.project_id == project.id, Task.status == "completed")
+            .order_by(Task.updated_at.desc())
+        ).all()
+
+        acceptance_task = next((t for t in tasks if t.agent_type == "acceptance_evaluator"), None)
+        review_task = next((t for t in tasks if t.agent_type == "reviewer"), None)
+        test_task = next((t for t in tasks if t.agent_type == "tester"), None)
+        code_task = next((t for t in tasks if t.agent_type == "coder"), None)
+
+        if code_task and code_task.output_data:
+            out = code_task.output_data
+            files = out.get("modified_files") or []
+            if files and isinstance(files, list):
+                file_lines = []
+                for f in files:
+                    if isinstance(f, dict):
+                        path = f.get("path") or f.get("file") or ""
+                        desc = f.get("description") or ""
+                        if path and desc:
+                            file_lines.append(f"• {path}：{desc}")
+                        elif path:
+                            file_lines.append(f"• {path}")
+                    elif isinstance(f, str):
+                        file_lines.append(f"• {f}")
+                if file_lines:
+                    parts.append("**实现文件**\n" + "\n".join(file_lines))
+            notes = out.get("notes")
+            if notes and isinstance(notes, list):
+                parts.append("**实现备注**\n" + "\n".join(f"• {n}" for n in notes if isinstance(n, str)))
+
+        if test_task and test_task.output_data:
+            out = test_task.output_data
+            report = out.get("report", "")
+            if report:
+                parts.append(f"**测试报告**\n{report}")
+            else:
+                passed = out.get("passed")
+                coverage = out.get("coverage")
+                status = "通过" if passed else "未通过"
+                line = f"测试状态：{status}"
+                if coverage is not None:
+                    line += f"，覆盖率 {coverage:.0%}"
+                parts.append(f"**测试结果**\n{line}")
+            failures = out.get("failures") or []
+            if failures and isinstance(failures, list):
+                parts.append("**失败项**\n" + "\n".join(f"• {_flatten_item(f)}" for f in failures))
+
+        if review_task and review_task.output_data:
+            out = review_task.output_data
+            result = out.get("result", "")
+            issues = out.get("issues") or []
+            summary = out.get("summary", "")
+            if summary:
+                parts.append(f"**Review 结论**\n{summary}")
+            elif result:
+                parts.append(f"**Review 结论**\n{result}")
+            if issues and isinstance(issues, list):
+                issue_lines = []
+                for issue in issues[:5]:
+                    if isinstance(issue, dict):
+                        sev = issue.get("severity", "")
+                        desc = issue.get("description", "")
+                        file = issue.get("file", "")
+                        if desc:
+                            label = f"[{sev}]" if sev else ""
+                            loc = f" {file}" if file else ""
+                            issue_lines.append(f"• {label}{loc} {desc}")
+                    elif isinstance(issue, str):
+                        issue_lines.append(f"• {issue}")
+                if issue_lines:
+                    parts.append("**Review 问题**\n" + "\n".join(issue_lines))
+
+        if acceptance_task and acceptance_task.output_data:
+            out = acceptance_task.output_data
+            summary = out.get("summary", "")
+            reason = out.get("reason") or out.get("recommendation", {}).get("reason", "")
+            action = out.get("action") or out.get("recommendation", {}).get("action", "")
+            rec_parts: list[str] = []
+            if summary:
+                rec_parts.append(summary)
+            if reason:
+                rec_parts.append(f"理由：{reason}")
+            if action:
+                rec_parts.append(f"建议：{'验收通过' if action == 'confirm' else '需要修改'}")
+            if rec_parts:
+                parts.append("**验收评估**\n" + "\n".join(rec_parts))
+
+        if not parts:
+            return self._fallback_summary(project, "ACCEPTANCE_PENDING")
+        return "\n\n".join(parts)
+
+    def _fallback_summary(self, project: Project, state: str) -> str:
+        name = project.name or project.id
+        sm = StateMachine(project.task_type)
+        display = sm.display_name(state)
+        return f"项目 {name}\n当前阶段：{display}（尚未生成输出文件）"
+
+    def _build_details_for_state(self, project: Project, state: str) -> dict[str, Any]:
+        """Return compact key-value fields for a confirmation card (Chinese labels only).
+
+        These fields are intentionally small metadata — the main content lives in
+        the card summary and, when long, in follow-up text messages.  Keeping
+        details short avoids duplicating long text inside the card.
+        """
+        # Agent label for the most recently completed task.
+        agent_label = self._last_agent_label(project)
+        details: dict[str, str] = {}
+        if agent_label:
+            details["生成者"] = agent_label
+
+        # For acceptance, add a compact recommendation line if available.
+        if state == "ACCEPTANCE_PENDING":
+            from sqlmodel import select
+
+            acceptance_task = self.project_service.session.exec(
+                select(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.agent_type == "acceptance_evaluator",
+                    Task.status == "completed",
+                )
+                .order_by(Task.updated_at.desc())
+                .limit(1)
+            ).first()
+            if acceptance_task and acceptance_task.output_data:
+                out = acceptance_task.output_data
+                action = out.get("action") or out.get("recommendation", {}).get("action", "")
+                if action == "confirm":
+                    details["评估建议"] = "通过"
+                elif action:
+                    details["评估建议"] = "需修改"
+
+        return details
+
+    def _last_agent_label(self, project: Project) -> str:
+        """Human-readable label for the last completed agent (e.g. 需求分析师)."""
+        agent_label_map = {
+            "planner": "需求分析师",
+            "coder": "编码 Agent",
+            "tester": "测试 Agent",
+            "reviewer": "Review Agent",
+            "project_manager": "项目经理 Agent",
+            "acceptance_evaluator": "验收评估 Agent",
+        }
+        tasks = self.project_service.session.exec(
+            select(Task)
+            .where(Task.project_id == project.id, Task.status == "completed")
+            .order_by(Task.updated_at.desc())
+            .limit(1)
+        ).all()
+        if tasks:
+            return agent_label_map.get(tasks[0].agent_type, tasks[0].agent_type)
+        return ""
+
+    async def _notify_auto_resolve(
+        self, project: Project, from_state: str, chosen: str
+    ) -> None:
+        """Notify the user that a confirmation was auto-resolved."""
+        if self.feishu_bridge is None:
+            return
+        sm = StateMachine(project.task_type)
+        display = sm.display_name(project.current_state)
+        name = project.name or project.id
+        label = {"confirm": "已自动确认", "reject": "已自动驳回"}.get(chosen, f"已自动处理({chosen})")
+        line = f"**{name}**\n{label}\n当前阶段：{display}"
+        receive_id, receive_id_type = self._resolve_project_recipient(project)
+        try:
+            await self.feishu_bridge.send_text(
+                receive_id, line, receive_id_type=receive_id_type,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to send auto-resolve notification for %s: %s", project.id, exc
+            )
+
+    async def _notify_state_transition(
+        self, project: Project, task: Task, from_state: str
+    ) -> None:
+        """Send a rich card notification when the project transitions between stages.
+
+        The card includes the previous agent's output summary and the new stage info.
+        """
+        if self.feishu_bridge is None:
+            return
+
+        # Only notify for meaningful transitions.
+        skip_states = {"INIT", "PAUSED"}
+        if from_state in skip_states:
+            return
+
+        # Notify when an agent_execution state completes (regardless of the next state).
+        agent_states = {
+            "PLANNING_REQUIREMENTS", "PLANNING_ARCHITECTURE", "PLANNING_SPECS",
+            "BUG_ANALYSIS", "DOC_OUTLINE", "CODING", "TESTING", "REVIEW",
+            "MERGING", "COMPLETED", "FAILED",
+        }
+        if from_state not in agent_states:
+            return
+
+        sm = StateMachine(project.task_type)
+        from_display = sm.display_name(from_state)
+        to_display = sm.display_name(project.current_state)
+        from_agent = self._agent_label_for_state(from_state)
+        to_agent = self._agent_label_for_state(project.current_state)
+        name = project.name or project.id
+
+        # Read the previous agent's output for a brief summary.
+        summary_note = self._agent_output_brief(project, from_state)
+
+        from mac_system.feishu.card import build_transition_card
+
+        card = build_transition_card(
+            project_name=name,
+            from_display=from_display,
+            to_display=to_display,
+            from_agent=from_agent,
+            to_agent=to_agent,
+            status_note=summary_note,
+        )
+        receive_id, receive_id_type = self._resolve_project_recipient(project)
+        try:
+            await self.feishu_bridge._send_interactive(
+                receive_id, card, receive_id_type=receive_id_type,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to send transition card for %s: %s", project.id, exc
+            )
+
+    def _agent_output_brief(self, project: Project, state: str) -> str:
+        """Return a one-line summary of what the agent at *state* produced."""
+        workspace = Path(project.workspace_path)
+        mac = workspace / ".mac"
+        file_map = {
+            "PLANNING_REQUIREMENTS": "REQUIREMENTS.json",
+            "PLANNING_ARCHITECTURE": "ARCHITECTURE.json",
+            "PLANNING_SPECS": "SPECS.json",
+            "BUG_ANALYSIS": "BUG_ANALYSIS.json",
+            "DOC_OUTLINE": "DOC_OUTLINE.json",
+        }
+        filename = file_map.get(state)
+        if not filename:
+            # For CODING/TESTING/REVIEW, check the task output.
+            return ""
+        path = mac / filename
+        if not path.exists():
+            return ""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return ""
+        summary = data.get("summary", "")
+        if summary and len(summary) > 120:
+            summary = summary[:120] + "…"
+        return summary
+
+    def _agent_label_for_state(self, state: str) -> str:
+        """Map a state name to the Chinese label of the agent that handles it."""
+        # Try each task type; human_confirmation / terminal states don't have agents.
+        agent_type = None
+        for tt in ("feature", "bug_fix", "documentation"):
+            try:
+                sm = StateMachine(tt)
+                agent_type = sm.agent_for(state)
+                if agent_type:
+                    break
+            except (KeyError, FileNotFoundError, ValueError):
+                continue
+        label_map = {
+            "planner": "需求分析师",
+            "coder": "编码 Agent",
+            "tester": "测试 Agent",
+            "reviewer": "Review Agent",
+            "project_manager": "项目经理 Agent",
+            "acceptance_evaluator": "验收评估 Agent",
+        }
+        return label_map.get(agent_type or "", agent_type or "")
 
     def _get_creator_open_id(self, project_id: str) -> str | None:
         from sqlmodel import select
