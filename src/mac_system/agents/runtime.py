@@ -83,6 +83,11 @@ class ClaudeCodeRuntime(AgentRuntime):
             env["ANTHROPIC_API_KEY"] = self.anthropic_api_key
         if self.anthropic_auth_token:
             env["ANTHROPIC_AUTH_TOKEN"] = self.anthropic_auth_token
+            if not self.anthropic_api_key:
+                # Claude Code CLI checks ANTHROPIC_API_KEY for auth; when using
+                # a third-party Anthropic-compatible provider (e.g. DeepSeek),
+                # the auth token doubles as the API key.
+                env["ANTHROPIC_API_KEY"] = self.anthropic_auth_token
         if self.anthropic_base_url:
             env["ANTHROPIC_BASE_URL"] = self.anthropic_base_url
         if self.claude_model:
