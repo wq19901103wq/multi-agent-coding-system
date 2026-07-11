@@ -8,7 +8,8 @@ from sqlmodel import Session, SQLModel, create_engine
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.agents.prompts import PromptRenderer
 from mac_system.agents.runtime import FakeRuntime
-from mac_system.api.main import app, get_orchestrator, get_project_service
+from mac_system.api.dependencies import get_orchestrator, get_project_service
+from mac_system.api.main import app
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
@@ -229,3 +230,74 @@ def test_inject_card_action_with_group_chat_context(client, monkeypatch):
 
     status_resp = client.get(f"/projects/{project_id}/status")
     assert status_resp.json()["current_state"] == "ARCHITECTURE_CONFIRM_PENDING"
+
+
+def test_admin_projects_panel_lists_projects(client):
+    create_resp = client.post(
+        "/projects",
+        json={
+            "name": "admin-test-project",
+            "task_type": "feature",
+            "description": "实现 admin 面板测试",
+            "approval_mode": "auto",
+        },
+    )
+    project_id = create_resp.json()["id"]
+
+    response = client.get("/admin/projects")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert project_id in response.text
+
+
+def test_admin_cancel_project(client):
+    create_resp = client.post(
+        "/projects",
+        json={
+            "name": "admin-cancel-test",
+            "task_type": "feature",
+            "description": "实现 admin 终止测试",
+            "approval_mode": "auto",
+        },
+    )
+    project_id = create_resp.json()["id"]
+
+    response = client.post(f"/admin/projects/{project_id}/cancel", follow_redirects=False)
+    assert response.status_code == 303
+
+    status_resp = client.get(f"/projects/{project_id}/status")
+    assert status_resp.json()["status"] == "cancelled"
+
+
+def test_admin_rollback_project(client):
+    create_resp = client.post(
+        "/projects",
+        json={
+            "name": "admin-rollback-test",
+            "task_type": "feature",
+            "description": "实现 admin 回退测试",
+            "approval_mode": "auto",
+        },
+    )
+    project_id = create_resp.json()["id"]
+
+    response = client.post(
+        f"/admin/projects/{project_id}/rollback",
+        data={"target_state": "INIT"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    status_resp = client.get(f"/projects/{project_id}/status")
+    assert status_resp.json()["current_state"] == "INIT"
+
+
+def test_admin_token_blocks_unauthorized(client, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "admin_token", "secret-token")
+
+    response = client.get("/admin/projects")
+    assert response.status_code == 403
+
+    response = client.get("/admin/projects?token=secret-token")
+    assert response.status_code == 200

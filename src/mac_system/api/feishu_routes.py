@@ -105,6 +105,7 @@ async def feishu_events(
             chat_type=msg.chat_type,
         )
         await handle_text_message(ctx, msg)
+        session.commit()
         return {"status": "ok"}
 
     # Card button action
@@ -123,6 +124,7 @@ async def feishu_events(
             orchestrator=orchestrator,
         )
         await handle_card_action(ctx, action)
+        session.commit()
         return {"status": "ok"}
 
     return {"status": "ignored"}

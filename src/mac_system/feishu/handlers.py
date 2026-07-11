@@ -96,8 +96,8 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         await _show_status(ctx, open_id, project_id)
         return
 
-    if text.startswith("/create "):
-        rest = text[len("/create "):].strip()
+    if text == "/create" or text.startswith("/create "):
+        rest = text[len("/create "):].strip() if text.startswith("/create ") else ""
         task_type, description = _parse_create_command(rest)
         if description:
             if task_type:
@@ -105,12 +105,20 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
             else:
                 await _route_and_create(ctx, open_id, description)
         else:
-            receive_id, receive_id_type = _reply_target(ctx, open_id)
-            await ctx.bridge.send_text(
-                receive_id,
-                "格式错误。用法：/create <描述> 或 /create --type=<task_type> <描述>",
-                receive_id_type=receive_id_type,
-            )
+            await _prompt_for_create_description(ctx, open_id)
+        return
+
+    if text.startswith("/cancel"):
+        rest = text[len("/cancel"):].strip()
+        await _cancel_project_command(ctx, open_id, rest)
+        return
+
+    if text == "/list":
+        await _list_my_projects(ctx, open_id)
+        return
+
+    if text == "/help":
+        await _show_help(ctx, open_id)
         return
 
     if text.startswith("/input "):
@@ -129,8 +137,137 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         await _handle_rejection_feedback(ctx, open_id, active_project, text)
         return
 
-    # Default: treat free-form text as a project creation request.
-    await _route_and_create(ctx, open_id, text)
+    # Default: do not auto-create projects from free-form text. Show help instead.
+    await _show_help(ctx, open_id)
+
+
+async def _prompt_for_create_description(
+    ctx: FeishuHandlerContext, open_id: str
+) -> None:
+    """Enter the interactive project-creation flow and ask for a description."""
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    ctx.service.upsert_pending_intent(
+        open_id,
+        description=None,
+        stage="awaiting_description",
+        chat_id=ctx.chat_id,
+        chat_type=ctx.chat_type,
+    )
+    await ctx.bridge._send_interactive(
+        receive_id,
+        build_create_prompt_card(chat_id=ctx.chat_id, chat_type=ctx.chat_type),
+        receive_id_type=receive_id_type,
+    )
+
+
+async def _cancel_project_command(
+    ctx: FeishuHandlerContext, open_id: str, rest: str
+) -> None:
+    """Handle /cancel [project_id]. If no id is given, cancel the user's latest active project."""
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    project_id = rest.strip()
+
+    if not project_id:
+        # Find the most recent active project bound to this user.
+        user_projects = ctx.service.session.exec(
+            select(ProjectUser).where(ProjectUser.open_id == open_id)
+        ).all()
+        project_ids = {up.project_id for up in user_projects}
+        if not project_ids:
+            await ctx.bridge.send_text(
+                receive_id, "你没有参与任何项目。", receive_id_type=receive_id_type
+            )
+            return
+        latest = ctx.service.session.exec(
+            select(Project)
+            .where(Project.id.in_(project_ids))
+            .where(Project.status == "active")
+            .order_by(Project.updated_at.desc())
+        ).first()
+        if latest is None:
+            await ctx.bridge.send_text(
+                receive_id, "没有可终止的活跃项目。", receive_id_type=receive_id_type
+            )
+            return
+        project_id = latest.id
+
+    # Authorization check: the user must be bound to the project.
+    binding = ctx.service.session.exec(
+        select(ProjectUser).where(
+            ProjectUser.project_id == project_id,
+            ProjectUser.open_id == open_id,
+        )
+    ).first()
+    if binding is None:
+        await ctx.bridge.send_text(
+            receive_id,
+            f"你没有权限终止项目 {project_id}。",
+            receive_id_type=receive_id_type,
+        )
+        return
+
+    try:
+        await ctx.orchestrator.cancel_project(project_id, reason="用户通过飞书命令终止")
+    except ProjectNotFoundError:
+        await ctx.bridge.send_text(
+            receive_id, f"项目 {project_id} 不存在。", receive_id_type=receive_id_type
+        )
+        return
+    except Exception as exc:
+        logger.exception("Failed to cancel project %s from Feishu", project_id)
+        await ctx.bridge.send_text(
+            receive_id,
+            f"终止项目 {project_id} 失败：{exc}",
+            receive_id_type=receive_id_type,
+        )
+        return
+
+    await ctx.bridge.send_text(
+        receive_id,
+        f"项目 {project_id} 已终止。",
+        receive_id_type=receive_id_type,
+    )
+
+
+async def _list_my_projects(ctx: FeishuHandlerContext, open_id: str) -> None:
+    """List projects bound to the user."""
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    user_projects = ctx.service.session.exec(
+        select(ProjectUser).where(ProjectUser.open_id == open_id)
+    ).all()
+    project_ids = {up.project_id for up in user_projects}
+    if not project_ids:
+        await ctx.bridge.send_text(
+            receive_id, "你还没有任何项目。", receive_id_type=receive_id_type
+        )
+        return
+    projects = ctx.service.session.exec(
+        select(Project).where(Project.id.in_(project_ids)).order_by(Project.updated_at.desc())
+    ).all()
+    lines = [f"你的项目（共 {len(projects)} 个）："]
+    for p in projects:
+        lines.append(f"- {p.id} {p.name or '(未命名)'} [{p.status}] {p.current_state}")
+    await ctx.bridge.send_text(
+        receive_id, "\n".join(lines), receive_id_type=receive_id_type
+    )
+
+
+async def _show_help(ctx: FeishuHandlerContext, open_id: str) -> None:
+    """Send a concise command help message."""
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    help_text = (
+        "可用命令：\n"
+        "/create <描述>  — 创建新项目\n"
+        "/create          — 进入交互式创建\n"
+        "/cancel [项目ID] — 终止项目（省略 ID 则终止最近活跃项目）\n"
+        "/list            — 列出我的项目\n"
+        "/status <项目ID> — 查看项目状态\n"
+        "/bind <项目ID>   — 绑定到项目\n"
+        "/menu            — 打开菜单\n"
+        "/help            — 显示本帮助\n\n"
+        "直接发消息不会创建项目；如需创建请使用 /create。"
+    )
+    await ctx.bridge.send_text(receive_id, help_text, receive_id_type=receive_id_type)
 
 
 async def _show_menu(ctx: FeishuHandlerContext, open_id: str) -> None:
@@ -646,18 +783,7 @@ async def _handle_menu_action(
         return
 
     if option == "create_prompt":
-        ctx.service.upsert_pending_intent(
-            open_id,
-            description=None,
-            stage="awaiting_description",
-            chat_id=ctx.chat_id,
-            chat_type=ctx.chat_type,
-        )
-        await ctx.bridge._send_interactive(
-            receive_id,
-            build_create_prompt_card(chat_id=ctx.chat_id, chat_type=ctx.chat_type),
-            receive_id_type=receive_id_type,
-        )
+        await _prompt_for_create_description(ctx, open_id)
         return
 
     if option.startswith("intent_confirm:"):

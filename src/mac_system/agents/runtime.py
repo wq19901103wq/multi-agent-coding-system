@@ -34,7 +34,13 @@ class AgentRuntime(ABC):
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
+        task_id: str | None = None,
     ) -> AgentRuntimeResult:
+        ...
+
+    @abstractmethod
+    def cancel(self, task_id: str) -> None:
+        """Best-effort cancellation of a running task."""
         ...
 
 
@@ -67,6 +73,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         api_timeout_ms: int | None = None,
     ):
         self.claude_bin = Path(claude_bin)
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
         self.anthropic_api_key = anthropic_api_key
         self.anthropic_auth_token = anthropic_auth_token
         self.claude_model = claude_model
@@ -173,6 +180,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
+        task_id: str | None = None,
     ) -> AgentRuntimeResult:
         # Write system prompt to temp file
         with tempfile.NamedTemporaryFile(
@@ -189,6 +197,7 @@ class ClaudeCodeRuntime(AgentRuntime):
                 allowed_tools=allowed_tools,
                 readonly_dirs=readonly_dirs,
                 timeout_seconds=timeout_seconds,
+                task_id=task_id,
             )
         finally:
             try:
@@ -204,6 +213,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
+        task_id: str | None = None,
     ) -> AgentRuntimeResult:
         cmd = self._build_command(
             system_prompt_file=system_prompt_file,
@@ -219,6 +229,8 @@ class ClaudeCodeRuntime(AgentRuntime):
             cwd=str(worktree),
             env=self._env(),
         )
+        if task_id:
+            self._processes[task_id] = proc
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
         result_event: dict[str, Any] | None = None
@@ -243,6 +255,10 @@ class ClaudeCodeRuntime(AgentRuntime):
 
         stdout_task = asyncio.create_task(_read_stream(proc.stdout, stdout_queue))
         stderr_task = asyncio.create_task(_read_stream(proc.stderr, stderr_queue))
+
+        def _cleanup_process() -> None:
+            if task_id and task_id in self._processes:
+                del self._processes[task_id]
 
         # Send the user prompt immediately.  The stream-json process may not
         # emit any output (including the init event) until it sees input.
@@ -359,6 +375,7 @@ class ClaudeCodeRuntime(AgentRuntime):
             )
 
         finally:
+            _cleanup_process()
             if proc.stdin is not None:
                 try:
                     proc.stdin.close()
@@ -372,6 +389,16 @@ class ClaudeCodeRuntime(AgentRuntime):
                 pass
             stdout_task.cancel()
             stderr_task.cancel()
+
+    def cancel(self, task_id: str) -> None:
+        """Kill the subprocess for a running task, if known."""
+        proc = self._processes.pop(task_id, None)
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
     @staticmethod
     def _strip_ansi(text: str) -> str:
@@ -644,6 +671,7 @@ class FakeRuntime(AgentRuntime):
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
+        task_id: str | None = None,
     ) -> AgentRuntimeResult:
         output = self.outputs.get(agent_type, {"success": True, "next_state_event": "complete"})
         return AgentRuntimeResult(
@@ -653,3 +681,6 @@ class FakeRuntime(AgentRuntime):
             logs="fake runtime",
             cost_info=None,
         )
+
+    def cancel(self, task_id: str) -> None:
+        pass

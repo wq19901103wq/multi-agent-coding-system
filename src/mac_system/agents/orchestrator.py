@@ -139,6 +139,33 @@ class AgentOrchestrator:
         async with lock:
             await self._tick_unsafe(project_id)
 
+    async def cancel_project(self, project_id: str, reason: str = "") -> None:
+        """Cancel a project, fail running tasks, and notify the chat/user."""
+        project = self.project_service.require_project(project_id)
+        if project.status == "cancelled":
+            return
+
+        # Best-effort kill any running agent subprocess.
+        for task in self.project_service._running_tasks(project_id):
+            try:
+                self.runtime.cancel(task.id)
+            except Exception:
+                pass
+
+        await self.project_service.cancel_project(project_id, reason=reason, triggered_by="user")
+
+        if self.feishu_bridge is None:
+            return
+        receive_id, receive_id_type = self._resolve_project_recipient(project)
+        try:
+            await self.feishu_bridge.send_text(
+                receive_id,
+                f"项目 {project.name or project.id} 已终止。{reason}".strip(),
+                receive_id_type=receive_id_type,
+            )
+        except Exception as exc:
+            logger.warning("Failed to send cancellation notification for %s: %s", project_id, exc)
+
     async def _tick_unsafe(self, project_id: str) -> None:
         project = self.project_service.require_project(project_id)
 
@@ -267,10 +294,17 @@ class AgentOrchestrator:
                 allowed_tools=allowed_tools,
                 readonly_dirs=[Path(project.workspace_path)],
                 timeout_seconds=self.settings.agent_timeout_seconds,
+                task_id=task.id,
             )
         except Exception as e:
             await self.project_service.fail_task(task.id, f"Runtime execution failed: {e}")
             await self._handle_agent_failure(project, state, task, f"Runtime execution failed: {e}")
+            return
+
+        # If the project was cancelled while the agent was running, discard the result.
+        project = self.project_service.require_project(project.id)
+        if project.status == "cancelled":
+            await self.project_service.fail_task(task.id, "Project cancelled while agent was running")
             return
 
         if not result.success or not result.output_json:

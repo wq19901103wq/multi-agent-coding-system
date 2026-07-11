@@ -29,9 +29,13 @@ class FakeBridge:
 class FakeOrchestrator:
     def __init__(self):
         self.ticked = []
+        self.cancelled = []
 
     async def tick(self, project_id: str) -> None:
         self.ticked.append(project_id)
+
+    async def cancel_project(self, project_id: str, reason: str = "") -> None:
+        self.cancelled.append((project_id, reason))
 
 
 @pytest.fixture
@@ -328,3 +332,57 @@ async def test_request_does_not_retry_client_errors():
     bridge._client.request = fake_request
     with pytest.raises(httpx.HTTPStatusError):
         await bridge._request("POST", "/x")
+
+
+async def test_create_command_without_args_prompts_for_description(feishu_ctx):
+    from mac_system.feishu.handlers import handle_text_message
+
+    msg = TextMessage(
+        open_id="ou_1",
+        message_id="m1",
+        text="/create",
+        is_command=True,
+    )
+    await handle_text_message(feishu_ctx, msg)
+
+    intent = feishu_ctx.service.get_pending_intent("ou_1")
+    assert intent is not None
+    assert intent.stage == "awaiting_description"
+    assert feishu_ctx.bridge.sent[-1][0] == "interactive"
+
+
+async def test_freeform_text_no_longer_creates_project(feishu_ctx):
+    from mac_system.feishu.handlers import handle_text_message
+
+    msg = TextMessage(
+        open_id="ou_1",
+        message_id="m1",
+        text="帮我实现一个个人网站",
+        is_command=False,
+    )
+    await handle_text_message(feishu_ctx, msg)
+
+    assert feishu_ctx.service.get_pending_intent("ou_1") is None
+    assert not any("已创建项目" in str(c[2]) for c in feishu_ctx.bridge.sent)
+    assert any("/create" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_cancel_command_cancels_bound_project(feishu_ctx):
+    from mac_system.feishu.handlers import handle_text_message
+
+    project = await feishu_ctx.service.create_project(
+        name="cancel-test",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+    )
+
+    msg = TextMessage(
+        open_id="ou_1",
+        message_id="m2",
+        text=f"/cancel {project.id}",
+        is_command=True,
+    )
+    await handle_text_message(feishu_ctx, msg)
+
+    assert (project.id, "用户通过飞书命令终止") in feishu_ctx.orchestrator.cancelled

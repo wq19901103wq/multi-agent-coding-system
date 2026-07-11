@@ -164,6 +164,47 @@ class ProjectService:
         self.session.commit()
         return project
 
+    async def cancel_project(
+        self,
+        project_id: str,
+        reason: str = "",
+        triggered_by: str = "user",
+    ) -> Project:
+        """Cancel a project and clean up its running tasks, approvals and worktrees.
+
+        Idempotent: calling it again on an already cancelled project is a no-op.
+        """
+        project = self.require_project(project_id)
+        if project.status == "cancelled":
+            return project
+
+        # Mark running tasks as failed so they are not recovered later.
+        for task in self._running_tasks(project_id):
+            task.status = "failed"
+            task.error_message = reason or "Project cancelled"
+
+        # Expire pending approvals.
+        for approval in self._pending_approvals(project_id):
+            approval.status = "expired"
+
+        project.status = "cancelled"
+        project.updated_at = _now()
+
+        # Remove any lingering worktrees for the project.
+        try:
+            WorktreeManager(self.settings.projects_dir).remove_all_worktrees(project_id)
+        except Exception:
+            pass
+
+        await self.log_event(
+            project_id=project_id,
+            level="INFO",
+            message=f"Project cancelled",
+            meta={"reason": reason, "triggered_by": triggered_by},
+        )
+        self.session.commit()
+        return project
+
     async def restart_project_with_type(
         self,
         project_id: str,
@@ -177,24 +218,10 @@ class ProjectService:
         feature). The new project keeps the same description and creator binding.
         """
         project = self.require_project(project_id)
-        if project.status == "cancelled":
-            raise ValueError(f"Project {project_id} is already cancelled")
-
-        # Cancel the original project.
-        project.status = "cancelled"
-        project.updated_at = _now()
-
-        # Remove any lingering worktrees for the old project.
-        try:
-            WorktreeManager(self.settings.projects_dir).remove_all_worktrees(project_id)
-        except Exception:
-            pass
-
-        await self.log_event(
-            project_id=project_id,
-            level="INFO",
-            message=f"Project cancelled for restart as {target_task_type}",
-            meta={"target_task_type": target_task_type},
+        await self.cancel_project(
+            project_id,
+            reason=f"Restarted as {target_task_type}",
+            triggered_by=triggered_by,
         )
 
         # Preserve creator binding if any.
@@ -277,6 +304,43 @@ class ProjectService:
                 for e in recent_events
             ],
         }
+
+    def list_projects(
+        self,
+        status: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[list[Project], int]:
+        """Return a paginated list of projects and the total count."""
+        query = select(Project)
+        if status:
+            query = query.where(Project.status == status)
+        query = query.order_by(Project.updated_at.desc())
+        total = len(self.session.exec(query).all())
+        projects = list(
+            self.session.exec(query.offset(offset).limit(limit)).all()
+        )
+        return projects, total
+
+    def _running_tasks(self, project_id: str) -> list[Task]:
+        return list(
+            self.session.exec(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status == "running",
+                )
+            ).all()
+        )
+
+    def _pending_approvals(self, project_id: str) -> list[Approval]:
+        return list(
+            self.session.exec(
+                select(Approval).where(
+                    Approval.project_id == project_id,
+                    Approval.status == "pending",
+                )
+            ).all()
+        )
 
     async def transition_state(
         self,
