@@ -301,3 +301,23 @@ def test_admin_token_blocks_unauthorized(client, monkeypatch):
 
     response = client.get("/admin/projects?token=secret-token")
     assert response.status_code == 200
+
+
+def test_admin_project_detail(client):
+    create_resp = client.post(
+        "/projects",
+        json={
+            "name": "admin-detail-test",
+            "task_type": "feature",
+            "description": "实现 admin 详情页测试",
+            "approval_mode": "auto",
+        },
+    )
+    project_id = create_resp.json()["id"]
+
+    response = client.get(f"/admin/projects/{project_id}")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert project_id in response.text
+    assert "执行与审批时间线" in response.text
+    assert "状态流转记录" in response.text

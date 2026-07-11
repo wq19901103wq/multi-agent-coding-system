@@ -1,12 +1,13 @@
 #!/usr/bin/env .venv/bin/python
 """Full-flow test with a rejection at the requirement confirmation stage."""
 import asyncio
+import os
 import sys
 import time
 
 import httpx
 
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = f"http://127.0.0.1:{os.getenv('MCS_PORT', '18080')}"
 CHAT_ID = "oc_aca93ea61c7494e26e3a03c91437fc0d"
 OPEN_ID = "ou_test_rejection_001"
 

@@ -981,7 +981,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-base",
-        default=os.getenv("MAC_API_BASE", "http://127.0.0.1:8000"),
+        default=os.getenv("MAC_API_BASE", "http://127.0.0.1:18080"),
         help="MAC API base URL",
     )
     parser.add_argument(

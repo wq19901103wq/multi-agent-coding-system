@@ -11,9 +11,11 @@ import json
 import sys
 import time
 
+import os
+
 import httpx
 
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = f"http://127.0.0.1:{os.getenv('MCS_PORT', '18080')}"
 
 # Use a real group chat_id from the environment if available, otherwise a
 # placeholder (the card will be addressed to the group even though we cannot

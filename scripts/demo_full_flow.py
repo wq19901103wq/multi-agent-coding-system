@@ -9,7 +9,7 @@ from mac_system.config import get_settings
 from mac_system.feishu.bridge import FeishuBridge
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = f"http://127.0.0.1:{os.getenv('MCS_PORT', '18080')}"
 ID_RE = re.compile(r"\b(proj_[a-zA-Z0-9_]+)\b")
 
 

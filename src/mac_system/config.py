@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # API / App
     app_name: str = "MAC System"
     debug: bool = Field(default=False, alias="DEBUG")
+    mcs_port: int = Field(default=18080, alias="MCS_PORT")
     database_url: str = Field(default="sqlite:///./mac_system.db", alias="DATABASE_URL")
     projects_dir: Path = Field(default=Path("./projects"), alias="PROJECTS_DIR")
     state_machines_dir: Path = Field(default=Path("./state_machines"), alias="STATE_MACHINES_DIR")

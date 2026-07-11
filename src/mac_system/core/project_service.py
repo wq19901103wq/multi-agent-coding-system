@@ -322,6 +322,34 @@ class ProjectService:
         )
         return projects, total
 
+    def get_project_tasks(self, project_id: str) -> list[Task]:
+        return list(
+            self.session.exec(
+                select(Task)
+                .where(Task.project_id == project_id)
+                .order_by(Task.created_at.asc())
+            ).all()
+        )
+
+    def get_project_approvals(self, project_id: str) -> list[Approval]:
+        return list(
+            self.session.exec(
+                select(Approval)
+                .where(Approval.project_id == project_id)
+                .order_by(Approval.created_at.asc())
+            ).all()
+        )
+
+    def get_project_events(self, project_id: str, limit: int | None = None) -> list[EventLog]:
+        query = (
+            select(EventLog)
+            .where(EventLog.project_id == project_id)
+            .order_by(EventLog.created_at.desc())
+        )
+        if limit:
+            query = query.limit(limit)
+        return list(self.session.exec(query).all())
+
     def _running_tasks(self, project_id: str) -> list[Task]:
         return list(
             self.session.exec(
