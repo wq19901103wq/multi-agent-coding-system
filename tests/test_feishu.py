@@ -386,3 +386,28 @@ async def test_cancel_command_cancels_bound_project(feishu_ctx):
     await handle_text_message(feishu_ctx, msg)
 
     assert (project.id, "用户通过飞书命令终止") in feishu_ctx.orchestrator.cancelled
+
+
+async def test_create_then_generic_description_creates_feature_project(feishu_ctx):
+    """/create followed by a generic description should default to feature."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/create", is_command=True),
+    )
+    assert feishu_ctx.service.get_pending_intent("ou_1").stage == "awaiting_description"
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="m2",
+            text="帮我做一个个人网站",
+            is_command=False,
+        ),
+    )
+
+    assert feishu_ctx.service.get_pending_intent("ou_1") is None
+    assert any("已创建项目" in str(c[2]) for c in feishu_ctx.bridge.sent if c[0] == "text")
+    assert len(feishu_ctx.orchestrator.ticked) >= 1

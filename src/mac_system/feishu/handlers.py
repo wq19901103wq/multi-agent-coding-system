@@ -518,7 +518,20 @@ async def _route_and_create(
     effective_chat_id = chat_id if chat_id is not None else ctx.chat_id
     effective_chat_type = chat_type if chat_type is not None else ctx.chat_type
 
-    if decision.task_type is None or decision.confidence < ctx.service.settings.intent_low_threshold:
+    # If the user explicitly invoked /create, we default to a feature project
+    # when no strong bug/doc signal is detected, so that generic descriptions
+    # like "帮我做一个个人网站" still result in a project.
+    if decision.task_type is None:
+        from mac_system.core.intent import CONFIDENCE_EXPLICIT
+        decision = RouteDecision(
+            task_type="feature",
+            initial_state=StateMachine("feature").initial_state,
+            confidence=CONFIDENCE_EXPLICIT,
+            needs_disambiguation=False,
+            reason="未识别明确类型，默认按功能需求创建",
+        )
+
+    if decision.confidence < ctx.service.settings.intent_low_threshold:
         await ctx.bridge.send_text(
             receive_id,
             "这个需求我不太确定怎么归类，能再描述一下吗？\n"

@@ -516,9 +516,9 @@ async def feishu_create_project(ctx: ScenarioContext, text: str) -> str:
 
 
 async def scenario_p2p_create(ctx: ScenarioContext) -> None:
-    """1. Create a project by sending a plain description in p2p."""
+    """1. Create a project by sending /create with a description in p2p."""
     eprint("Scenario 1: p2p_create")
-    project_id = await feishu_create_project(ctx, "实现一个 config-validator CLI")
+    project_id = await feishu_create_project(ctx, "/create 实现一个 config-validator CLI")
     status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
     if status is None:
         raise RuntimeError("Project did not reach REQUIREMENT_CONFIRM_PENDING")
@@ -540,7 +540,7 @@ async def scenario_group_create_at_mention(ctx: ScenarioContext) -> None:
     eprint("Scenario 3: group_create_at_mention")
     if not ctx.dry_run and not ctx.args.chat_id:
         raise RuntimeError("--chat-id is required for group scenarios")
-    project_id = await feishu_create_project(ctx, "写一份项目 README")
+    project_id = await feishu_create_project(ctx, "/create 写一份项目 README")
     status = await wait_for_state(ctx, project_id, "OUTLINE_CONFIRM_PENDING")
     eprint(f"  reached {status['current_state']}")
 
@@ -949,9 +949,28 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
     eprint(f"  reached {status['current_state']}")
 
 
+async def scenario_p2p_create_interactive(ctx: ScenarioContext) -> None:
+    """Create a project by sending /create then a generic description."""
+    eprint("Scenario: p2p_create_interactive")
+    msg_id = await send_feishu_text(ctx, "/create")
+    if ctx.dry_run:
+        return
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"请直接回复|描述一下你的需求", after_message_id=msg_id
+    )
+    if reply is None:
+        raise RuntimeError("MAC bot did not prompt for description")
+    project_id = await feishu_create_project(ctx, "帮我做一个个人网站")
+    status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
+    if status is None:
+        raise RuntimeError("Project did not reach REQUIREMENT_CONFIRM_PENDING")
+    eprint(f"  reached {status['current_state']}")
+
+
 SCENARIOS: dict[str, Any] = {
     "p2p_create": scenario_p2p_create,
     "p2p_create_with_type": scenario_p2p_create_with_type,
+    "p2p_create_interactive": scenario_p2p_create_interactive,
     "group_create_at_mention": scenario_group_create_at_mention,
     "group_create_menu": scenario_group_create_menu,
     "intent_confirm_override": scenario_intent_confirm_override,
