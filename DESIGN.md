@@ -1,5 +1,11 @@
 # Multi-Agent Coding System 架构设计与 MVP 实现计划
 
+> **现行规范说明（v3.2）**：涉及状态转换、多轮确认、自动审批、用户中途输入和跨 Agent 反馈时，以 `specs/state_machine_semantics.md`、`specs/orchestrator_spec.md`、`specs/mac_protocol.md` 和 `specs/approval_modes.json` 为准。本文后续保留的早期流程图和阶段计划仅作为背景，不覆盖上述规范。
+
+> 需求、架构、Spec、测试和验收之间的稳定 ID、版本、失效传播及验收矩阵以 `specs/artifact_traceability_spec.md` 为准。
+
+> Claude Code Runtime 的工具执行采用单一所有者模型：Read/Write/Edit/Bash 等内置工具由 Claude Code CLI 执行；MAC 只负责进程生命周期、权限策略、事件观察、进度转发和最终结果解析。MAC 不得根据 `tool_use` 再执行一次工具或伪造 `tool_result`。详细约束以 `specs/runtime_spec.md` 为准。
+
 ## 1. 设计目标
 
 构建一个**条件人类闭环（Conditional Human-in-the-Loop）**的多 Agent 编码系统：
@@ -167,8 +173,9 @@ class AgentRuntimeResult:
 | **需求理解门** | planner stage=requirements 输出后 | 人类确认/澄清 |
 | **方案设计门** | planner stage=architecture 输出后 | 人类确认/修改 |
 | **Spec 合理性门** | planner stage=specs 输出后 | 人类确认/调整 |
-| **代码实现门** | Coder 完成后，Tester 测试前 | 测试失败则退回 Coder |
-| **Review 门** | Tester 完成后 | Review 不通过则退回 Coder |
+| **代码实现门** | Coder 完成后，Tester 测试前 | 用户修订进入 REWORK |
+| **测试门** | Tester 完成后 | quality fail 进入 REWORK 并按根因路由 |
+| **Review 门** | Reviewer 完成后 | blocking issue 进入 REWORK 并注入下一轮 Agent |
 | **验收门** | Reviewer 完成后 | 人类最终确认 |
 
 ### 2.7 安全模型
@@ -557,6 +564,8 @@ CREATE TABLE project_users (
 
 为保证 Claude Code Agent 输出可被 Python 控制层解析，每个阶段必须输出固定格式。
 
+> 本节保留的 JSON 仅用于说明字段意图，不再是可执行完整样例。v3.2 的唯一结构契约是 `specs/schemas/*.json`；REQ/AC/DEC/SPEC/TEST 追踪和验收矩阵见 `specs/artifact_traceability_spec.md`。实现和 Prompt 不得复制本节旧的字符串 AC、单一 assigned_agent 或总体 meets_requirements 格式。
+
 #### planner stage=requirements 输出
 
 ```json
@@ -775,12 +784,14 @@ CREATE TABLE project_users (
 }
 ```
 
-系统通过 `open_id` 找到 `project_id`，通过消息内容或卡片 value 解析用户动作。
+系统先根据卡片/命令中的显式 ID 或 `(chat_id, open_id)` 的 ChatUserContext 确定 project_id，再解析用户动作。禁止通过 open_id 选择“最近更新项目”。
 
 **用户-项目绑定机制**：
 - 创建项目时，系统记录发起人的 `open_id`（若从飞书创建）或允许用户在创建后通过飞书发送绑定指令（如 `/bind proj_xxx`）完成绑定。
-- `project_users` 表维护 `project_id ↔ open_id` 的多对多关系；MVP 阶段一个项目默认绑定创建者一人。
-- 飞书回调时，用 `event.message.sender.sender_id.open_id` 查询 `project_users`，找到对应项目后再处理决策或追问。
+- `project_users` 维护权限及角色；`project_chats` 维护通知/可见关系；`chat_user_contexts` 维护每个用户在每个聊天中的 active project。
+- 一个聊天可关联多个项目，一个项目也可订阅多个聊天；项目状态不属于聊天。
+- 卡片 approval_id、显式 project_id 的优先级高于 active context；无唯一上下文时要求用户选择。
+- 完整规则见 `specs/conversation_routing_spec.md`。
 
 ---
 
@@ -800,7 +811,7 @@ CREATE TABLE project_users (
 | **auto** | ❌ | ❌ | ❌ | ⚠️ 仅异常 | ✅ | 高信任度任务 |
 
 **规则**：
-- 用户不响应时，流程进入 `PAUSED` 状态，不阻塞其他独立项目的运行
+- 人工确认长期未响应时保持 pending，不占用 Agent 执行槽位；只有显式 `/pause` 才进入暂停控制状态
 - 夜间模式可自动切换，减少打扰
 - 澄清/冲突默认需要人工，除非配置为自动
 
@@ -1066,6 +1077,28 @@ config-validator/
 3. **MVP 是否先做文本交互？** 还是直接做卡片交互？
 
 ---
+
+## 13.1 v3.2 多轮闭环补充设计
+
+系统采用“执行态—输入态—确认态—返工路由”四类节点。执行态生成版本化产物；Agent 信息不足时进入该阶段输入态；确认态允许 confirm 或 revise；测试、Review 和验收的问题进入 REWORK，由失败分类推荐回退目标，用户做最终选择。
+
+输入态是所有 Agent 的通用能力，而非只服务需求阶段。Requirements/Architecture/Specs Planner、Coder、Tester、Reviewer、Acceptance Evaluator、Project Manager 都可以在完成前发起结构化选项或自由文本问题，并连续多轮 grill-me。问题和回答持久化，携带 resume_state 和追踪 ID；blocking question 未解决时禁止 complete。各 Agent 的强制提问场景见 `specs/product_requirements.md`。
+
+测试失败不默认全部交给 Coder：实现缺陷回 Coding，测试缺陷或环境问题回 Testing，契约不清回 Specs，方案问题回 Architecture，范围问题回 Requirements。Reviewer 的 blocking issues 必须作为下一轮 Coder 的输入，Coder 逐项输出 addressed_feedback，下一轮 Reviewer 逐项核验。
+
+用户中途命令走控制通道并优先执行；Agent 运行期间的自由文本写入持久化 pending_user_inputs。Agent 返回后、merge/transition 前必须再次检查控制状态和输入队列。范围变更、纠正或 rollback 会让当前结果失效；普通问题可回答但不得静默改变已确认范围。
+
+自动审批只适用于已经明确 pass 的质量门。runtime failure、quality fail、REWORK 和最终验收始终不能自动通过。
+
+会话路由与项目状态机分层：conversation scope 负责确定 chat、actor、project 和权限；项目状态机只接收已经验证的 project event。切换 `/use` 只改变用户在当前聊天的 active project，不改变项目状态。群聊不同成员可以选择不同项目；项目状态变化提交一次后，再按 ProjectChat 订阅策略广播到多个会话。
+
+设计参考：LangGraph 的持久化 interrupt/resume 用于可恢复的人类输入循环；SWE-agent RetryAgent 保留 attempt/review 供下一轮消费；GitHub Actions environment protection rules 将自动检查、等待和人工 reviewer 作为相互独立的 gate。MAC 不直接依赖这些实现，但采用相同的“持久化暂停、反馈进入下一轮、自动结果不替代人工保护规则”原则。
+
+交付追踪采用 REQ → AC → DEC → SPEC → CODE/TEST → REV → Acceptance Matrix。上游确认版本改变时执行影响分析并使受影响下游产物 stale；状态回退不能代替依赖失效。最终验收必须逐 AC 提供实现、测试和 Review 证据。
+
+- https://langchain-ai.github.io/langgraph/how-tos/human_in_the_loop/wait-user-input/
+- https://swe-agent.com/latest/reference/agent/
+- https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments
 
 ## 14. MVP 最终范围
 

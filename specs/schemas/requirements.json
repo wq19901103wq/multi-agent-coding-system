@@ -3,13 +3,40 @@
   "$id": "https://mac-system.local/schemas/requirements.json",
   "title": "REQUIREMENTS.json",
   "type": "object",
-  "required": ["summary", "goals", "acceptance_criteria"],
+  "required": ["artifact_id", "version", "round", "status", "summary", "requirements", "acceptance_criteria"],
   "additionalProperties": false,
   "properties": {
+    "artifact_id": {"const": "requirements"},
+    "version": {"type": "integer", "minimum": 1},
+    "round": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["draft", "pending_confirmation", "confirmed", "stale", "superseded", "rejected"]},
+    "content_hash": {"type": "string"},
+    "source_input_ids": {"type": "array", "items": {"type": "string"}},
+    "supersedes_round": {"type": ["integer", "null"], "minimum": 1},
     "summary": {"type": "string"},
     "goals": {
       "type": "array",
       "items": {"type": "string"}
+    },
+    "requirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "description", "priority", "kind", "source", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "pattern": "^REQ-[A-Z0-9-]+$"},
+          "title": {"type": "string"},
+          "description": {"type": "string"},
+          "priority": {"enum": ["must", "should", "could", "wont"]},
+          "kind": {"enum": ["functional", "security", "performance", "reliability", "usability", "compatibility", "observability", "cost", "data_governance"]},
+          "source": {"type": "string"},
+          "status": {"enum": ["proposed", "confirmed", "superseded", "removed"]},
+          "actors": {"type": "array", "items": {"type": "string"}},
+          "scenarios": {"type": "array", "items": {"type": "string"}}
+        }
+      }
     },
     "constraints": {
       "type": "array",
@@ -28,13 +55,49 @@
         }
       }
     },
+    "resolved_questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["question", "answer", "source_input_id"],
+        "additionalProperties": false,
+        "properties": {
+          "question": {"type": "string"},
+          "answer": {"type": "string"},
+          "source_input_id": {"type": "string"}
+        }
+      }
+    },
     "acceptance_criteria": {
       "type": "array",
-      "items": {"type": "string"}
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "requirement_ids", "statement", "verification_method"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "pattern": "^AC-[A-Z0-9-]+$"},
+          "requirement_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "statement": {"type": "string"},
+          "verification_method": {"enum": ["automated_test", "integration_test", "e2e", "manual", "inspection", "metric"]},
+          "evidence_required": {"type": "string"}
+        }
+      }
     },
     "assumptions": {
       "type": "array",
-      "items": {"type": "string"}
+      "items": {
+        "type": "object",
+        "required": ["id", "statement", "risk", "validation_plan"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "statement": {"type": "string"},
+          "owner": {"type": "string"},
+          "risk": {"enum": ["low", "medium", "high"]},
+          "validation_plan": {"type": "string"}
+        }
+      }
     },
     "out_of_scope": {
       "type": "array",

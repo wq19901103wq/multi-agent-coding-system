@@ -27,7 +27,138 @@
 | `terminal` | 流程结束，不再自动推进 | `COMPLETED`, `FAILED`, `CANCELLED` |
 | `idle` | 流程暂停，等待 `/resume` 命令 | `PAUSED` |
 
+## 统一循环模型（v1.1）
+
+每个可迭代交付阶段都允许多轮执行，但必须区分三类循环：
+
+1. **Agent 主动澄清**：Agent 无法在现有上下文下安全继续，发出 `ask_user`，进入对应的 `*_INPUT_PENDING`；用户 `answer` 后回到原阶段，并创建新 Task。
+2. **用户要求修订**：产物已生成，但用户在 `*_CONFIRM_PENDING` 选择 `revise` 并提供反馈；系统保存反馈包后回到原阶段。
+3. **下游发现上游问题**：测试、Review 或验收产生结构化失败反馈，进入 `REWORK`，由用户选择应回退的层级。
+
+每次重新进入 Agent 阶段都增加该阶段的 `round_number`，不得覆盖旧 Task、旧产物版本或旧反馈。旧 approval 在状态离开时必须标记为 `expired`。
+
+上游产物修订确认后必须执行 artifact impact analysis。受影响的下游产物标记为 stale，基于旧版本运行的 Task 结果必须丢弃；只有 impact report 已生成且回退目标明确后才能继续。切换状态本身不能替代失效传播。
+
+### 多轮规划状态
+
+| 执行态 | 主动澄清态 | 产物确认态 | `answer`/`revise` 返回 |
+|---|---|---|---|
+| `PLANNING_REQUIREMENTS` | `REQUIREMENT_INPUT_PENDING` | `REQUIREMENT_CONFIRM_PENDING` | `PLANNING_REQUIREMENTS` |
+| `PLANNING_ARCHITECTURE` | `ARCHITECTURE_INPUT_PENDING` | `ARCHITECTURE_CONFIRM_PENDING` | `PLANNING_ARCHITECTURE` |
+| `PLANNING_SPECS` | `SPEC_INPUT_PENDING` | `SPEC_CONFIRM_PENDING` | `PLANNING_SPECS` |
+
+`confirm` 才进入下一阶段。输入回答和修订意见必须作为结构化 feedback packet 注入新一轮 Agent，而不是只保留一段 `latest_*` 文本。
+
+### 质量门
+
+| Agent 结果 | 含义 | 处理 |
+|---|---|---|
+| runtime/schema/merge failure | Agent 未形成可信业务结论 | 按技术失败重试；超过上限进入 `FAILED` |
+| quality pass | 测试或 Review 明确通过 | 进入对应 `*_CONFIRM_PENDING`；可按 approval mode 自动确认 |
+| quality fail | 测试失败或 Review 有 blocking issue | 进入 `REWORK`；禁止自动确认通过 |
+| human revise | Agent 判断通过，但用户不同意 | 进入 `REWORK` |
+
+禁止把 `TESTING` / `REVIEW` 的 `fail` 改写为 `complete`。自动模式只能自动确认已经由 Agent 判定为 pass 的质量门。
+
+### REWORK 路由
+
+`REWORK` 始终需要人工选择，系统可提供 `recommended_rework_target`，但不得自动替用户覆盖明确失败。通用目标为：
+
+- `to_requirements`：需求不一致或需求缺失
+- `to_architecture`：方案或系统边界错误
+- `to_specs`：验收标准、接口契约或任务拆分错误
+- `to_coding`：实现缺陷或漏实现
+- `to_testing`：测试用例、测试数据或测试环境问题
+
+`bug_fix` 和 `documentation` 任务仅展示其状态机实际支持的目标。
+
+## 用户中途输入与命令
+
+### 所有 Agent 的主动 Grill-Me 循环
+
+`ask_user` 不是 Planner 专属事件。Planner、Coder、Tester、Reviewer、Acceptance Evaluator 和 Project Manager 都可以在完成当前 task 前进入可恢复输入边界。
+
+```text
+AGENT_EXECUTION
+  ├─ complete → 下一质量门
+  ├─ fail → 技术失败或 REWORK
+  └─ ask_user → AGENT_INPUT_PENDING
+                    ├─ answer/select_option → 原 Agent 新一轮
+                    ├─ ask_user → 继续多轮输入
+                    ├─ accept_default → 原 Agent 新一轮
+                    ├─ pause/cancel → 控制状态
+                    └─ scope_change → REWORK/上游阶段
+```
+
+每个 agent_execution 状态必须声明其 input pending 状态；可以使用阶段专属状态或统一 `AGENT_INPUT_PENDING`，但 payload 必须保存 `resume_state`、agent、stage、task_id 和 round。
+
+问题至少包含 `question_id`、正文、提问原因、blocking、选项、推荐项、是否允许自由输入、默认假设和受影响追踪 ID。输入态允许连续多轮；blocking question 未解决或默认假设未获用户接受时禁止回到完成路径。
+
+用户输入是独立于 Agent 输出的控制流，不得被当前执行吞掉。
+
+### 命令通道
+
+- `/status`、`/help`：只读，不改变状态。
+- `/pause`：立即设置项目控制状态为 paused；正在运行的 Agent 可结束，但其结果在恢复前不得推进状态。
+- `/resume`：恢复保存的执行状态，并先消费暂停期间的输入。
+- `/cancel`：进入终止状态；之后到达的 Agent 结果全部丢弃。
+- `/rollback`：记录目标状态；当前 Agent 完成后丢弃过期结果，从目标状态创建新轮次。
+- `/confirm`、`/reject`、`/input`：只允许操作项目当前状态对应的唯一 pending approval。
+
+### 自由文本通道
+
+1. 当前为 `*_INPUT_PENDING`：文本作为该 approval 的回答。
+2. 当前为 `*_CONFIRM_PENDING`：文本保存为对当前产物的评论；除非明确解析为 confirm/revise，否则不自动转换状态。
+3. Agent 正在运行：文本追加到持久化 `pending_user_inputs` 队列，记录 `input_id`、时间、发送者、目标项目和当时状态。
+4. 无运行任务且无 pending approval：作为项目追问处理；若包含范围变更，创建 feedback packet 并进入 `REWORK`，不得静默修改已确认需求。
+
+Agent 完成后，Orchestrator 在合并产物和推进状态前必须重新读取项目控制状态及未消费输入：
+
+- 存在 cancel/rollback/pause 时，优先执行控制命令。
+- 存在影响当前产物的文本时，先进入确认或 REWORK，不得自动通过。
+- 输入按创建顺序消费，并以 `consumed_by_task_id` 留下审计记录。
+
+## 通用 Agent 提问子状态机
+
+`ask_user` 是所有 agent-execution 状态的通用事件，不应为每个 Agent 复制一套固定状态。状态机引擎应支持参数化 `AGENT_INPUT_PENDING` 覆盖层，并持久化：
+
+- `resume_state`、`origin_task_id`、`origin_round`；
+- `question_id`、问题类型、阻塞级别、选项、推荐项及默认行为；
+- `conversation/project` 绑定、已提交回答和受影响产物 ID。
+
+通用轮转为：`S(agent_execution) → ask_user → AGENT_INPUT_PENDING(resume_state=S) → answer → S(new round)`。原 Task 以 `waiting_for_user` 或等价终态结束，回答后必须创建新轮次，不能让已退出的进程原地继续。用户回答若改变上游产物，则按影响分析跳转到 Requirements/Architecture/Specs/REWORK，而不是机械返回 `resume_state`。
+
+Planner 现有的 `REQUIREMENT_INPUT_PENDING`、`ARCHITECTURE_INPUT_PENDING`、`SPEC_INPUT_PENDING` 以及 Coder 的 `CLARIFICATION_PENDING` 是兼容别名；Tester、Reviewer、Acceptance Evaluator 和 Project Manager 必须复用同一协议。实现完成前，不得把文档中的通用能力宣称为已交付能力。
+
+并发约束：每个 `(project_id, origin_task_id, question_id)` 至多一个 pending interaction；服务重启和多会话投递均复用同一记录。收到回答时先以 CAS/事务完成 pending→answered，再恢复一次，防止两个聊天窗口重复触发。
+
 ## 按状态的事件语义
+
+### Reject 交互流程
+
+reject 必须按确认节点类型分流，不能用同一条“先消费 approval、再等自由文本”的路径。
+
+**规划确认（需求 / 方案 / Spec / Bug 分析 / 文档大纲）**
+
+- 修改意见是重跑 Planner 的必要输入。
+- 用户只点击「驳回」但尚未填写意见时，**不得先 resolve 原 approval**；系统展示驳回意见输入卡，项目仍停在原 `*_CONFIRM_PENDING`，原 approval 保持 pending。
+- 用户提交意见后，在同一事务中创建 feedback packet、resolve approval(reject)、转换回对应 Planner 状态。
+- `/reject appr_xxx feedback` 可一次性完成上述事务。
+- 用户取消输入时保持原确认态，不能留下“执行态但没有 Task、也没有 pending approval”的隐式等待状态。
+
+**质量确认和最终验收（Coding / Testing / Review / Acceptance）**
+
+- 点击「驳回」即表示结果不被接受，反馈文本可以为空。
+- 系统原子 resolve approval(reject) 并进入 `REWORK`。
+- 进入 `REWORK` 后必须立即且仅创建一次 REWORK approval/选择卡；不得回复“请直接输入修改意见”后停住。
+- 可选反馈若随命令到达则在同一事务创建；若稍后补充，则绑定当前 REWORK 和来源 Task，但不阻止回退选择卡出现。
+
+**推进不变量**
+
+1. 状态进入 `human_confirmation` / `human_input` 后，只允许一次 `ensure_pending_approval_and_card`；已有 pending approval 时复用，不得过期后重建。
+2. 若推进函数开始时项目已经位于 human state，tick 一次创建/复用 approval 后必须返回，禁止再 tick 第二次。
+3. 若从 agent/system state tick 后到达 human state，再 tick 一次创建 approval 后返回。
+4. 每个非 terminal 状态在 handler 返回前必须满足之一：有 running Task、有 pending Approval、存在明确 paused 控制状态；否则视为 stuck invariant violation 并记录 ERROR。
 
 ### `INIT` → 任务类型对应的初始状态
 
@@ -59,7 +190,7 @@
 ### `REQUIREMENT_CONFIRM_PENDING`
 
 - **`confirm`**：进入 `PLANNING_ARCHITECTURE`
-- **`reject`**：回到 `PLANNING_REQUIREMENTS`，保留用户评论作为 planner 输入
+- **`reject`**：回到 `PLANNING_REQUIREMENTS`，保留用户评论作为 planner 输入。交互流程见上方「Reject 交互流程」。
 
 ### `PLANNING_ARCHITECTURE` → `ARCHITECTURE_CONFIRM_PENDING`
 
@@ -72,7 +203,7 @@
 ### `ARCHITECTURE_CONFIRM_PENDING`
 
 - **`confirm`**：进入 `PLANNING_SPECS`
-- **`reject`**：回到 `PLANNING_ARCHITECTURE`
+- **`reject`**：回到 `PLANNING_ARCHITECTURE`。交互流程见上方「Reject 交互流程」。
 - **`select_option`**：
   - 用户选择了 Architect 给出的某个决策选项
   - 请求体中携带 `decision_id` 和 `option_key`
@@ -90,7 +221,7 @@
 ### `SPEC_CONFIRM_PENDING`
 
 - **`confirm`**：进入 `CODING`
-- **`reject`**：回到 `PLANNING_SPECS`
+- **`reject`**：回到 `PLANNING_SPECS`。交互流程见上方「Reject 交互流程」。
 
 ### `CODING`
 
@@ -134,9 +265,9 @@ Agent：`tester`
 
 | 事件 | 含义 | 处理 |
 |------|------|------|
-| `complete` | 测试通过 | 进入 `REVIEW` |
-| `fail` | 测试失败 | `retry_count += 1`；若 `retry_count <= MAX_TEST_RETRIES` 回到 `CODING`，否则事件 `fail_max_retries` |
-| `fail_max_retries` | 测试失败超过最大重试 | 进入 `FAILED` |
+| `complete` | 测试通过 | 进入 `TESTING_CONFIRM_PENDING` |
+| `fail` | 测试质量失败 | 生成 feedback packet，进入 `REWORK`，禁止自动通过 |
+| runtime/schema failure | 测试 Agent 未形成可信结论 | 在 `TESTING` 重试，超过技术重试上限进入 `FAILED` |
 
 ### `REVIEW`
 
@@ -144,14 +275,14 @@ Agent：`reviewer`
 
 | 事件 | 含义 | 处理 |
 |------|------|------|
-| `complete` | Review 通过 | 进入 `ACCEPTANCE_PENDING` |
-| `fail` | Review 不通过 | `retry_count += 1`；若 `retry_count <= MAX_REVIEW_RETRIES` 回到 `CODING`，否则事件 `fail_max_retries` |
-| `fail_max_retries` | Review 不通过超过最大重试 | 进入 `FAILED` |
+| `complete` | Review 通过 | 进入 `REVIEW_CONFIRM_PENDING` |
+| `fail` | Review 存在 blocking issue | 生成 feedback packet，进入 `REWORK`，禁止自动通过 |
+| runtime/schema failure | Reviewer 未形成可信结论 | 在 `REVIEW` 重试，超过技术重试上限进入 `FAILED` |
 
 ### `ACCEPTANCE_PENDING`
 
 - **`confirm`**：进入 `MERGING`
-- **`reject`**：回到 `CODING`（默认实现层问题）
+- **`reject`**：进入 `REWORK`，由用户根据反馈选择根因层级
 
 按任务类型提供的回退选项：
 
@@ -186,10 +317,10 @@ Agent：`reviewer`
 1. **计数器存储位置**：`STATE.json` 的 `context.retry_counts.{STATE_NAME}`，以及数据库 `Task.retry_count`。
 2. **何时重置**：当状态离开 `TESTING` 或 `REVIEW` 进入非失败目标状态时，对应计数器重置为 0。
 3. **最大重试次数**：
-   - 测试失败：`MAX_TEST_RETRIES`（默认 2）
-   - Review 失败：`MAX_REVIEW_RETRIES`（默认 2）
-   - Agent 执行失败（JSON 解析失败等）：`MAX_AGENT_RETRIES`（默认 3）
-4. **Agent 执行失败重试**：若 `PLANNING_*` / `CODING` 等 Agent 执行返回 `success=false`，Orchestrator 会先重试同一次 Task（不创建新 worktree，或清理后重建），最多 `MAX_AGENT_RETRIES` 次，之后进入 `FAILED`。
+   - Tester 技术执行失败：`MAX_TEST_RETRIES`（默认 2）
+   - Reviewer 技术执行失败：`MAX_REVIEW_RETRIES`（默认 2）
+   - 其他 Agent 技术执行失败：`MAX_AGENT_RETRIES`（默认 3）
+4. **技术失败重试**：进程异常、超时、JSON/schema 无效或 merge 失败可重试；每次创建新 Task/worktree。业务质量 fail 不消耗技术重试次数，而是进入 `REWORK`。
 
 ## 暂停 / 恢复规则
 
@@ -213,7 +344,7 @@ Agent：`reviewer`
    - 状态名在 `require_confirmation_for` 列表中；或
    - 状态类型在 `require_confirmation_for_types` 列表中（如 `human_confirmation`、`human_input`）。
 3. 若当前状态不需要确认：
-   - `human_confirmation`：直接触发 `confirm` 事件，记录 `auto_resolved` 决策日志。
+   - `human_confirmation`：只有非禁止节点且前置 Agent 结果为 pass 时才能触发 `confirm`；`REWORK`、`ACCEPTANCE_PENDING`、quality fail 和存在未消费用户输入时不得自动处理。
    - `human_input`（如 `CLARIFICATION_PENDING`）：
      - 调用 `project_manager` Agent 基于上下文生成默认回答
      - 以 `answer` 事件推进

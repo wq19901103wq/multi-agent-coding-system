@@ -18,7 +18,16 @@
       "display": "大纲设计中",
       "next_states": {
         "complete": "OUTLINE_CONFIRM_PENDING",
+        "ask_user": "OUTLINE_INPUT_PENDING",
         "fail": "FAILED"
+      }
+    },
+    "OUTLINE_INPUT_PENDING": {
+      "type": "human_input",
+      "input_purpose": "clarification",
+      "display": "等待大纲澄清",
+      "next_states": {
+        "answer": "DOC_OUTLINE"
       }
     },
     "OUTLINE_CONFIRM_PENDING": {
@@ -34,7 +43,7 @@
       "agent": "coder",
       "display": "文档编写中",
       "next_states": {
-        "complete": "REVIEW",
+        "complete": "CODING_CONFIRM_PENDING",
         "fail": "FAILED",
         "clarify": "CLARIFICATION_PENDING",
         "conflict": "CONFLICT_PENDING",
@@ -59,14 +68,38 @@
         "needs_outline_change": "DOC_OUTLINE"
       }
     },
+    "CODING_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认文档内容",
+      "next_states": {
+        "confirm": "REVIEW",
+        "reject": "REWORK"
+      }
+    },
     "REVIEW": {
       "type": "agent_execution",
       "agent": "reviewer",
       "display": "Review 中",
       "next_states": {
-        "complete": "ACCEPTANCE_PENDING",
-        "fail": "CODING",
+        "complete": "REVIEW_CONFIRM_PENDING",
+        "fail": "REWORK",
         "fail_max_retries": "FAILED"
+      }
+    },
+    "REVIEW_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认 Review 结果",
+      "next_states": {
+        "confirm": "ACCEPTANCE_PENDING",
+        "reject": "REWORK"
+      }
+    },
+    "REWORK": {
+      "type": "human_confirmation",
+      "display": "等待选择回退层级",
+      "next_states": {
+        "to_outline": "DOC_OUTLINE",
+        "to_coding": "CODING"
       }
     },
     "ACCEPTANCE_PENDING": {
@@ -74,7 +107,7 @@
       "display": "等待验收",
       "next_states": {
         "confirm": "MERGING",
-        "reject": "CODING",
+        "reject": "REWORK",
         "reject_to_outline": "DOC_OUTLINE"
       }
     },

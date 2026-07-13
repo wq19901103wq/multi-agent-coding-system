@@ -18,7 +18,16 @@
       "display": "Bug 分析中",
       "next_states": {
         "complete": "BUG_FIX_CONFIRM_PENDING",
+        "ask_user": "BUG_FIX_INPUT_PENDING",
         "fail": "FAILED"
+      }
+    },
+    "BUG_FIX_INPUT_PENDING": {
+      "type": "human_input",
+      "input_purpose": "clarification",
+      "display": "等待 Bug 分析澄清",
+      "next_states": {
+        "answer": "BUG_ANALYSIS"
       }
     },
     "BUG_FIX_CONFIRM_PENDING": {
@@ -34,7 +43,7 @@
       "agent": "coder",
       "display": "修复代码中",
       "next_states": {
-        "complete": "TESTING",
+        "complete": "CODING_CONFIRM_PENDING",
         "fail": "FAILED",
         "clarify": "CLARIFICATION_PENDING",
         "conflict": "CONFLICT_PENDING",
@@ -59,14 +68,30 @@
         "needs_bug_analysis_change": "BUG_ANALYSIS"
       }
     },
+    "CODING_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认修复代码",
+      "next_states": {
+        "confirm": "TESTING",
+        "reject": "REWORK"
+      }
+    },
     "TESTING": {
       "type": "agent_execution",
       "agent": "tester",
       "display": "测试中",
       "next_states": {
-        "complete": "REVIEW",
-        "fail": "CODING",
+        "complete": "TESTING_CONFIRM_PENDING",
+        "fail": "REWORK",
         "fail_max_retries": "FAILED"
+      }
+    },
+    "TESTING_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认测试结果",
+      "next_states": {
+        "confirm": "REVIEW",
+        "reject": "REWORK"
       }
     },
     "REVIEW": {
@@ -74,9 +99,26 @@
       "agent": "reviewer",
       "display": "Review 中",
       "next_states": {
-        "complete": "ACCEPTANCE_PENDING",
-        "fail": "CODING",
+        "complete": "REVIEW_CONFIRM_PENDING",
+        "fail": "REWORK",
         "fail_max_retries": "FAILED"
+      }
+    },
+    "REVIEW_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认 Review 结果",
+      "next_states": {
+        "confirm": "ACCEPTANCE_PENDING",
+        "reject": "REWORK"
+      }
+    },
+    "REWORK": {
+      "type": "human_confirmation",
+      "display": "等待选择回退层级",
+      "next_states": {
+        "to_analysis": "BUG_ANALYSIS",
+        "to_coding": "CODING",
+        "to_testing": "TESTING"
       }
     },
     "ACCEPTANCE_PENDING": {
@@ -84,7 +126,7 @@
       "display": "等待验收",
       "next_states": {
         "confirm": "MERGING",
-        "reject": "CODING",
+        "reject": "REWORK",
         "reject_to_analysis": "BUG_ANALYSIS"
       }
     },

@@ -32,7 +32,7 @@ def cli(debug: bool) -> None:
 
 @cli.command("server")
 @click.option("--host", default="127.0.0.1", help="Bind host.")
-@click.option("--port", default=8000, help="Bind port.")
+@click.option("--port", default=get_settings().mcs_port, help="Bind port.")
 @click.option("--reload", is_flag=True, help="Enable auto-reload.")
 def server(host: str, port: int, reload: bool) -> None:
     """Start the FastAPI server."""

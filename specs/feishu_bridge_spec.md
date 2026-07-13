@@ -284,6 +284,107 @@ Agent 执行完成后发送，文案避免“已完成：需求分析中”的�
 }
 ```
 
+### 7.3 驳回后 interim 消息
+
+驳回交互按节点类型处理：
+
+- 规划确认：点击驳回后展示意见输入卡，原 approval 在用户提交意见前保持 pending；不能先回退状态再等待自由文本。
+- 质量确认/验收：点击驳回后立即进入 REWORK，并发送回退目标选择卡。反馈文本是可选项，不能因为没有反馈而不发 REWORK 卡。
+- `/reject appr_xxx feedback` 可同时完成驳回和反馈提交。
+
+---
+
+### 7.4 Agent 实时进度卡片
+
+Agent 执行期间，其实时思考过程（thinking/text）和工具调用（tool_use）应通过飞书卡片实时推送，让用户看到 bot 正在做什么，而非等待数分钟后才有响应。
+
+#### 推送策略
+
+- Agent 每产生一次 assistant 事件（含 thinking/text/tool_use），即通过回调推送到飞书
+- 连续 thinking 片段合并为一张内容卡片发送，避免刷屏
+- 工具调用（Read/Write/Bash/Glob 等）单独发卡片展示工具名和关键参数
+- LLM 返回时间较长（>30s）时，发送"思考中…"提示卡片
+
+#### 卡片格式
+
+**思考过程卡片（thinking/text 合并）：**
+
+```json
+{
+  "config": {"wide_screen_mode": true},
+  "header": {
+    "title": {"tag": "plain_text", "content": "Agent 思考中 — {stage}"},
+    "template": "blue"
+  },
+  "elements": [
+    {"tag": "div", "text": {"tag": "lark_md", "content": "{thinking_content}"}}
+  ]
+}
+```
+
+**工具调用卡片：**
+
+```json
+{
+  "config": {"wide_screen_mode": true},
+  "header": {
+    "title": {"tag": "plain_text", "content": "正在执行 — {tool_name}"},
+    "template": "purple"
+  },
+  "elements": [
+    {"tag": "div", "text": {"tag": "lark_md", "content": "**工具**: {tool_name}\n**输入**: {tool_input_preview}"}}
+  ]
+}
+```
+
+#### 实现方式
+
+在 `AgentRuntime` 中增加可选的 `progress_callback` 参数，Orchestrator 在创建 runtime 时传入回调函数。**本功能默认关闭**，通过 `DEBUG_AGENT_PROGRESS=1` 环境变量或项目配置中的 `debug_agent_progress: true` 启用。
+
+```python
+# runtime.py
+async def execute(
+    self, ...,
+    progress_callback: Callable[[str, str], Awaitable[None]] | None = None,
+) -> AgentRuntimeResult:
+    """execute 签名新增 progress_callback.
+
+    progress_callback(event_type, content) 在每次收到 assistant 事件时被调用。
+    event_type: "thinking" | "text" | "tool_use"
+    content: thinking/text 内容字符串，或 tool_use 的 JSON 序列化
+    """
+```
+
+```python
+# orchestrator.py
+result = await self.runtime.execute(
+    ...,
+    progress_callback=self._make_progress_callback(project, task),
+)
+
+def _make_progress_callback(self, project, task):
+    """返回一个异步回调，将 agent 进度通过 FeishuBridge 推送。"""
+    async def cb(event_type: str, content: str):
+        if not self.feishu_bridge:
+            return
+        # 实现：按 event_type 发送对应卡片
+    return cb
+```
+
+#### 注意事项
+
+- 进度卡片只用于展示，不影响状态机逻辑
+- 回调中不应抛出异常（故障可记录日志但不中断 agent 执行）
+- 高频 thinking 片段应合并发送（合并间隔 ≤2s），避免飞书限流
+
+交互流程：
+1. 规划确认点驳回 → 输入卡 → 提交 feedback → 原子回退 → 新 Planner 轮次。
+2. 质量确认点驳回 → 原子进入 REWORK → 立即发送唯一 REWORK approval 卡。
+3. REWORK 卡必须携带 project_id、approval_id、source_state 和可选 recommended_target。
+4. 同一 project/state 已有 pending approval 时重发同一 approval，不生成新 ID。
+
+操作反馈卡只能在业务事务成功后发送；若只打开规划驳回输入卡，文案应为“请填写修改意见”，不能宣称“已驳回”。
+
 ## 8. 事件解析
 
 ### 7.1 文本消息
@@ -341,6 +442,8 @@ ButtonAction(
 
 ## 9. 用户-项目绑定
 
+本节只描述飞书侧交互；完整的聊天、用户、项目路由和权限规则以 `conversation_routing_spec.md` 为准。`project_users` 只表示权限，不再承担“当前消息属于哪个项目”的路由职责。
+
 ### 8.1 创建项目时绑定
 
 - 从飞书创建项目时，把创建者 `open_id` 写入 `project_users` 表。
@@ -355,6 +458,14 @@ ButtonAction(
 - `project_users` 表支持多对多。
 - MVP 阶段主要由创建者操作。
 
+### 8.4 多聊天与多项目
+
+- 一个聊天可以关联多个项目，一个项目可以关联多个聊天。
+- 自由文本根据 `(chat_id, open_id)` 的 active project 路由，不使用用户最近更新项目。
+- 卡片和命令优先使用显式 approval_id/project_id。
+- 群聊只处理 @机器人、命令、回复机器人消息和卡片动作。
+- 无唯一上下文时返回项目选择卡片，禁止猜测。
+
 ---
 
 ## 10. 文本指令（Fallback）
@@ -363,11 +474,30 @@ ButtonAction(
 |------|------|
 | `/whoami` | 返回 open_id |
 | `/bind <project_id>` | 绑定到项目 |
+| `/projects` | 列出当前聊天可用项目 |
+| `/use <project_id>` | 切换当前用户在当前聊天中的项目上下文 |
+| `/current` | 查看当前项目 |
+| `/leave-project` | 清除当前项目上下文 |
 | `/status <project_id>` | 查询项目状态 |
 | `/create [--type=<task_type>] <描述>` | 创建项目；省略 `--type` 时由 IntentRouter 自动分类 |
 | `/input <approval_id> <回答>` | 提交人工输入 |
 
 ---
+
+### 中途文本与命令
+
+- 命令始终进入控制通道，优先级高于普通文本；`/cancel`、`/rollback`、`/pause` 可以使正在运行的 Agent 结果失效。
+- Agent 运行期间的自由文本必须回复“已保存、稍后处理”，并写入持久化 pending_user_inputs，不能只存在 WebSocket 处理线程内。
+- pending input/confirmation 状态下的自然语言必须绑定明确 approval_id；若用户有多个项目或多个候选审批，先让用户选择，禁止猜测。
+
+### 8.5 Agent 主动提问卡（Grill-Me）
+
+所有 Agent 都可以发送主动提问卡。卡片必须包含 Agent/阶段/轮次、问题与原因、blocking 和默认行为、2–5 个选项及推荐理由、自由文本入口，以及“采用推荐项”“接受默认假设并继续”“暂停/取消”等操作。
+
+payload 必须携带 `question_id`、`approval_id`、`project_id`、`resume_state`、task_id 和 round。用户回答后若 Agent 仍不理解，可以生成下一张卡继续 grill-me；旧卡更新为已回答，新卡使用新 question_id，数据库中仍只有一个当前 pending approval。
+
+同一问题投递到多个聊天时，任一合法回答成功后其他卡片更新为已处理；回答必须按 question/approval 显式路由，不受后来 `/use` 切换影响。
+- 卡片按钮、slash command 和自动确认使用同一个原子 resolve approval 服务，保证权限、幂等和状态一致性。
 
 ## 11. 调试
 

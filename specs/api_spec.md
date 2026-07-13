@@ -113,6 +113,16 @@
 
 用户追问或发送非命令消息。
 
+消息处理取决于项目实时状态：
+
+- `*_INPUT_PENDING`：作为当前唯一 input approval 的回答。
+- `*_CONFIRM_PENDING`：保存为当前产物评论；只有明确 action 才改变状态。
+- Agent 正在运行：返回 `202 Accepted`，将消息写入持久化 pending_user_inputs，稍后在 merge/transition 前消费。
+- 消息包含范围变更或纠正：生成 feedback packet 并阻止该轮自动确认。
+- 普通问题：可由 project_manager 回答，但不得静默修改已确认产物。
+
+飞书自由文本进入本端点前必须已由 conversation routing 解析出唯一 project_id。无 active project 或存在歧义时返回项目选择响应，不得按用户最近项目猜测。
+
 **Request：**
 
 ```json
@@ -130,6 +140,35 @@
   "state": "REQUIREMENT_CONFIRM_PENDING"
 }
 ```
+
+排队响应示例：
+
+```json
+{
+  "project_id": "proj_...",
+  "input_id": "input_...",
+  "status": "queued",
+  "observed_state": "CODING",
+  "message": "输入已保存，将在本轮 Agent 结束后优先处理"
+}
+```
+
+### `POST /projects/{project_id}/approvals/{approval_id}/resolve`
+
+原子响应当前 approval。服务校验 approval 仍为 pending、属于项目当前状态且 action 在 options 中，然后在同一事务内提交 approval 响应和状态转换。重复请求返回第一次处理结果并标记 `already_resolved=true`。
+
+### 会话上下文接口
+
+```text
+GET    /conversations/{chat_id}/projects
+GET    /conversations/{chat_id}/users/{open_id}/context
+PUT    /conversations/{chat_id}/users/{open_id}/context
+DELETE /conversations/{chat_id}/users/{open_id}/context
+POST   /projects/{project_id}/chats
+DELETE /projects/{project_id}/chats/{chat_id}
+```
+
+设置 active project 时必须同时验证用户的 ProjectUser 权限和项目的 ProjectChat 可见关系。管理 API 使用受认证主体，不应信任请求方随意填写 open_id。
 
 ### `POST /projects/{project_id}/commands`
 

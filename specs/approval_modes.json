@@ -1,6 +1,11 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "timezone": "Asia/Shanghai",
+  "invariants": {
+    "never_auto_confirm_states": ["REWORK", "ACCEPTANCE_PENDING"],
+    "never_auto_confirm_results": ["quality_fail", "runtime_failure"],
+    "cancel_auto_confirmation_on_pending_user_input": true
+  },
   "modes": {
     "strict": {
       "description": "所有关键节点都需要人工确认",
@@ -28,6 +33,7 @@
       "auto_resolve_clarification": true,
       "auto_resolve_conflict": true,
       "auto_resolve_strategy": "project_manager_default",
+      "quality_gate_pass_strategy": "immediate_confirm",
       "night_window": {
         "start_time": "23:00",
         "end_time": "08:00",
@@ -42,7 +48,8 @@
       "require_confirmation_for_types": [],
       "auto_resolve_clarification": true,
       "auto_resolve_conflict": true,
-      "auto_resolve_strategy": "project_manager_default"
+      "auto_resolve_strategy": "project_manager_default",
+      "quality_gate_pass_strategy": "immediate_confirm"
     }
   }
 }

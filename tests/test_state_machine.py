@@ -22,9 +22,13 @@ def test_feature_transitions():
     assert sm.next_state("ARCHITECTURE_CONFIRM_PENDING", "select_option") == "PLANNING_ARCHITECTURE"
     assert sm.next_state("PLANNING_SPECS", "complete") == "SPEC_CONFIRM_PENDING"
     assert sm.next_state("SPEC_CONFIRM_PENDING", "confirm") == "CODING"
-    assert sm.next_state("CODING", "complete") == "TESTING"
-    assert sm.next_state("TESTING", "complete") == "REVIEW"
-    assert sm.next_state("REVIEW", "complete") == "ACCEPTANCE_PENDING"
+    assert sm.next_state("CODING", "complete") == "CODING_CONFIRM_PENDING"
+    assert sm.next_state("CODING_CONFIRM_PENDING", "confirm") == "TESTING"
+    assert sm.next_state("CODING_CONFIRM_PENDING", "reject") == "REWORK"
+    assert sm.next_state("TESTING", "complete") == "TESTING_CONFIRM_PENDING"
+    assert sm.next_state("TESTING_CONFIRM_PENDING", "confirm") == "REVIEW"
+    assert sm.next_state("REVIEW", "complete") == "REVIEW_CONFIRM_PENDING"
+    assert sm.next_state("REVIEW_CONFIRM_PENDING", "confirm") == "ACCEPTANCE_PENDING"
     assert sm.next_state("ACCEPTANCE_PENDING", "confirm") == "MERGING"
     assert sm.next_state("MERGING", "complete") == "COMPLETED"
 
@@ -34,7 +38,8 @@ def test_bug_fix_state_machine():
     assert sm.initial_state == "BUG_ANALYSIS"
     assert sm.next_state("BUG_ANALYSIS", "complete") == "BUG_FIX_CONFIRM_PENDING"
     assert sm.next_state("BUG_FIX_CONFIRM_PENDING", "confirm") == "CODING"
-    assert sm.next_state("CODING", "complete") == "TESTING"
+    assert sm.next_state("CODING", "complete") == "CODING_CONFIRM_PENDING"
+    assert sm.next_state("CODING_CONFIRM_PENDING", "confirm") == "TESTING"
     assert sm.next_state("CODING", "bug_analysis_question") == "BUG_ANALYSIS"
 
 
@@ -43,7 +48,8 @@ def test_documentation_state_machine():
     assert sm.initial_state == "DOC_OUTLINE"
     assert sm.next_state("DOC_OUTLINE", "complete") == "OUTLINE_CONFIRM_PENDING"
     assert sm.next_state("OUTLINE_CONFIRM_PENDING", "confirm") == "CODING"
-    assert sm.next_state("CODING", "complete") == "REVIEW"
+    assert sm.next_state("CODING", "complete") == "CODING_CONFIRM_PENDING"
+    assert sm.next_state("CODING_CONFIRM_PENDING", "confirm") == "REVIEW"
     assert sm.next_state("CODING", "outline_question") == "DOC_OUTLINE"
 
 

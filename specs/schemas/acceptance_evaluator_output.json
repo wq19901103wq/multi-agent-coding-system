@@ -3,7 +3,7 @@
   "$id": "https://mac-system.local/schemas/acceptance_evaluator_output.json",
   "title": "Acceptance Evaluator Output",
   "type": "object",
-  "required": ["success", "next_state_event", "result", "summary", "evidence"],
+  "required": ["success", "next_state_event", "result", "summary", "evidence", "acceptance_matrix", "blocking_conditions"],
   "additionalProperties": false,
   "properties": {
     "success": {"type": "boolean"},
@@ -13,12 +13,42 @@
     "evidence": {
       "type": "object",
       "required": ["tests_passed", "review_result", "meets_requirements"],
+      "additionalProperties": false,
       "properties": {
         "tests_passed": {"type": "boolean"},
         "coverage": {"type": "number", "minimum": 0, "maximum": 1},
         "review_result": {"enum": ["pass", "fail"]},
         "meets_requirements": {"type": "boolean"}
       }
+    },
+    "acceptance_matrix": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["acceptance_criterion_id", "requirement_ids", "spec_ids", "implementation_evidence", "test_evidence_ids", "review_result", "result"],
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_criterion_id": {"type": "string"},
+          "requirement_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "spec_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "implementation_evidence": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "test_evidence_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "review_result": {"enum": ["pass", "fail", "unknown"]},
+          "result": {"enum": ["pass", "fail", "unknown"]},
+          "notes": {"type": "string"}
+        }
+      }
+    },
+    "blocking_conditions": {
+      "type": "array",
+      "items": {
+        "enum": ["unmapped_requirement", "missing_spec", "missing_implementation_evidence", "missing_test_evidence", "open_blocking_review_issue", "stale_artifact", "pending_scope_change", "test_result_unknown", "migration_unverified", "rollback_unverified"]
+      }
+    },
+    "artifact_versions": {
+      "type": "object",
+      "additionalProperties": {"type": "integer", "minimum": 1}
     },
     "recommendation": {
       "type": "object",

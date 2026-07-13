@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     intent_high_threshold: float = Field(default=0.85, alias="INTENT_HIGH_THRESHOLD")
     intent_low_threshold: float = Field(default=0.5, alias="INTENT_LOW_THRESHOLD")
 
+    # Agent progress
+    debug_agent_progress: bool = Field(default=False, alias="DEBUG_AGENT_PROGRESS")
+
     # Admin panel
     admin_token: str | None = Field(default=None, alias="ADMIN_TOKEN")
 

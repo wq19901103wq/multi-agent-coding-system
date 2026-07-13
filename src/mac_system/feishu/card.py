@@ -28,6 +28,11 @@ def build_content_card(
     Use this for multi-card content streams: each card shows one chunk of
     markdown, and the caller sends the action buttons on the final card.
     """
+    # Defensive coercion: callers may accidentally pass None for page/total.
+    if not isinstance(page, int):
+        page = 1
+    if not isinstance(total, int):
+        total = 1
     header_title = title if total <= 1 else f"{title}（{page}/{total}）"
     elements: list[dict[str, Any]] = [
         {"tag": "div", "text": _lark_md(content)},
@@ -61,6 +66,11 @@ def build_confirmation_card(
         elements.append({"tag": "div", "text": _lark_md(f"**摘要**：{summary}")})
     for key, value in details.items():
         elements.append({"tag": "div", "text": _lark_md(f"**{key}**：{value}")})
+
+    # Expose the approval id so users can respond via slash commands too.
+    elements.append(
+        {"tag": "div", "text": _lark_md(f"审批ID：`{approval_id}`\n可用 `/confirm {approval_id}` 或 `/reject {approval_id} [反馈]`")}
+    )
 
     if show_actions:
         actions: list[dict[str, Any]] = []
@@ -108,7 +118,8 @@ def build_input_card(
     ]
     if context:
         elements.append({"tag": "div", "text": _lark_md(f"**上下文**：{context}")})
-    elements.append({"tag": "div", "text": _lark_md("请直接回复你的答案。")})
+    elements.append({"tag": "div", "text": _lark_md(f"审批ID：`{approval_id}`")})
+    elements.append({"tag": "div", "text": _lark_md("请直接回复你的答案，或用 `/input <approval_id> <回答>`。")})
     elements.append({
         "tag": "action",
         "actions": [{

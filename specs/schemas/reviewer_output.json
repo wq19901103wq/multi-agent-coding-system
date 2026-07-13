@@ -13,15 +13,41 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["severity", "description"],
+        "required": ["id", "severity", "description", "blocking", "category"],
+        "additionalProperties": false,
         "properties": {
+          "id": {"type": "string"},
           "severity": {"enum": ["minor", "major", "critical"]},
+          "category": {"enum": ["requirements", "architecture", "spec", "implementation", "tests", "security", "maintainability"]},
+          "blocking": {"type": "boolean"},
           "file": {"type": "string"},
           "line": {"type": "integer"},
-          "description": {"type": "string"}
+          "description": {"type": "string"},
+          "recommendation": {"type": "string"}
         }
       }
     },
+    "recommended_rework_target": {
+      "enum": ["none", "requirements", "architecture", "specs", "coding", "testing"]
+    },
+    "verified_feedback_ids": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "requirement_coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["acceptance_criterion_id", "status", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_criterion_id": {"type": "string"},
+          "status": {"enum": ["covered", "partially_covered", "not_covered", "violated"]},
+          "evidence": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "stale_artifact_ids": {"type": "array", "items": {"type": "string"}},
     "summary": {"type": "string"},
     "notes": {
       "type": "array",

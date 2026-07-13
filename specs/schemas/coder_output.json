@@ -23,6 +23,20 @@
       "type": "array",
       "items": {"type": "string"}
     },
+    "addressed_feedback": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["feedback_id", "status", "explanation"],
+        "additionalProperties": false,
+        "properties": {
+          "feedback_id": {"type": "string"},
+          "status": {"enum": ["fixed", "partially_fixed", "disputed", "not_applicable"]},
+          "explanation": {"type": "string"},
+          "files": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
     "clarification_question": {"type": "string"},
     "conflict": {
       "type": "object",

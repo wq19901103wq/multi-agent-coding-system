@@ -1,8 +1,10 @@
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from collections.abc import Awaitable
+from typing import Any, Callable
+
 
 from sqlmodel import select
 
@@ -12,7 +14,7 @@ from mac_system.config import get_settings
 from mac_system.core.lock_manager import ProjectLockManager, get_default_lock_manager
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
-from mac_system.models import Project, Task
+from mac_system.models import Approval, Project, Task
 from mac_system.state_machine import StateMachine
 
 
@@ -57,12 +59,14 @@ def _flatten_item(item: Any) -> str:
     return str(item)
 
 
-def _split_markdown_sections(text: str, max_chars: int = 1600) -> list[str]:
+def _split_markdown_sections(text: str | None, max_chars: int = 1600) -> list[str]:
     """Split Markdown text into readable chunks at section boundaries.
 
     Tries to keep sections together; only splits a section if it alone exceeds
     ``max_chars``.  Returns at least one chunk.
     """
+    if not text:
+        return ["（暂无详细汇报内容）"]
     if len(text) <= max_chars:
         return [text]
 
@@ -114,6 +118,16 @@ def _mention_prefix(open_id: str | None) -> str:
     if not open_id:
         return ""
     return f'<at user_id="{open_id}">@用户</at> '
+
+
+# Quality-gate confirmation states.  In manual/strict modes these wait for
+# human approval; in night/auto modes they are confirmed immediately so the
+# flow is not blocked, while still emitting a report card.
+_AUTO_CONFIRM_STATES: frozenset[str] = frozenset({
+    "CODING_CONFIRM_PENDING",
+    "TESTING_CONFIRM_PENDING",
+    "REVIEW_CONFIRM_PENDING",
+})
 
 
 class AgentOrchestrator:
@@ -174,6 +188,32 @@ class AgentOrchestrator:
 
         state_machine = StateMachine(project.task_type)
         state = project.current_state
+
+        # Apply any agent result that was produced while the project was paused.
+        paused_result = project.context.get("paused_agent_result")
+        if paused_result:
+            if paused_result.get("state") == state and not state_machine.is_terminal(state):
+                task = self.project_service.session.get(Task, paused_result["task_id"])
+                if task is not None:
+                    await self._handle_agent_output(
+                        project,
+                        state_machine,
+                        task,
+                        Path(paused_result["worktree_path"]),
+                        paused_result["output"],
+                    )
+                    project = self.project_service.require_project(project.id)
+                ctx = dict(project.context)
+                ctx.pop("paused_agent_result", None)
+                project.context = ctx
+                self.project_service.session.commit()
+                return
+            # Stale paused result; clear it.
+            ctx = dict(project.context)
+            ctx.pop("paused_agent_result", None)
+            project.context = ctx
+            self.project_service.session.commit()
+
         state_type = state_machine.state_type(state)
 
         if state_machine.is_terminal(state):
@@ -204,25 +244,72 @@ class AgentOrchestrator:
         max_retries = self._max_retries_for_state(state)
         if retry_count >= max_retries:
             await self.project_service.transition_state(
-                project.id, "fail_max_retries", triggered_by="orchestrator"
+                project.id, "fail", triggered_by="orchestrator"
             )
             return
 
-        # Include any rejection feedback the user provided, then clear it so it
-        # is not reused for unrelated downstream stages.
+        # Idempotency guard: do NOT start a new task if there is already a
+        # running agent for this project at this same state.  This prevents
+        # duplicate claude processes when tick() is called concurrently.
+        from sqlmodel import select
+        from mac_system.models import Task as TaskModel
+        running_task = self.project_service.session.exec(
+            select(TaskModel)
+            .where(
+                TaskModel.project_id == project.id,
+                TaskModel.state == state,
+                TaskModel.status == "running",
+            )
+            .limit(1)
+        ).first()
+        if running_task is not None:
+            logger.info(
+                "Skipping _execute_agent for %s at %s — task %s is already running",
+                project.id, state, running_task.id,
+            )
+            return
+
+        # Build round-aware task input.  Each re-entry into the same agent stage
+        # increments the stage round number so prompts and artifacts can refer to
+        # the correct iteration.
+        stage_rounds = dict(project.context.get("stage_rounds", {}))
+        round_number = stage_rounds.get(state, 0) + 1
+        stage_rounds[state] = round_number
+        project.context = {**project.context, "stage_rounds": stage_rounds}
+
+        # Include open feedback packets and any legacy rejection note.
         new_context = dict(project.context)
         rejection_note = new_context.pop("latest_rejection_feedback", "")
         project.context = new_context
+        open_feedback = [
+            {
+                "feedback_id": fb.id,
+                "source_stage": fb.source_stage,
+                "source_task_id": fb.source_task_id,
+                "source_round": fb.source_round,
+                "kind": fb.kind,
+                "failure_class": fb.failure_class,
+                "summary": fb.summary,
+                "blocking": fb.blocking,
+                "recommended_rework_target": fb.recommended_rework_target,
+                "evidence": fb.evidence,
+                "user_comment": fb.user_comment,
+            }
+            for fb in self.project_service.get_open_feedback_packets(project.id)
+        ]
 
         # Create task
         task = await self.project_service.create_task(
             project_id=project.id,
             agent_type=agent_type,
             state=state,
+            round_number=round_number,
             input_data={
                 "description": project.description,
                 "state": state,
+                "round_number": round_number,
                 "rejection_note": rejection_note,
+                "open_feedback": open_feedback,
             },
         )
 
@@ -274,6 +361,8 @@ class AgentOrchestrator:
                 task_id=task.id,
                 output_schema_path=str(output_schema),
                 rejection_note=rejection_note,
+                open_feedback=open_feedback,
+                round_number=round_number,
             )
             allowed_tools = self.prompt_renderer.get_allowed_tools(agent_type)
         except Exception as e:
@@ -282,6 +371,11 @@ class AgentOrchestrator:
             return
 
         # Execute agent
+        logger.info(
+            "Agent %s(%s) started for %s (task=%s)", agent_type, stage, project.id, task.id,
+        )
+        import time as _time
+        _agent_start = _time.monotonic()
         try:
             result = await self.runtime.execute(
                 agent_type=agent_type,
@@ -295,16 +389,67 @@ class AgentOrchestrator:
                 readonly_dirs=[Path(project.workspace_path)],
                 timeout_seconds=self.settings.agent_timeout_seconds,
                 task_id=task.id,
+                progress_callback=self._make_progress_callback(project, task),
             )
         except Exception as e:
+            _elapsed = _time.monotonic() - _agent_start
+            logger.error(
+                "Agent %s failed for %s after %.1fs: %s",
+                agent_type, project.id, _elapsed, e,
+            )
             await self.project_service.fail_task(task.id, f"Runtime execution failed: {e}")
             await self._handle_agent_failure(project, state, task, f"Runtime execution failed: {e}")
             return
+        _elapsed = _time.monotonic() - _agent_start
+        logger.info(
+            "Agent %s completed for %s in %.1fs (success=%s)",
+            agent_type, project.id, _elapsed, result.success,
+        )
+
+        # Fallback: some runtimes write the agent output into TASK.json instead of
+        # returning it directly in the result event.
+        if (not result.output_json) and result.success:
+            task_json_path = worktree / ".mac" / "TASK.json"
+            if task_json_path.exists():
+                try:
+                    task_doc = json.loads(task_json_path.read_text(encoding="utf-8"))
+                    output = task_doc.get("output")
+                    if isinstance(output, dict) and output.get("next_state_event"):
+                        result.output_json = output
+                except Exception as exc:
+                    logger.warning("Failed to read TASK.json output: %s", exc)
 
         # If the project was cancelled while the agent was running, discard the result.
         project = self.project_service.require_project(project.id)
         if project.status == "cancelled":
             await self.project_service.fail_task(task.id, "Project cancelled while agent was running")
+            return
+
+        # If the project was paused, complete the task and stash the result so
+        # we can apply it on resume instead of re-running the agent.
+        if project.status == "paused":
+            await self.project_service.complete_task(
+                task.id, result.output_json, result.cost_info
+            )
+            project = self.project_service.require_project(project.id)
+            project.context = {
+                **project.context,
+                "paused_agent_result": {
+                    "task_id": task.id,
+                    "state": state,
+                    "output": result.output_json,
+                    "worktree_path": str(worktree),
+                },
+            }
+            self.project_service.session.commit()
+            return
+
+        # If the project state changed (e.g. user rollback/cancel), discard stale result.
+        if project.current_state != state:
+            await self.project_service.fail_task(
+                task.id,
+                f"Project state changed from {state} to {project.current_state} while agent was running",
+            )
             return
 
         if not result.success or not result.output_json:
@@ -318,8 +463,43 @@ class AgentOrchestrator:
             task.id, result.output_json, result.cost_info
         )
 
+        # Consume any pending user inputs received while the agent was running.
+        await self._consume_pending_user_inputs(project, task, state, result.output_json)
+
         # Handle agent output
         await self._handle_agent_output(project, state_machine, task, worktree, result.output_json)
+
+        # In night/auto modes, quality-gate confirmations do not block the
+        # next tick.  Resolve them immediately while still emitting report cards.
+        await self._auto_resolve_quality_gates(project, state_machine)
+
+    async def _auto_resolve_quality_gates(
+        self,
+        project: Project,
+        state_machine: StateMachine,
+    ) -> None:
+        """Auto-resolve quality-gate confirmations when the approval mode allows.
+
+        These states still produce an approval record and report card, but if
+        the current mode says they do not require human confirmation we confirm
+        them right away and continue to the next agent stage in the same tick.
+        """
+        for _ in range(5):
+            refreshed = self.project_service.get_project(project.id)
+            if refreshed is None:
+                return
+            state = refreshed.current_state
+            if state not in _AUTO_CONFIRM_STATES:
+                break
+            state_type = state_machine.state_type(state)
+            if self._state_requires_confirmation(
+                state, state_type, refreshed.approval_config
+            ):
+                break
+            await self._handle_human_confirmation(refreshed, state_machine)
+            new_state = self.project_service.get_project(project.id).current_state
+            if new_state == state:
+                break
 
     async def _execute_auxiliary_agent(
         self,
@@ -517,11 +697,39 @@ class AgentOrchestrator:
     ) -> None:
         state = project.current_state
         event = output.get("next_state_event", "complete")
+        feedback_packet_id: str | None = None
+
+        # Quality gates: only an explicit pass is allowed to move forward.
+        # A failing assessment is recorded as a structured FeedbackPacket and
+        # routed to REWORK via the state machine's "fail" event.
+        if state == "TESTING":
+            if output.get("passed") is False:
+                event = "fail"
+                packet = await self._create_feedback_from_tester_output(project, task, output)
+                feedback_packet_id = packet.id if packet else None
+            else:
+                await self._resolve_verified_feedback(output.get("verified_feedback_ids", []), task.id)
+        elif state == "REVIEW":
+            issues = output.get("issues", [])
+            blocking_issue = any(issue.get("blocking") for issue in issues)
+            if output.get("result") == "fail" or blocking_issue:
+                event = "fail"
+                packet = await self._create_feedback_from_reviewer_output(project, task, output)
+                feedback_packet_id = packet.id if packet else None
+            else:
+                await self._resolve_verified_feedback(output.get("verified_feedback_ids", []), task.id)
+
+        # Apply any free-text user inputs that arrived while the agent was
+        # running.  Blocking inputs discard the agent result instead of merging
+        # stale output.
+        discard_event = await self._consume_pending_user_inputs(project, task, state, output)
+        if discard_event:
+            event = discard_event
 
         # For planner stages, copy the .mac/ output files written by the agent
-        # from the worktree back to the main workspace.  (Coder/tester/reviewer
-        # stages go through a full git merge later in this method.)
-        if state in (
+        # from the worktree back to the main workspace.  Only do this when the
+        # result is actually going to be kept (event == "complete").
+        if event == "complete" and state in (
             "PLANNING_REQUIREMENTS",
             "PLANNING_ARCHITECTURE",
             "PLANNING_SPECS",
@@ -530,7 +738,7 @@ class AgentOrchestrator:
         ):
             self._copy_mac_outputs(project, worktree, output, state)
 
-        # For coder/tester/reviewer, merge worktree changes
+        # For coder/tester/reviewer, merge worktree changes only on success.
         if state in ("CODING", "TESTING", "REVIEW") and event == "complete":
             try:
                 self.worktree_manager.merge_worktree(
@@ -551,6 +759,8 @@ class AgentOrchestrator:
 
         # Transition state
         payload = self._build_transition_payload(output)
+        if feedback_packet_id:
+            payload["feedback_packet_id"] = feedback_packet_id
         from_state = project.current_state
         await self.project_service.transition_state(
             project.id, event, payload=payload, triggered_by="agent"
@@ -570,6 +780,145 @@ class AgentOrchestrator:
                     "Failed to remove worktree %s after transition: %s", worktree, e
                 )
 
+    async def _create_feedback_from_tester_output(
+        self,
+        project: Project,
+        task: Task,
+        output: dict[str, Any],
+    ) -> Any:
+        """Create a FeedbackPacket from a failing tester output."""
+        failures = output.get("failures", [])
+        recommended = output.get("recommended_rework_target")
+        if recommended in (None, "none"):
+            recommended = None
+        return await self.project_service.create_feedback_packet(
+            project_id=project.id,
+            source_stage="TESTING",
+            source_task_id=task.id,
+            source_round=task.round_number,
+            kind="quality_failure",
+            summary=output.get("report") or "测试未通过",
+            blocking=True,
+            failure_class=output.get("failure_class") or "implementation_bug",
+            recommended_rework_target=recommended,
+            evidence=[{"type": "test_failure", **f} for f in failures] if failures else [],
+        )
+
+    async def _create_feedback_from_reviewer_output(
+        self,
+        project: Project,
+        task: Task,
+        output: dict[str, Any],
+    ) -> Any:
+        """Create a FeedbackPacket from a failing reviewer output."""
+        issues = output.get("issues", [])
+        blocking_issue = next((i for i in issues if i.get("blocking")), None)
+        failure_class = blocking_issue.get("category") if blocking_issue else "implementation"
+        recommended = output.get("recommended_rework_target")
+        if recommended in (None, "none"):
+            recommended = None
+        return await self.project_service.create_feedback_packet(
+            project_id=project.id,
+            source_stage="REVIEW",
+            source_task_id=task.id,
+            source_round=task.round_number,
+            kind="quality_failure",
+            summary=output.get("summary") or "Review 未通过",
+            blocking=True,
+            failure_class=failure_class,
+            recommended_rework_target=recommended,
+            evidence=[{"type": "review_issue", **i} for i in issues] if issues else [],
+        )
+
+    async def _resolve_verified_feedback(
+        self,
+        verified_feedback_ids: list[str] | None,
+        resolved_by_task_id: str,
+    ) -> None:
+        """Mark feedback packets resolved when a quality gate verifies the fix."""
+        if not verified_feedback_ids:
+            return
+        for feedback_id in verified_feedback_ids:
+            try:
+                await self.project_service.resolve_feedback_packet(
+                    feedback_id, resolved_by_task_id=resolved_by_task_id
+                )
+            except Exception as exc:
+                logger.warning("Failed to resolve feedback packet %s: %s", feedback_id, exc)
+
+    def _discard_event_for_state(self, state: str) -> str:
+        """Return the event that discards a stale agent result for ``state``."""
+        if state in ("PLANNING_REQUIREMENTS", "PLANNING_ARCHITECTURE",
+                     "PLANNING_SPECS", "BUG_ANALYSIS", "DOC_OUTLINE"):
+            return "ask_user"
+        if state == "CODING":
+            return "clarify"
+        return "fail"
+
+    async def _consume_pending_user_inputs(
+        self,
+        project: Project,
+        task: Task,
+        state: str,
+        output: dict[str, Any],
+    ) -> str | None:
+        """Consume free-text user inputs received while an agent was running.
+
+        scope_change / correction inputs are recorded as blocking feedback.
+        When such an input arrives in an agent-execution stage, the agent's
+        result is treated as stale: it is not merged/copied and the project is
+        routed to the appropriate human_input state (or REWORK for quality
+        gates) so the user's input can be incorporated before proceeding.
+        """
+        pending = self.project_service.get_pending_user_inputs(project.id)
+        if not pending:
+            return None
+
+        blocking_inputs: list[Any] = []
+        for inp in pending:
+            await self.project_service.consume_pending_user_input(
+                inp.id, task.id, commit=False
+            )
+            await self.project_service.create_feedback_packet(
+                project_id=project.id,
+                source_stage=state,
+                source_task_id=task.id,
+                source_round=task.round_number,
+                kind=inp.kind,
+                summary=inp.content,
+                blocking=inp.kind in ("scope_change", "correction"),
+                user_comment=inp.content,
+                commit=False,
+            )
+            if inp.kind in ("scope_change", "correction"):
+                blocking_inputs.append(inp)
+
+        if not blocking_inputs:
+            self.project_service.session.commit()
+            return None
+
+        user_note = "\n".join(f"- {inp.content}" for inp in blocking_inputs)
+        stale_note = f"Agent 运行期间收到 blocking 输入，当前结果已丢弃：\n{user_note}"
+
+        event = self._discard_event_for_state(state)
+        output["next_state_event"] = event
+        output["clarification_question"] = user_note
+        output.setdefault("notes", []).append(stale_note)
+
+        if state == "TESTING":
+            output["passed"] = False
+            output["report"] = (
+                (output.get("report") or "测试未通过") + "\n\n用户中途输入（强制驳回）：\n" + user_note
+            )
+        elif state == "REVIEW":
+            output["result"] = "fail"
+            output["summary"] = (
+                (output.get("summary") or "Review 未通过") + "\n\n用户中途输入（强制驳回）：\n" + user_note
+            )
+
+        self.project_service.session.commit()
+        return event
+
     async def _handle_agent_failure(
         self,
         project: Project,
@@ -588,10 +937,11 @@ class AgentOrchestrator:
             meta={"task_id": task.id, "state": state, "retry_count": retry_count},
         )
 
-        if retry_count < max_retries:
+        next_retry_count = retry_count + 1
+        if next_retry_count < max_retries:
             # Reassign the context dict so SQLAlchemy detects the JSON mutation.
             new_counts = dict(project.context.get("retry_counts", {}))
-            new_counts[retry_key] = retry_count + 1
+            new_counts[retry_key] = next_retry_count
             project.context = {**project.context, "retry_counts": new_counts}
             # Persist the retry count immediately so the next tick sees it even
             # if the outer session_scope rolls back for unrelated reasons.
@@ -599,8 +949,20 @@ class AgentOrchestrator:
             # Stay in same state for retry
             return
 
+        # This failure consumed the last allowed attempt. Transition now;
+        # relying on a future tick leaves an active project with no task.
+        new_counts = dict(project.context.get("retry_counts", {}))
+        new_counts[retry_key] = next_retry_count
+        project.context = {**project.context, "retry_counts": new_counts}
+        self.project_service.session.commit()
+
+        # Runtime/infra failures for quality-gate agents must still end in FAILED,
+        # not REWORK.  Those states expose a dedicated fail_max_retries event.
+        terminal_event = "fail"
+        if state in ("TESTING", "REVIEW"):
+            terminal_event = "fail_max_retries"
         await self.project_service.transition_state(
-            project.id, "fail", triggered_by="orchestrator"
+            project.id, terminal_event, triggered_by="orchestrator"
         )
 
     def _state_requires_confirmation(
@@ -612,9 +974,13 @@ class AgentOrchestrator:
         """Return True if the state should be confirmed by a human.
 
         A state requires confirmation when either:
-        - its state name is listed in ``require_confirmation_for``; or
-        - its state type is listed in ``require_confirmation_for_types``.
+        - its state name is listed in ``require_confirmation_for``;
+        - its state type is listed in ``require_confirmation_for_types``; or
+        - it is the REWORK state, which must always be driven by a human decision.
         """
+        # REWORK is a human decision on where to roll back; never auto-resolve it.
+        if state == "REWORK":
+            return True
         require_names = approval_config.get("require_confirmation_for", [])
         require_types = approval_config.get("require_confirmation_for_types", [])
         return state in require_names or state_type in require_types
@@ -634,12 +1000,6 @@ class AgentOrchestrator:
         # Build question/options based on state
         question, options = self._build_confirmation_question(project, state)
 
-        # Track how many times this confirmation state has been entered.
-        rounds = dict(project.context.get("confirmation_rounds", {}))
-        round_number = rounds.get(state, 0) + 1
-        rounds[state] = round_number
-        project.context = {**project.context, "confirmation_rounds": rounds}
-
         task = (
             self.project_service.session.exec(
                 select(Task)
@@ -649,38 +1009,68 @@ class AgentOrchestrator:
             .first()
         )
 
-        approval = await self.project_service.create_approval(
-            project_id=project.id,
-            task_id=task.id if task else None,
-            state=state,
-            approval_type="confirmation",
-            question=question,
-            options=options,
-            payload={"round_number": round_number},
-        )
+        # Human-state ticks are idempotent. Reuse an existing pending approval
+        # instead of expiring the card that another tick just created.
+        approval = self.project_service.session.exec(
+            select(Approval)
+            .where(
+                Approval.project_id == project.id,
+                Approval.state == state,
+                Approval.status == "pending",
+            )
+            .order_by(Approval.created_at.desc())
+        ).first()
+        if approval is None:
+            rounds = dict(project.context.get("confirmation_rounds", {}))
+            round_number = rounds.get(state, 0) + 1
+            rounds[state] = round_number
+            project.context = {**project.context, "confirmation_rounds": rounds}
+            approval = await self.project_service.create_approval(
+                project_id=project.id,
+                task_id=task.id if task else None,
+                state=state,
+                approval_type="confirmation",
+                question=question,
+                options=options,
+                payload={"round_number": round_number},
+            )
 
-        # Auto-resolve if state does not require confirmation
+        # Auto-resolve if the current mode does not require confirmation.
         if not requires_confirmation:
-            strategy = approval_config.get("auto_resolve_strategy", "none")
-            if strategy == "project_manager_default":
-                chosen = await self._choose_action_with_project_manager(
-                    project, state, question, options
-                )
+            chosen: str | None = None
+            if state in _AUTO_CONFIRM_STATES:
+                # Quality gates are shown to the user (report card) but
+                # default to confirm so the flow is not blocked in auto/night.
+                chosen = "confirm"
+            else:
+                strategy = approval_config.get("auto_resolve_strategy", "none")
+                if strategy == "project_manager_default":
+                    chosen = await self._choose_action_with_project_manager(
+                        project, state, question, options
+                    )
                 if chosen is None:
                     chosen = options[0]["action"]
-                    logger.warning(
-                        "project_manager agent failed to choose an action for %s, falling back to %s",
-                        project.id, chosen,
-                    )
-                await self.project_service.respond_approval(
-                    approval.id, chosen, "system_auto"
+                    if strategy == "project_manager_default":
+                        logger.warning(
+                            "project_manager agent failed to choose an action for %s, falling back to %s",
+                            project.id, chosen,
+                        )
+
+            # For quality gates, still emit the report card before auto-resolving.
+            if state in _AUTO_CONFIRM_STATES and self.feishu_bridge:
+                await self._send_confirmation_cards(
+                    project, approval, question, options, show_actions=False
                 )
-                await self.project_service.transition_state(
-                    project.id, chosen, triggered_by="system_auto"
-                )
-                # Notify the user that the system auto-resolved this step.
-                await self._notify_auto_resolve(project, state, chosen)
-                return
+
+            await self.project_service.respond_approval(
+                approval.id, chosen, "system_auto"
+            )
+            await self.project_service.transition_state(
+                project.id, chosen, triggered_by="system_auto"
+            )
+            # Notify the user that the system auto-resolved this step.
+            await self._notify_auto_resolve(project, state, chosen)
+            return
 
         # Enrich acceptance cards with an evaluator recommendation.
         acceptance_recommendation = None
@@ -689,73 +1079,85 @@ class AgentOrchestrator:
 
         # Otherwise, send notification and wait
         if self.feishu_bridge:
-            sm = StateMachine(project.task_type)
-            state_display = sm.display_name(state)
-            project_name = project.name or project.id
-            title = f"{question} — {project_name}"
+            await self._send_confirmation_cards(
+                project, approval, question, options, acceptance_recommendation
+            )
 
-            state_details = self._build_details_for_state(project, state)
-            details: dict[str, Any] = {"当前阶段": state_display}
-            if state_details:
-                details.update(state_details)
-            if acceptance_recommendation:
-                rec_summary = acceptance_recommendation.get("reason") or acceptance_recommendation.get("summary", "")
-                if rec_summary:
-                    details["验收评估"] = rec_summary[:200]
-                if acceptance_recommendation.get("action") == "confirm":
-                    details["建议操作"] = "验收通过"
-            summary_text = self._build_summary_for_state(project, state)
-            receive_id, receive_id_type = self._resolve_project_recipient(project)
-            creator_open_id = self._get_creator_open_id(project.id)
+    async def _send_confirmation_cards(
+        self,
+        project: Project,
+        approval: Any,
+        question: str,
+        options: list[dict],
+        acceptance_recommendation: dict[str, Any] | None = None,
+        show_actions: bool = True,
+    ) -> None:
+        """Send a report card followed by the action confirmation card."""
+        if self.feishu_bridge is None:
+            return
 
-            # Feishu interactive card JSON is best kept under ~30 KB and the
-            # mobile client renders long lark_md blocks poorly.  When the summary
-            # is long we split it into multiple display cards (a la feishu-connect)
-            # and keep the action buttons on the final confirmation card so the
-            # user reads the full content before deciding.
-            CARD_SUMMARY_LIMIT = 900
-            is_long = len(summary_text) > CARD_SUMMARY_LIMIT
+        sm = StateMachine(project.task_type)
+        state_display = sm.display_name(project.current_state)
+        project_name = project.name or project.id
+        title = f"{question} — {project_name}"
 
-            if is_long:
-                chunks = _split_markdown_sections(summary_text, max_chars=1600)
-                total = len(chunks)
-                for idx, chunk in enumerate(chunks, start=1):
-                    try:
-                        await self.feishu_bridge.send_content_card(
-                            open_id=receive_id,
-                            title=title,
-                            content=chunk,
-                            page=idx,
-                            total=total,
-                            color="blue",
-                            receive_id_type=receive_id_type,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to send summary content card for %s: %s", project.id, exc
-                        )
-                        break
-                # Final card only carries metadata and action buttons.
-                card_summary = "请查看上方完整内容后选择操作"
-            else:
-                card_summary = summary_text
+        state_details = self._build_details_for_state(project, project.current_state)
+        details: dict[str, Any] = {"当前阶段": state_display}
+        if state_details:
+            details.update(state_details)
+        if acceptance_recommendation:
+            rec_summary = acceptance_recommendation.get("reason") or acceptance_recommendation.get("summary", "")
+            if rec_summary:
+                details["验收评估"] = rec_summary[:200]
+            if acceptance_recommendation.get("action") == "confirm":
+                details["建议操作"] = "验收通过"
+        summary_text = self._build_summary_for_state(project, project.current_state)
+        if not summary_text:
+            logger.warning(
+                "Summary for %s at %s is empty; using fallback", project.id, project.current_state
+            )
+            summary_text = self._fallback_summary(project, project.current_state)
+        receive_id, receive_id_type = self._resolve_project_recipient(project)
 
+        # Always send a separate report card first, then the action card.
+        # This separates "本轮汇报" from "状态流转/确认".
+        chunks = _split_markdown_sections(summary_text, max_chars=1600)
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
             try:
-                await self.feishu_bridge.send_confirmation_card(
+                await self.feishu_bridge.send_content_card(
                     open_id=receive_id,
-                    approval_id=approval.id,
                     title=title,
-                    summary=card_summary,
-                    details=details,
-                    options=options,
+                    content=chunk,
+                    page=idx,
+                    total=total,
+                    color="blue",
                     receive_id_type=receive_id_type,
-                    chat_id=project.feishu_chat_id,
-                    chat_type=project.feishu_chat_type,
                 )
             except Exception as exc:
                 logger.warning(
-                    "Failed to send confirmation card for %s: %s", project.id, exc
+                    "Failed to send summary content card for %s: %s", project.id, exc
                 )
+                break
+
+        # The confirmation card carries only metadata and action buttons.
+        try:
+            await self.feishu_bridge.send_confirmation_card(
+                open_id=receive_id,
+                approval_id=approval.id,
+                title=title,
+                summary="请查看上方报告后选择操作",
+                details=details,
+                options=options,
+                receive_id_type=receive_id_type,
+                chat_id=project.feishu_chat_id,
+                chat_type=project.feishu_chat_type,
+                show_actions=show_actions,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to send confirmation card for %s: %s", project.id, exc
+            )
 
     async def _handle_human_input(
         self,
@@ -771,13 +1173,19 @@ class AgentOrchestrator:
 
         question = self._build_input_question(project, state)
 
+        # REWORK is option-based: the user chooses which upstream stage to revisit.
+        if state == "REWORK":
+            question, options = self._build_confirmation_question(project, state)
+        else:
+            options = []
+
         approval = await self.project_service.create_approval(
             project_id=project.id,
             task_id=None,
             state=state,
             approval_type="input",
             question=question,
-            options=[],
+            options=options,
         )
 
         if not requires_confirmation:
@@ -806,6 +1214,8 @@ class AgentOrchestrator:
             receive_id, receive_id_type = self._resolve_project_recipient(project)
             creator_open_id = self._get_creator_open_id(project.id)
             context_text = self._build_summary_for_state(project, state)
+            if not context_text:
+                context_text = self._fallback_summary(project, state)
 
             # Keep the input card compact; stream long context as display cards.
             INPUT_CONTEXT_LIMIT = 800
@@ -834,16 +1244,34 @@ class AgentOrchestrator:
             else:
                 card_context = context_text
 
-            await self.feishu_bridge.send_input_card(
-                open_id=receive_id,
-                approval_id=approval.id,
-                title=question,
-                question=question,
-                context=card_context,
-                receive_id_type=receive_id_type,
-                chat_id=project.feishu_chat_id,
-                chat_type=project.feishu_chat_type,
-            )
+            if state == "REWORK":
+                # Present the rollback options as actionable buttons.
+                details = {"当前阶段": state_machine.display_name(state)}
+                state_details = self._build_details_for_state(project, state)
+                if state_details:
+                    details.update(state_details)
+                await self.feishu_bridge.send_confirmation_card(
+                    open_id=receive_id,
+                    approval_id=approval.id,
+                    title=question,
+                    summary="请选择要回退到哪一层重新处理",
+                    details=details,
+                    options=options,
+                    receive_id_type=receive_id_type,
+                    chat_id=project.feishu_chat_id,
+                    chat_type=project.feishu_chat_type,
+                )
+            else:
+                await self.feishu_bridge.send_input_card(
+                    open_id=receive_id,
+                    approval_id=approval.id,
+                    title=question,
+                    question=question,
+                    context=card_context,
+                    receive_id_type=receive_id_type,
+                    chat_id=project.feishu_chat_id,
+                    chat_type=project.feishu_chat_type,
+                )
 
     async def _execute_system_action(
         self,
@@ -1042,6 +1470,41 @@ class AgentOrchestrator:
         if key in confirm_options:
             return confirm_options[key]
 
+        # Quality-gate confirmations: report card + confirmation card.
+        # They default to auto-confirm after a short delay.
+        quality_gate_options = [
+            {"action": "confirm", "label": "通过", "next_state": None},
+            {"action": "reject", "label": "不通过，打回重改", "next_state": "REWORK"},
+        ]
+        if state == "CODING_CONFIRM_PENDING":
+            return "请确认编码结果", quality_gate_options
+        if state == "TESTING_CONFIRM_PENDING":
+            return "请确认测试结果", quality_gate_options
+        if state == "REVIEW_CONFIRM_PENDING":
+            return "请确认 Review 结果", quality_gate_options
+
+        # Rework state lets the user choose which upstream stage to revisit.
+        rework_options_map = {
+            "feature": [
+                {"action": "to_requirements", "label": "重新明确需求", "next_state": "PLANNING_REQUIREMENTS"},
+                {"action": "to_architecture", "label": "重新设计方案", "next_state": "PLANNING_ARCHITECTURE"},
+                {"action": "to_specs", "label": "重新拆 Spec", "next_state": "PLANNING_SPECS"},
+                {"action": "to_coding", "label": "直接重新编码", "next_state": "CODING"},
+                {"action": "to_testing", "label": "直接重新测试", "next_state": "TESTING"},
+            ],
+            "bug_fix": [
+                {"action": "to_analysis", "label": "重新分析 Bug", "next_state": "BUG_ANALYSIS"},
+                {"action": "to_coding", "label": "直接重新编码", "next_state": "CODING"},
+                {"action": "to_testing", "label": "直接重新测试", "next_state": "TESTING"},
+            ],
+            "documentation": [
+                {"action": "to_outline", "label": "重新梳理大纲", "next_state": "DOC_OUTLINE"},
+                {"action": "to_coding", "label": "直接重新编写", "next_state": "CODING"},
+            ],
+        }
+        if state == "REWORK":
+            return "本轮未通过，请选择如何处理", rework_options_map.get(project.task_type, rework_options_map["feature"])
+
         if state == "ACCEPTANCE_PENDING":
             restart_option = {
                 "action": "restart_with_type",
@@ -1084,10 +1547,33 @@ class AgentOrchestrator:
         return (f"请确认 {state}", [{"action": "confirm", "label": "确认", "next_state": "COMPLETED"}])
 
     def _build_input_question(self, project: Project, state: str) -> str:
+        pending_input = project.context.get("clarification_answer")
+        if pending_input and state in {
+            "CLARIFICATION_PENDING",
+            "REQUIREMENT_INPUT_PENDING",
+            "ARCHITECTURE_INPUT_PENDING",
+            "SPEC_INPUT_PENDING",
+            "BUG_FIX_INPUT_PENDING",
+            "OUTLINE_INPUT_PENDING",
+        }:
+            return (
+                f"Agent 运行期间收到你的输入：\n{pending_input}\n\n"
+                "请确认或补充后回复"
+            )
         if state == "CLARIFICATION_PENDING":
             return "Agent 请求澄清，请回复你的答案"
         elif state == "CONFLICT_PENDING":
             return "发现设计冲突，请裁决"
+        elif state == "REQUIREMENT_INPUT_PENDING":
+            return "Agent 对需求有疑问，请补充说明"
+        elif state == "ARCHITECTURE_INPUT_PENDING":
+            return "Agent 对技术方案有疑问，请补充说明"
+        elif state == "SPEC_INPUT_PENDING":
+            return "Agent 对 Spec 有疑问，请补充说明"
+        elif state == "BUG_FIX_INPUT_PENDING":
+            return "Agent 对 Bug 分析有疑问，请补充说明"
+        elif state == "OUTLINE_INPUT_PENDING":
+            return "Agent 对文档大纲有疑问，请补充说明"
         return f"请输入 {state}"
 
     def _build_summary_for_state(self, project: Project, state: str) -> str:
@@ -1097,6 +1583,29 @@ class AgentOrchestrator:
         """
         if state == "ACCEPTANCE_PENDING":
             return self._build_acceptance_summary(project)
+
+        # Quality gates: pull the latest completed task output for the report card.
+        quality_gate_agent = {
+            "CODING_CONFIRM_PENDING": "coder",
+            "TESTING_CONFIRM_PENDING": "tester",
+            "REVIEW_CONFIRM_PENDING": "reviewer",
+        }.get(state)
+        if quality_gate_agent:
+            return self._build_agent_task_summary(project, quality_gate_agent)
+
+        if state == "REWORK":
+            open_feedback = self.project_service.get_open_feedback_packets(project.id)
+            if open_feedback:
+                parts = ["**未解决的反馈**"]
+                for fb in open_feedback:
+                    target = fb.recommended_rework_target or "未指定"
+                    parts.append(f"- [{fb.source_stage}] {fb.summary}（建议回退：{target}）")
+                parts.append("\n请选择要回退到哪一层重新处理。")
+                return "\n".join(parts)
+            legacy_feedback = project.context.get("latest_rejection_feedback", "")
+            if legacy_feedback:
+                return f"**驳回/反馈**\n{legacy_feedback}\n\n请选择要回退到哪一层重新处理。"
+            return "请选择要回退到哪一层重新处理。"
 
         workspace = Path(project.workspace_path)
         mac = workspace / ".mac"
@@ -1144,7 +1653,32 @@ class AgentOrchestrator:
         if data.get("goals"):
             parts.append("**目标**\n" + "\n".join(f"• {g}" for g in data["goals"]))
         if data.get("acceptance_criteria"):
-            parts.append("**验收标准**\n" + "\n".join(f"• {a}" for a in data["acceptance_criteria"]))
+            rows = []
+            for ac in data["acceptance_criteria"]:
+                if isinstance(ac, dict):
+                    sid = ac.get("id", "")
+                    stmt = ac.get("statement") or ac.get("description", "")
+                    rows.append(f"• {sid} {stmt}" if sid else f"• {stmt}")
+                else:
+                    rows.append(f"• {ac}")
+            if rows:
+                parts.append("**验收标准**\n" + "\n".join(rows))
+        if data.get("constraints"):
+            parts.append("**约束**\n" + "\n".join(f"• {c}" for c in data["constraints"]))
+        if data.get("requirements"):
+            count = len(data["requirements"])
+            parts.append(f"**需求条目**：共 {count} 条（详细内容可通过 `/status` 查看）")
+        if data.get("ambiguities"):
+            rows = []
+            for amb in data["ambiguities"]:
+                if isinstance(amb, dict):
+                    q = amb.get("question", "")
+                    rows.append(f"• {q}" if q else "")
+                else:
+                    rows.append(f"• {amb}")
+            rows = [r for r in rows if r]
+            if rows:
+                parts.append("**待澄清**\n" + "\n".join(rows))
         if data.get("root_cause"):
             parts.append(f"**根因分析**\n{data['root_cause']}")
         if data.get("fix_strategy"):
@@ -1168,6 +1702,90 @@ class AgentOrchestrator:
 
         if not parts:
             return self._fallback_summary(project, state)
+        return "\n\n".join(parts)
+
+    def _build_agent_task_summary(self, project: Project, agent_type: str) -> str:
+        """Return a human-readable summary from the latest completed task of an agent."""
+        from sqlmodel import select
+
+        task = self.project_service.session.exec(
+            select(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.agent_type == agent_type,
+                Task.status == "completed",
+            )
+            .order_by(Task.updated_at.desc())
+            .limit(1)
+        ).first()
+        if not task or not task.output_data:
+            return self._fallback_summary(project, project.current_state)
+
+        out = task.output_data
+        parts: list[str] = []
+
+        if agent_type == "coder":
+            files = out.get("modified_files") or []
+            if files and isinstance(files, list):
+                file_lines = []
+                for f in files:
+                    if isinstance(f, dict):
+                        path = f.get("path") or f.get("file") or ""
+                        desc = f.get("description") or ""
+                        if path and desc:
+                            file_lines.append(f"• {path}：{desc}")
+                        elif path:
+                            file_lines.append(f"• {path}")
+                    elif isinstance(f, str):
+                        file_lines.append(f"• {f}")
+                if file_lines:
+                    parts.append("**实现文件**\n" + "\n".join(file_lines))
+            notes = out.get("notes")
+            if notes and isinstance(notes, list):
+                parts.append("**实现备注**\n" + "\n".join(f"• {n}" for n in notes if isinstance(n, str)))
+
+        elif agent_type == "tester":
+            report = out.get("report", "")
+            if report:
+                parts.append(f"**测试报告**\n{report}")
+            passed = out.get("passed")
+            if passed is not None:
+                parts.append(f"**结果**：{'通过' if passed else '未通过'}")
+            failures = out.get("failures") or []
+            if failures and isinstance(failures, list):
+                parts.append("**失败项**\n" + "\n".join(
+                    f"• {f.get('test', '')}：{f.get('error', '')}" for f in failures if isinstance(f, dict)
+                ))
+            coverage = out.get("coverage")
+            if coverage is not None:
+                parts.append(f"**覆盖率**：{coverage * 100:.1f}%")
+
+        elif agent_type == "reviewer":
+            result = out.get("result")
+            if result:
+                parts.append(f"**Review 结论**：{'通过' if result == 'pass' else '不通过'}")
+            summary = out.get("summary", "")
+            if summary:
+                parts.append(f"**Review 总结**\n{summary}")
+            issues = out.get("issues") or []
+            if issues and isinstance(issues, list):
+                issue_lines = []
+                for issue in issues:
+                    if isinstance(issue, dict):
+                        sev = issue.get("severity", "")
+                        desc = issue.get("description", "")
+                        file = issue.get("file", "")
+                        line = issue.get("line")
+                        loc = f"{file}:{line}" if file and line else file
+                        issue_lines.append(f"• [{sev}] {desc}" + (f"（{loc}）" if loc else ""))
+                if issue_lines:
+                    parts.append("**问题清单**\n" + "\n".join(issue_lines))
+            notes = out.get("notes")
+            if notes and isinstance(notes, list):
+                parts.append("**备注**\n" + "\n".join(f"• {n}" for n in notes if isinstance(n, str)))
+
+        if not parts:
+            return self._fallback_summary(project, project.current_state)
         return "\n\n".join(parts)
 
     def _build_acceptance_summary(self, project: Project) -> str:
@@ -1317,6 +1935,49 @@ class AgentOrchestrator:
                     details["评估建议"] = "需修改"
 
         return details
+
+    def _make_progress_callback(self, project: Project, task: Any) -> Callable[[str, str], Awaitable[None]] | None:
+        """Return a callback that pushes agent progress to Feishu.
+
+        Only used when DEBUG_AGENT_PROGRESS=1.  The callback is fire-and-forget:
+        failures are logged but never propagated.
+        """
+        logger.info(
+            "progress_callback requested for %s (bridge=%s, debug=%s)",
+            project.id, self.feishu_bridge is not None, self.settings.debug_agent_progress,
+        )
+        if self.feishu_bridge is None:
+            logger.info("progress_callback skipped — no FeishuBridge")
+            return None
+        receive_id, receive_id_type = self._resolve_project_recipient(project)
+        if not receive_id:
+            logger.info("progress_callback skipped — no recipient for %s", project.id)
+            return None
+
+        async def _cb(event_type: str, content: str) -> None:
+            try:
+                if event_type == "thinking":
+                    await self.feishu_bridge.send_content_card(
+                        open_id=receive_id,
+                        title="Agent 思考中",
+                        content=content,
+                        color="blue",
+                        receive_id_type=receive_id_type,
+                    )
+                elif event_type == "tool":
+                    import json
+                    data = json.loads(content)
+                    name = data.get("name", "?")
+                    inp = data.get("input", {})
+                    preview = json.dumps(inp, ensure_ascii=False)[:200]
+                    await self.feishu_bridge.send_text(
+                        receive_id,
+                        f"⚙️ 执行 {name}: {preview}",
+                        receive_id_type=receive_id_type,
+                    )
+            except Exception as exc:
+                logger.warning("progress_callback failed: %s", exc)
+        return _cb
 
     def _last_agent_label(self, project: Project) -> str:
         """Human-readable label for the last completed agent (e.g. 需求分析师)."""

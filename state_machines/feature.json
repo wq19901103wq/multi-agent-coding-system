@@ -18,7 +18,16 @@
       "display": "需求分析中",
       "next_states": {
         "complete": "REQUIREMENT_CONFIRM_PENDING",
+        "ask_user": "REQUIREMENT_INPUT_PENDING",
         "fail": "FAILED"
+      }
+    },
+    "REQUIREMENT_INPUT_PENDING": {
+      "type": "human_input",
+      "input_purpose": "clarification",
+      "display": "等待需求澄清",
+      "next_states": {
+        "answer": "PLANNING_REQUIREMENTS"
       }
     },
     "REQUIREMENT_CONFIRM_PENDING": {
@@ -36,7 +45,16 @@
       "display": "方案设计中",
       "next_states": {
         "complete": "ARCHITECTURE_CONFIRM_PENDING",
+        "ask_user": "ARCHITECTURE_INPUT_PENDING",
         "fail": "FAILED"
+      }
+    },
+    "ARCHITECTURE_INPUT_PENDING": {
+      "type": "human_input",
+      "input_purpose": "clarification",
+      "display": "等待方案澄清",
+      "next_states": {
+        "answer": "PLANNING_ARCHITECTURE"
       }
     },
     "ARCHITECTURE_CONFIRM_PENDING": {
@@ -55,7 +73,16 @@
       "display": "Spec 拆分中",
       "next_states": {
         "complete": "SPEC_CONFIRM_PENDING",
+        "ask_user": "SPEC_INPUT_PENDING",
         "fail": "FAILED"
+      }
+    },
+    "SPEC_INPUT_PENDING": {
+      "type": "human_input",
+      "input_purpose": "clarification",
+      "display": "等待 Spec 澄清",
+      "next_states": {
+        "answer": "PLANNING_SPECS"
       }
     },
     "SPEC_CONFIRM_PENDING": {
@@ -71,7 +98,7 @@
       "agent": "coder",
       "display": "编码中",
       "next_states": {
-        "complete": "TESTING",
+        "complete": "CODING_CONFIRM_PENDING",
         "fail": "FAILED",
         "clarify": "CLARIFICATION_PENDING",
         "conflict": "CONFLICT_PENDING",
@@ -100,14 +127,30 @@
         "needs_architecture_change": "PLANNING_ARCHITECTURE"
       }
     },
+    "CODING_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认编码结果",
+      "next_states": {
+        "confirm": "TESTING",
+        "reject": "REWORK"
+      }
+    },
     "TESTING": {
       "type": "agent_execution",
       "agent": "tester",
       "display": "测试中",
       "next_states": {
-        "complete": "REVIEW",
-        "fail": "CODING",
+        "complete": "TESTING_CONFIRM_PENDING",
+        "fail": "REWORK",
         "fail_max_retries": "FAILED"
+      }
+    },
+    "TESTING_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认测试结果",
+      "next_states": {
+        "confirm": "REVIEW",
+        "reject": "REWORK"
       }
     },
     "REVIEW": {
@@ -115,9 +158,28 @@
       "agent": "reviewer",
       "display": "Review 中",
       "next_states": {
-        "complete": "ACCEPTANCE_PENDING",
-        "fail": "CODING",
+        "complete": "REVIEW_CONFIRM_PENDING",
+        "fail": "REWORK",
         "fail_max_retries": "FAILED"
+      }
+    },
+    "REVIEW_CONFIRM_PENDING": {
+      "type": "human_confirmation",
+      "display": "等待确认 Review 结果",
+      "next_states": {
+        "confirm": "ACCEPTANCE_PENDING",
+        "reject": "REWORK"
+      }
+    },
+    "REWORK": {
+      "type": "human_confirmation",
+      "display": "等待选择回退层级",
+      "next_states": {
+        "to_requirements": "PLANNING_REQUIREMENTS",
+        "to_architecture": "PLANNING_ARCHITECTURE",
+        "to_specs": "PLANNING_SPECS",
+        "to_coding": "CODING",
+        "to_testing": "TESTING"
       }
     },
     "ACCEPTANCE_PENDING": {
@@ -125,7 +187,7 @@
       "display": "等待验收",
       "next_states": {
         "confirm": "MERGING",
-        "reject": "CODING",
+        "reject": "REWORK",
         "reject_to_requirements": "PLANNING_REQUIREMENTS",
         "reject_to_architecture": "PLANNING_ARCHITECTURE",
         "reject_to_specs": "PLANNING_SPECS"

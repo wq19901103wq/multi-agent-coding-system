@@ -1,14 +1,23 @@
 import asyncio
 import json
+import logging
 import os
 import re
-import shlex
-import subprocess
 import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+
+logger = logging.getLogger(__name__)
+_STREAM_READER_LIMIT = 16 * 1024 * 1024
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    _h.setLevel(logging.INFO)
+    logger.addHandler(_h)
+    logger.setLevel(logging.INFO)
+from typing import Any, Callable
+from collections.abc import Awaitable
 
 
 @dataclass
@@ -35,6 +44,7 @@ class AgentRuntime(ABC):
         readonly_dirs: list[Path],
         timeout_seconds: int,
         task_id: str | None = None,
+        progress_callback: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> AgentRuntimeResult:
         ...
 
@@ -44,10 +54,6 @@ class AgentRuntime(ABC):
         ...
 
 
-class ToolExecutionError(Exception):
-    """Raised when a local tool invocation fails."""
-
-
 class ClaudeCodeRuntime(AgentRuntime):
     """Drive Claude Code CLI via a stream-json subprocess session.
 
@@ -55,8 +61,9 @@ class ClaudeCodeRuntime(AgentRuntime):
     --output-format stream-json``) emits JSON events on stdout and accepts
     JSON events on stdin.  Running with piped stdio makes Claude Code treat
     the session as non-interactive, which also skips the workspace trust
-    dialog.  This runtime executes the built-in tools (Bash/Read/Write/
-    Edit/Glob/Grep) locally so the model can iterate against the codebase.
+    dialog. Claude Code CLI is the sole executor of built-in tools. The
+    runtime observes tool events for progress reporting but never executes a
+    tool_use or writes a synthetic tool_result back to the CLI.
     """
 
     def __init__(
@@ -181,6 +188,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         readonly_dirs: list[Path],
         timeout_seconds: int,
         task_id: str | None = None,
+        progress_callback: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> AgentRuntimeResult:
         # Write system prompt to temp file
         with tempfile.NamedTemporaryFile(
@@ -198,6 +206,7 @@ class ClaudeCodeRuntime(AgentRuntime):
                 readonly_dirs=readonly_dirs,
                 timeout_seconds=timeout_seconds,
                 task_id=task_id,
+                progress_callback=progress_callback,
             )
         finally:
             try:
@@ -214,6 +223,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         readonly_dirs: list[Path],
         timeout_seconds: int,
         task_id: str | None = None,
+        progress_callback: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> AgentRuntimeResult:
         cmd = self._build_command(
             system_prompt_file=system_prompt_file,
@@ -228,6 +238,10 @@ class ClaudeCodeRuntime(AgentRuntime):
             stderr=asyncio.subprocess.PIPE,
             cwd=str(worktree),
             env=self._env(),
+            # Claude tool_use events are one JSON line and Write/Edit inputs
+            # can contain an entire artifact. The asyncio default (~64 KiB)
+            # is too small for second-round planning artifacts.
+            limit=_STREAM_READER_LIMIT,
         )
         if task_id:
             self._processes[task_id] = proc
@@ -235,10 +249,10 @@ class ClaudeCodeRuntime(AgentRuntime):
         stderr_lines: list[str] = []
         result_event: dict[str, Any] | None = None
 
-        stdout_queue: asyncio.Queue[str] = asyncio.Queue()
-        stderr_queue: asyncio.Queue[str] = asyncio.Queue()
+        stdout_queue: asyncio.Queue[Any] = asyncio.Queue()
+        stderr_queue: asyncio.Queue[Any] = asyncio.Queue()
 
-        async def _read_stream(stream: asyncio.StreamReader, queue: asyncio.Queue[str]) -> None:
+        async def _read_stream(stream: asyncio.StreamReader, queue: asyncio.Queue[Any]) -> None:
             while True:
                 line = await stream.readline()
                 if not line:
@@ -253,7 +267,24 @@ class ClaudeCodeRuntime(AgentRuntime):
             proc.stdin.write((line + "\n").encode("utf-8"))
             await proc.stdin.drain()
 
-        stdout_task = asyncio.create_task(_read_stream(proc.stdout, stdout_queue))
+        # Sentinel: when _read_stream finishes (stdout pipe closed),
+        # put this into the queue so the main loop can exit early
+        # instead of waiting forever.
+        _STREAM_CLOSED = object()
+
+        class _StreamError:
+            def __init__(self, error: BaseException):
+                self.error = error
+
+        async def _read_stream_with_sentinel():
+            try:
+                await _read_stream(proc.stdout, stdout_queue)
+            except BaseException as exc:
+                await stdout_queue.put(_StreamError(exc))
+            finally:
+                await stdout_queue.put(_STREAM_CLOSED)
+
+        stdout_task = asyncio.create_task(_read_stream_with_sentinel())
         stderr_task = asyncio.create_task(_read_stream(proc.stderr, stderr_queue))
 
         def _cleanup_process() -> None:
@@ -267,49 +298,39 @@ class ClaudeCodeRuntime(AgentRuntime):
             "message": {"role": "user", "content": task_prompt},
         })
 
-        def _execute_tool(tool_use: dict[str, Any]) -> dict[str, Any]:
-            name = tool_use.get("name")
-            tool_use_id = tool_use.get("id")
-            input_data = tool_use.get("input", {})
-            try:
-                if name == "Bash":
-                    result = self._tool_bash(input_data, cwd=worktree)
-                elif name == "Read":
-                    result = self._tool_read(input_data)
-                elif name == "Write":
-                    result = self._tool_write(input_data, cwd=worktree)
-                elif name == "Edit":
-                    result = self._tool_edit(input_data, cwd=worktree)
-                elif name == "Glob":
-                    result = self._tool_glob(input_data, cwd=worktree)
-                elif name == "Grep":
-                    result = self._tool_grep(input_data, cwd=worktree)
-                else:
-                    raise ToolExecutionError(f"Tool {name} not implemented")
-                return {
-                    "tool_use_id": tool_use_id,
-                    "type": "tool_result",
-                    "content": result,
-                    "is_error": False,
-                }
-            except Exception as e:
-                return {
-                    "tool_use_id": tool_use_id,
-                    "type": "tool_result",
-                    "content": f"Error executing {name}: {e}",
-                    "is_error": True,
-                }
-
         try:
             loop = asyncio.get_event_loop()
             deadline = loop.time() + timeout_seconds
 
+
             while True:
-                timeout = max(0.5, deadline - loop.time())
-                try:
-                    line = await asyncio.wait_for(stdout_queue.get(), timeout=timeout)
-                except asyncio.TimeoutError:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.info("EXIT deadline reached (task=%s)", task_id)
                     break
+                # Poll in short intervals so we can detect a dead process
+                # early instead of waiting until the deadline.
+                poll_timeout = min(5.0, remaining)
+                try:
+                    line = await asyncio.wait_for(stdout_queue.get(), timeout=poll_timeout)
+                except asyncio.TimeoutError:
+                    # If the subprocess has already exited, there will be
+                    # no more events — bail out instead of waiting until
+                    # the deadline.
+                    if proc.returncode is not None:
+                        break
+
+                    continue
+
+                # Stream-closed sentinel — the subprocess stdout pipe
+                # has been closed, so no more events will arrive.  Bail out
+                # even if the asyncio process object hasn't updated yet.
+                if line is _STREAM_CLOSED:
+                    break
+                if isinstance(line, _StreamError):
+                    raise RuntimeError(
+                        f"Claude stdout reader failed: {line.error}"
+                    ) from line.error
 
                 # Strip ANSI escape sequences for diagnostics.
                 clean_line = self._strip_ansi(line).rstrip()
@@ -321,21 +342,32 @@ class ClaudeCodeRuntime(AgentRuntime):
 
                 event_type = event.get("type")
 
+                logger.info(
+                    "EVENT %s (task=%s)", event_type, task_id,
+                )
+
                 if event_type == "assistant":
                     msg = event.get("message", {})
                     content = msg.get("content", [])
                     if isinstance(content, dict):
                         content = [content]
                     for block in content:
+                        if block.get("type") in ("thinking", "text") and progress_callback:
+                            txt = block.get("text", "")[:500]
+                            if txt.strip():
+                                await progress_callback("thinking", txt.strip())
                         if block.get("type") == "tool_use":
-                            tool_result = _execute_tool(block)
-                            await _send_message({
-                                "type": "user",
-                                "message": {
-                                    "role": "user",
-                                    "content": [tool_result],
-                                },
-                            })
+                            if progress_callback:
+                                await progress_callback("tool", json.dumps({
+                                    "name": block.get("name"),
+                                    "input": self._summarize_tool_input(block),
+                                }))
+                            logger.info(
+                                "TOOL %s delegated to Claude CLI (task=%s)",
+                                block.get("name"), task_id,
+                            )
+
+
 
                 elif event_type == "result":
                     result_event = event
@@ -370,7 +402,7 @@ class ClaudeCodeRuntime(AgentRuntime):
                 success=False,
                 output_json=None,
                 output_files=[],
-                logs=logs or "No result event received before timeout",
+                logs="No result event received before timeout",
                 cost_info=None,
             )
 
@@ -415,159 +447,37 @@ class ClaudeCodeRuntime(AgentRuntime):
             return parsed
         return None
 
-    def _ensure_path_in_worktree(self, path: Path, cwd: Path) -> Path:
-        """Resolve ``path`` and ensure it lies inside ``cwd``.
-
-        This prevents an agent from writing or editing files outside the
-        workspace (e.g. via ``../../etc/passwd``).
-        """
-        resolved = path.resolve()
-        resolved_cwd = cwd.resolve()
-        if not resolved.is_relative_to(resolved_cwd):
-            raise ToolExecutionError(f"Path must be inside workspace: {path}")
-        return resolved
-
-    def _tool_bash(self, input_data: dict[str, Any], cwd: Path) -> str:
-        command = input_data.get("command", "")
-        if not command:
-            raise ToolExecutionError("Bash command is empty")
-        args = shlex.split(command)
-        if not args:
-            raise ToolExecutionError("Bash command is empty")
-        proc = subprocess.run(
-            args,
-            shell=False,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        if proc.returncode != 0:
-            raise ToolExecutionError(f"Exit {proc.returncode}\n{stderr}")
-        return stdout + (f"\n--- stderr ---\n{stderr}" if stderr else "")
-
-    def _tool_read(self, input_data: dict[str, Any]) -> str:
-        path = Path(input_data.get("file_path", ""))
-        if not path.is_absolute():
-            raise ToolExecutionError("Read requires absolute file_path")
-        if not path.exists():
-            raise ToolExecutionError(f"File not found: {path}")
-        return path.read_text(encoding="utf-8")
-
-    def _tool_write(self, input_data: dict[str, Any], cwd: Path) -> str:
-        path = Path(input_data.get("file_path", ""))
-        content = input_data.get("content", "")
-        if not path.is_absolute():
-            raise ToolExecutionError("Write requires absolute file_path")
-        path = self._ensure_path_in_worktree(path, cwd)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return f"Wrote {path}"
-
-    def _tool_edit(self, input_data: dict[str, Any], cwd: Path) -> str:
-        path = Path(input_data.get("file_path", ""))
-        old_string = input_data.get("old_string", "")
-        new_string = input_data.get("new_string", "")
-        replace_all = input_data.get("replace_all", False)
-        if not path.is_absolute():
-            raise ToolExecutionError("Edit requires absolute file_path")
-        path = self._ensure_path_in_worktree(path, cwd)
-        if not path.exists():
-            raise ToolExecutionError(f"File not found: {path}")
-        content = path.read_text(encoding="utf-8")
-        if replace_all:
-            if old_string not in content:
-                raise ToolExecutionError("old_string not found")
-            content = content.replace(old_string, new_string)
-        else:
-            count = content.count(old_string)
-            if count != 1:
-                raise ToolExecutionError(
-                    f"old_string appears {count} times (expected 1)"
-                )
-            content = content.replace(old_string, new_string, 1)
-        path.write_text(content, encoding="utf-8")
-        return f"Edited {path}"
-
-    def _tool_glob(self, input_data: dict[str, Any], cwd: Path) -> str:
-        import fnmatch
-
-        pattern = input_data.get("pattern", "")
-        search_path = Path(input_data.get("path") or cwd)
-        if not search_path.is_absolute():
-            search_path = cwd / search_path
-        matches = []
-        for root, _dirs, files in os.walk(search_path):
-            for filename in files:
-                full = Path(root) / filename
-                rel = full.relative_to(search_path)
-                if fnmatch.fnmatch(str(rel), pattern) or fnmatch.fnmatch(filename, pattern):
-                    matches.append(str(full))
-        return "\n".join(sorted(matches)) or "(no matches)"
-
-    def _tool_grep(self, input_data: dict[str, Any], cwd: Path) -> str:
-        import fnmatch
-        import re
-
-        pattern = input_data.get("pattern", "")
-        search_path = Path(input_data.get("path") or cwd)
-        if not search_path.is_absolute():
-            search_path = cwd / search_path
-        output_mode = input_data.get("output_mode", "content")
-        glob_pattern = input_data.get("glob")
-        context_before = input_data.get("-B", 0)
-        context_after = input_data.get("-A", 0)
-        show_line_numbers = input_data.get("-n", True)
-        case_insensitive = input_data.get("-i", False)
-        head_limit = input_data.get("head_limit")
-
-        flags = re.IGNORECASE if case_insensitive else 0
-        regex = re.compile(pattern, flags)
-
-        files = []
-        if search_path.is_file():
-            files = [search_path]
-        else:
-            for root, _dirs, filenames in os.walk(search_path):
-                for filename in filenames:
-                    full = Path(root) / filename
-                    if glob_pattern and not fnmatch.fnmatch(filename, glob_pattern):
-                        continue
-                    files.append(full)
-
-        results: list[str] = []
-        seen_files: set[str] = set()
-        for file_path in files:
-            try:
-                text = file_path.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-            lines = text.splitlines()
-            for i, line in enumerate(lines, start=1):
-                if regex.search(line):
-                    if output_mode == "files_with_matches":
-                        seen_files.add(str(file_path))
-                        break
-                    context_lines = []
-                    if context_before:
-                        for j in range(max(1, i - context_before), i):
-                            context_lines.append(f"{j}: {lines[j-1]}" if show_line_numbers else lines[j-1])
-                    main_line = f"{i}: {line}" if show_line_numbers else line
-                    context_lines.append(main_line)
-                    if context_after:
-                        for j in range(i + 1, min(len(lines), i + context_after) + 1):
-                            context_lines.append(f"{j}: {lines[j-1]}" if show_line_numbers else lines[j-1])
-                    results.append(f"{file_path}:\n" + "\n".join(context_lines))
-                    if head_limit and len(results) >= head_limit:
-                        break
-            if head_limit and len(results) >= head_limit:
-                break
-
-        if output_mode == "files_with_matches":
-            return "\n".join(sorted(seen_files)) or "(no matches)"
-        return "\n\n".join(results) or "(no matches)"
+    @staticmethod
+    def _summarize_tool_input(block: dict[str, Any]) -> dict[str, Any]:
+        """Return progress-safe metadata without embedding artifact contents."""
+        name = block.get("name")
+        value = block.get("input")
+        if not isinstance(value, dict):
+            return {}
+        if name == "Write":
+            content = value.get("content", "")
+            return {
+                "file_path": value.get("file_path"),
+                "content_length": len(content) if isinstance(content, str) else None,
+            }
+        if name == "Edit":
+            old = value.get("old_string", "")
+            new = value.get("new_string", "")
+            return {
+                "file_path": value.get("file_path"),
+                "old_length": len(old) if isinstance(old, str) else None,
+                "new_length": len(new) if isinstance(new, str) else None,
+                "replace_all": bool(value.get("replace_all", False)),
+            }
+        if name == "Bash":
+            return {"command": str(value.get("command", ""))[:200]}
+        summary: dict[str, Any] = {}
+        for key, item in value.items():
+            if isinstance(item, str):
+                summary[key] = item[:200]
+            elif isinstance(item, (int, float, bool)) or item is None:
+                summary[key] = item
+        return summary
 
     def _parse_json_output(self, text: str) -> dict[str, Any] | None:
         text = text.strip()
@@ -672,6 +582,7 @@ class FakeRuntime(AgentRuntime):
         readonly_dirs: list[Path],
         timeout_seconds: int,
         task_id: str | None = None,
+        progress_callback: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> AgentRuntimeResult:
         output = self.outputs.get(agent_type, {"success": True, "next_state_event": "complete"})
         return AgentRuntimeResult(

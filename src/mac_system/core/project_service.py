@@ -4,16 +4,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlmodel import Session, select
+from sqlmodel import Session, select, update
 
 from mac_system.config import get_agent_config, get_settings
 from mac_system.database import session_scope
 from mac_system.models import (
     Approval,
+    ChatUserContext,
     EventLog,
+    FeedbackPacket,
     PendingIntent,
+    PendingUserInput,
     ProcessedEvent,
     Project,
+    ProjectChat,
     ProjectUser,
     Task,
 )
@@ -145,8 +149,44 @@ class ProjectService:
 
         if creator_open_id:
             self.session.add(
-                ProjectUser(project_id=project_id, open_id=creator_open_id)
+                ProjectUser(
+                    project_id=project_id,
+                    open_id=creator_open_id,
+                    role="owner",
+                )
             )
+
+        if feishu_chat_id:
+            self.session.add(
+                ProjectChat(
+                    id=generate_id("pch"),
+                    project_id=project_id,
+                    chat_id=feishu_chat_id,
+                    chat_type=feishu_chat_type,
+                    relation="origin",
+                    notification_level="all",
+                    created_by=creator_open_id,
+                )
+            )
+            if creator_open_id:
+                now = _now()
+                existing = self.session.get(
+                    ChatUserContext, (feishu_chat_id, creator_open_id)
+                )
+                if existing:
+                    existing.active_project_id = project_id
+                    existing.selected_at = now
+                    existing.updated_at = now
+                else:
+                    self.session.add(
+                        ChatUserContext(
+                            chat_id=feishu_chat_id,
+                            open_id=creator_open_id,
+                            active_project_id=project_id,
+                            selected_at=now,
+                            updated_at=now,
+                        )
+                    )
 
         # Write initial STATE.json
         self._write_state_json(project)
@@ -258,6 +298,164 @@ class ProjectService:
         if project is None:
             raise ProjectNotFoundError(project_id)
         return project
+
+    # ------------------------------------------------------------------
+    # Chat / user context routing
+    # ------------------------------------------------------------------
+
+    def bind_project_to_chat(
+        self,
+        project_id: str,
+        chat_id: str,
+        chat_type: str = "p2p",
+        relation: str = "subscribed",
+        notification_level: str = "all",
+        created_by: str | None = None,
+    ) -> ProjectChat:
+        """Bind a project to a Feishu chat if not already bound."""
+        existing = self.session.exec(
+            select(ProjectChat).where(
+                ProjectChat.project_id == project_id,
+                ProjectChat.chat_id == chat_id,
+            )
+        ).first()
+        if existing:
+            return existing
+        chat = ProjectChat(
+            id=generate_id("pch"),
+            project_id=project_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            relation=relation,
+            notification_level=notification_level,
+            created_by=created_by,
+        )
+        self.session.add(chat)
+        self.session.commit()
+        return chat
+
+    def set_chat_user_context(
+        self,
+        chat_id: str,
+        open_id: str,
+        project_id: str | None,
+    ) -> ChatUserContext:
+        """Set the active project for a user within a specific chat."""
+        ctx = self.session.exec(
+            select(ChatUserContext).where(
+                ChatUserContext.chat_id == chat_id,
+                ChatUserContext.open_id == open_id,
+            )
+        ).first()
+        now = _now()
+        if ctx is None:
+            ctx = ChatUserContext(
+                chat_id=chat_id,
+                open_id=open_id,
+                active_project_id=project_id,
+                selected_at=now,
+            )
+            self.session.add(ctx)
+        else:
+            ctx.active_project_id = project_id
+            ctx.selected_at = now
+            ctx.updated_at = now
+        self.session.commit()
+        return ctx
+
+    def get_chat_user_active_project(
+        self,
+        chat_id: str,
+        open_id: str,
+    ) -> Project | None:
+        """Return the active project for a user in a chat, if any."""
+        ctx = self.session.exec(
+            select(ChatUserContext).where(
+                ChatUserContext.chat_id == chat_id,
+                ChatUserContext.open_id == open_id,
+            )
+        ).first()
+        if ctx is None:
+            return None
+        project = self.session.get(Project, ctx.active_project_id)
+        if project is None or project.status == "cancelled":
+            return None
+        return project
+
+    def list_projects_for_chat(self, chat_id: str) -> list[Project]:
+        """Return active projects bound to a Feishu chat."""
+        chats = self.session.exec(
+            select(ProjectChat).where(ProjectChat.chat_id == chat_id)
+        ).all()
+        project_ids = [c.project_id for c in chats]
+        if not project_ids:
+            return []
+        return list(
+            self.session.exec(
+                select(Project)
+                .where(Project.id.in_(project_ids))
+                .where(Project.status != "cancelled")
+                .order_by(Project.updated_at.desc())
+            ).all()
+        )
+
+    # ------------------------------------------------------------------
+    # Approval helpers
+    # ------------------------------------------------------------------
+
+    async def _expire_pending_approvals(
+        self,
+        project_id: str,
+        commit: bool = True,
+    ) -> int:
+        """Expire all pending approvals for a project before creating a new one."""
+        result = self.session.exec(
+            update(Approval)
+            .where(
+                Approval.project_id == project_id,
+                Approval.status == "pending",
+            )
+            .values(status="expired")
+        )
+        if commit:
+            self.session.commit()
+        return result.rowcount
+
+    async def resolve_approval(
+        self,
+        approval_id: str,
+        event: str,
+        responded_by: str,
+        payload: dict | None = None,
+    ) -> tuple[Approval, Project]:
+        """Atomically respond to an approval and transition project state.
+
+        Both the approval update and the state transition happen in the same
+        database transaction so they cannot diverge.
+        """
+        approval = self.get_approval(approval_id)
+        project = self.require_project(approval.project_id)
+
+        if approval.status != "pending":
+            raise ValueError(f"Approval {approval_id} is not pending")
+        if approval.state != project.current_state:
+            raise ValueError(
+                f"Approval state {approval.state} does not match project state {project.current_state}"
+            )
+        valid_actions = {opt.get("action") for opt in approval.payload.get("options", [])}
+        if event not in valid_actions:
+            raise ValueError(f"Invalid action {event} for approval {approval_id}")
+
+        approval = await self.respond_approval(
+            approval_id, event, responded_by, commit=False
+        )
+        project = await self.transition_state(
+            approval.project_id,
+            event,
+            payload=payload,
+            triggered_by=responded_by,
+        )
+        return approval, project
 
     def get_project_status(self, project_id: str) -> dict[str, Any]:
         project = self.require_project(project_id)
@@ -387,6 +585,12 @@ class ProjectService:
         previous_state = project.current_state
         project.previous_state = previous_state
         project.current_state = next_state
+        if next_state == "FAILED":
+            project.status = "failed"
+        elif next_state == "COMPLETED":
+            project.status = "completed"
+        elif next_state == "CANCELLED":
+            project.status = "cancelled"
         project.updated_at = _now()
 
         # Update context if payload provided rollback/resolved decisions
@@ -434,6 +638,7 @@ class ProjectService:
         agent_type: str,
         state: str,
         input_data: dict,
+        round_number: int = 1,
     ) -> Task:
         project = self.require_project(project_id)
         task_id = generate_id("task")
@@ -442,6 +647,7 @@ class ProjectService:
             project_id=project_id,
             agent_type=agent_type,
             state=state,
+            round_number=round_number,
             status="pending",
             input_data=input_data,
         )
@@ -519,7 +725,11 @@ class ProjectService:
         question: str,
         options: list[dict],
         payload: dict | None = None,
+        commit: bool = True,
     ) -> Approval:
+        # Enforce at most one pending approval per project.
+        await self._expire_pending_approvals(project_id, commit=False)
+
         approval_id = generate_id("appr")
         approval_payload = dict(payload or {})
         approval_payload["options"] = options
@@ -541,7 +751,8 @@ class ProjectService:
             message=f"Approval created: {approval_id} for {state}",
             meta={"approval_id": approval_id, "state": state, "type": approval_type},
         )
-        self.session.commit()
+        if commit:
+            self.session.commit()
         return approval
 
     def get_approval(self, approval_id: str) -> Approval:
@@ -555,18 +766,253 @@ class ProjectService:
         approval_id: str,
         response: str,
         responded_by: str,
+        commit: bool = True,
     ) -> Approval:
-        approval = self.get_approval(approval_id)
-        if approval is None:
+        """Respond to an approval using a compare-and-set update.
+
+        Only the first caller with ``status='pending'`` wins; subsequent calls
+        receive the already-responded approval for idempotency.
+        """
+        result = self.session.exec(
+            update(Approval)
+            .where(Approval.id == approval_id, Approval.status == "pending")
+            .values(
+                response=response,
+                responded_by=responded_by,
+                status="responded",
+                responded_at=_now(),
+            )
+        )
+        if result.rowcount == 0:
+            approval = self.get_approval(approval_id)
+            if approval is not None and approval.status != "pending":
+                return approval
             raise ApprovalNotFoundError(approval_id)
-        if approval.status != "pending":
-            raise ValueError(f"Approval already responded: {approval_id}")
-        approval.response = response
-        approval.responded_by = responded_by
-        approval.status = "responded"
-        approval.responded_at = _now()
+        if commit:
+            self.session.commit()
+        return self.get_approval(approval_id)
+
+    # ------------------------------------------------------------------
+    # Feedback packets
+    # ------------------------------------------------------------------
+
+    async def create_feedback_packet(
+        self,
+        project_id: str,
+        source_stage: str,
+        source_task_id: str | None,
+        source_round: int,
+        kind: str,
+        summary: str,
+        blocking: bool = True,
+        failure_class: str | None = None,
+        recommended_rework_target: str | None = None,
+        evidence: list[dict] | None = None,
+        user_comment: str | None = None,
+        status: str = "open",
+        commit: bool = True,
+    ) -> FeedbackPacket:
+        packet = FeedbackPacket(
+            id=generate_id("fb"),
+            project_id=project_id,
+            source_stage=source_stage,
+            source_task_id=source_task_id,
+            source_round=source_round,
+            kind=kind,
+            summary=summary,
+            blocking=blocking,
+            failure_class=failure_class,
+            recommended_rework_target=recommended_rework_target,
+            evidence=evidence or [],
+            user_comment=user_comment,
+            status=status,
+        )
+        self.session.add(packet)
+        await self.log_event(
+            project_id=project_id,
+            level="INFO",
+            message=f"Feedback packet created: {packet.id} ({kind})",
+            meta={
+                "feedback_id": packet.id,
+                "source_stage": source_stage,
+                "source_task_id": source_task_id,
+                "recommended_rework_target": recommended_rework_target,
+            },
+        )
+        if commit:
+            self.session.commit()
+        return packet
+
+    def get_open_feedback_packets(self, project_id: str) -> list[FeedbackPacket]:
+        return list(
+            self.session.exec(
+                select(FeedbackPacket)
+                .where(
+                    FeedbackPacket.project_id == project_id,
+                    FeedbackPacket.status.in_(["open", "disputed"]),
+                )
+                .order_by(FeedbackPacket.created_at.asc())
+            ).all()
+        )
+
+    async def resolve_feedback_packet(
+        self,
+        feedback_id: str,
+        resolved_by_task_id: str,
+        status: str = "resolved",
+    ) -> FeedbackPacket:
+        packet = self.session.get(FeedbackPacket, feedback_id)
+        if packet is None:
+            raise ValueError(f"Feedback packet not found: {feedback_id}")
+        packet.status = status
+        packet.resolved_by_task_id = resolved_by_task_id
+        packet.updated_at = _now()
         self.session.commit()
-        return approval
+        return packet
+
+    # ------------------------------------------------------------------
+    # Pending user inputs (free text received while an agent is running)
+    # ------------------------------------------------------------------
+
+    async def create_pending_user_input(
+        self,
+        project_id: str,
+        sender_id: str | None,
+        observed_state: str,
+        content: str,
+        kind: str = "question",
+        source_chat_id: str | None = None,
+    ) -> PendingUserInput:
+        inp = PendingUserInput(
+            id=generate_id("input"),
+            project_id=project_id,
+            sender_id=sender_id,
+            source_chat_id=source_chat_id,
+            observed_state=observed_state,
+            content=content,
+            kind=kind,
+            status="pending",
+        )
+        self.session.add(inp)
+        await self.log_event(
+            project_id=project_id,
+            level="INFO",
+            message=f"Pending user input created: {inp.id} ({kind})",
+            meta={
+                "input_id": inp.id,
+                "observed_state": observed_state,
+                "kind": kind,
+                "source_chat_id": source_chat_id,
+            },
+        )
+        self.session.commit()
+        return inp
+
+    def get_pending_user_inputs(self, project_id: str) -> list[PendingUserInput]:
+        return list(
+            self.session.exec(
+                select(PendingUserInput)
+                .where(
+                    PendingUserInput.project_id == project_id,
+                    PendingUserInput.status == "pending",
+                )
+                .order_by(PendingUserInput.created_at.asc())
+            ).all()
+        )
+
+    async def consume_pending_user_input(
+        self,
+        input_id: str,
+        consumed_by_task_id: str,
+        commit: bool = True,
+    ) -> PendingUserInput:
+        inp = self.session.get(PendingUserInput, input_id)
+        if inp is None:
+            raise ValueError(f"Pending input not found: {input_id}")
+        inp.status = "consumed"
+        inp.consumed_by_task_id = consumed_by_task_id
+        if commit:
+            self.session.commit()
+        return inp
+
+    # ------------------------------------------------------------------
+    # Project control state
+    # ------------------------------------------------------------------
+
+    async def pause_project(self, project_id: str, triggered_by: str = "user") -> Project:
+        project = self.require_project(project_id)
+        if project.status == "paused":
+            return project
+        project.previous_state = project.current_state
+        project.status = "paused"
+        project.updated_at = _now()
+        await self.log_event(
+            project_id=project_id,
+            level="INFO",
+            message="Project paused",
+            meta={"state_at_pause": project.previous_state, "triggered_by": triggered_by},
+        )
+        self.session.commit()
+        return project
+
+    async def resume_project(self, project_id: str, triggered_by: str = "user") -> Project:
+        project = self.require_project(project_id)
+        if project.status != "paused":
+            return project
+        project.status = "active"
+        project.updated_at = _now()
+        await self.log_event(
+            project_id=project_id,
+            level="INFO",
+            message="Project resumed",
+            meta={"resume_to_state": project.current_state, "triggered_by": triggered_by},
+        )
+        self.session.commit()
+        return project
+
+    async def rollback_project(
+        self,
+        project_id: str,
+        target_state: str,
+        triggered_by: str = "user",
+    ) -> Project:
+        project = self.require_project(project_id)
+        state_machine = StateMachine(project.task_type)
+        if target_state not in state_machine.states:
+            raise InvalidStateTransitionError(project.current_state, f"rollback_to_{target_state}")
+
+        project.previous_state = project.current_state
+        project.current_state = target_state
+        project.updated_at = _now()
+
+        # Mark running tasks as failed so their outputs are discarded.
+        for task in self._running_tasks(project_id):
+            task.status = "failed"
+            task.error_message = f"Rolled back to {target_state}"
+
+        # Expire pending approvals.
+        for approval in self._pending_approvals(project_id):
+            approval.status = "expired"
+
+        await self.log_event(
+            project_id=project_id,
+            level="INFO",
+            message=f"Project rolled back to {target_state}",
+            meta={"from_state": project.previous_state, "to_state": target_state, "triggered_by": triggered_by},
+        )
+        self.session.commit()
+        return project
+
+    async def expire_pending_approvals_for_state(
+        self, project_id: str, state: str
+    ) -> None:
+        for approval in self._pending_approvals(project_id):
+            if approval.state == state:
+                approval.status = "expired"
+                approval.updated_at = _now()
+        self.session.commit()
+
+    # ------------------------------------------------------------------
 
     async def log_event(
         self,
@@ -588,13 +1034,44 @@ class ProjectService:
         state_path = workspace / ".mac" / "STATE.json"
         pending = self._build_pending_approval(project)
 
+        # Build read-only summaries for agents.
+        context = dict(project.context)
+        context["pending_user_inputs"] = [
+            {
+                "input_id": inp.id,
+                "sender_id": inp.sender_id,
+                "source_chat_id": inp.source_chat_id,
+                "observed_state": inp.observed_state,
+                "content": inp.content,
+                "kind": inp.kind,
+                "created_at": inp.created_at.isoformat(),
+            }
+            for inp in self.get_pending_user_inputs(project.id)
+        ]
+        context["open_feedback"] = [
+            {
+                "feedback_id": fb.id,
+                "source_stage": fb.source_stage,
+                "source_task_id": fb.source_task_id,
+                "source_round": fb.source_round,
+                "kind": fb.kind,
+                "failure_class": fb.failure_class,
+                "summary": fb.summary,
+                "blocking": fb.blocking,
+                "recommended_rework_target": fb.recommended_rework_target,
+                "evidence": fb.evidence,
+                "user_comment": fb.user_comment,
+            }
+            for fb in self.get_open_feedback_packets(project.id)
+        ]
+
         state_doc = {
             "version": "1.0",
             "project_id": project.id,
             "current_state": project.current_state,
             "previous_state": project.previous_state,
             "pending_approval": pending,
-            "context": project.context,
+            "context": context,
             "history": project.context.get("history", []),
         }
 

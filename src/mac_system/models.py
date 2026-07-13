@@ -3,6 +3,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field as SQLField, SQLModel, JSON, Column
 
 
@@ -55,7 +56,8 @@ class Task(SQLModel, table=True):
     project_id: str = SQLField(foreign_key="projects.id", index=True)
     agent_type: str
     state: str
-    status: str = SQLField(default="pending")  # pending, running, completed, failed
+    round_number: int = SQLField(default=1)
+    status: str = SQLField(default="pending")  # pending, running, completed, failed, cancelled
     worktree_path: Optional[str] = None
     input_data: dict = SQLField(default_factory=dict, sa_column=Column(JSON))
     output_data: dict = SQLField(default_factory=dict, sa_column=Column(JSON))
@@ -64,6 +66,42 @@ class Task(SQLModel, table=True):
     cost_usd: Optional[float] = None
     created_at: datetime = SQLField(default_factory=datetime.utcnow)
     updated_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class FeedbackPacket(SQLModel, table=True):
+    __tablename__ = "feedback_packets"
+
+    id: str = SQLField(primary_key=True)
+    project_id: str = SQLField(foreign_key="projects.id", index=True)
+    source_stage: str
+    source_task_id: Optional[str] = SQLField(foreign_key="tasks.id", nullable=True)
+    source_round: int = SQLField(default=1)
+    kind: str = SQLField(default="quality_failure")  # quality_failure, user_revision, acceptance_rejection
+    failure_class: Optional[str] = None
+    summary: str
+    blocking: bool = SQLField(default=True)
+    recommended_rework_target: Optional[str] = None
+    evidence: list = SQLField(default_factory=list, sa_column=Column(JSON))
+    user_comment: Optional[str] = None
+    status: str = SQLField(default="open")  # open, resolved, disputed
+    resolved_by_task_id: Optional[str] = SQLField(foreign_key="tasks.id", nullable=True)
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    updated_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class PendingUserInput(SQLModel, table=True):
+    __tablename__ = "pending_user_inputs"
+
+    id: str = SQLField(primary_key=True)
+    project_id: str = SQLField(foreign_key="projects.id", index=True)
+    sender_id: Optional[str] = None
+    source_chat_id: Optional[str] = None
+    observed_state: str
+    content: str
+    kind: str = SQLField(default="question")  # scope_change, correction, question
+    status: str = SQLField(default="pending")  # pending, consumed
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    consumed_by_task_id: Optional[str] = SQLField(foreign_key="tasks.id", nullable=True)
 
 
 class Approval(SQLModel, table=True):
@@ -99,7 +137,35 @@ class ProjectUser(SQLModel, table=True):
 
     project_id: str = SQLField(foreign_key="projects.id", primary_key=True)
     open_id: str = SQLField(primary_key=True)
+    role: str = SQLField(default="editor")  # owner / editor / reviewer / viewer
     created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class ProjectChat(SQLModel, table=True):
+    __tablename__ = "project_chats"
+    __table_args__ = (UniqueConstraint("project_id", "chat_id", name="uix_project_chat"),)
+
+    id: str = SQLField(primary_key=True)
+    project_id: str = SQLField(foreign_key="projects.id", index=True)
+    chat_id: str = SQLField(index=True)
+    chat_type: str = SQLField(default="p2p")
+    relation: str = SQLField(default="origin")  # origin / subscribed
+    notification_level: str = SQLField(default="all")  # all / approvals / result / none
+    created_by: str | None = None
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class ChatUserContext(SQLModel, table=True):
+    __tablename__ = "chat_user_contexts"
+
+    chat_id: str = SQLField(primary_key=True)
+    open_id: str = SQLField(primary_key=True)
+    active_project_id: str | None = SQLField(
+        foreign_key="projects.id", index=True, nullable=True
+    )
+    selected_at: datetime = SQLField(default_factory=datetime.utcnow)
+    expires_at: datetime | None = None
+    updated_at: datetime = SQLField(default_factory=datetime.utcnow)
 
 
 class PendingIntent(SQLModel, table=True):

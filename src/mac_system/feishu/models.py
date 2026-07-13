@@ -38,4 +38,5 @@ class TextMessage:
     chat_id: str | None = None
     chat_type: str = "p2p"
     sender_type: str = "user"
+    is_at_bot: bool = False
     mentions: list[dict[str, Any]] = field(default_factory=list)

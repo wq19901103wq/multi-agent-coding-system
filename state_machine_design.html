@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MAC System 状态流转与卡片设计</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f8fa;
+      --card: #ffffff;
+      --text: #1f2328;
+      --muted: #59636e;
+      --border: #d1d9e0;
+      --accent: #0969da;
+      --ok: #1a7f37;
+      --warn: #9a6700;
+      --bad: #cf222e;
+      --agent: #ddf4ff;
+      --human: #fff8c5;
+      --system: #fbefff;
+      --terminal: #dafbe1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+      margin: 0;
+      padding: 0;
+    }
+    header {
+      background: linear-gradient(90deg, #0969da 0%, #54aeff 100%);
+      color: white;
+      padding: 48px 24px;
+      text-align: center;
+    }
+    header h1 { margin: 0 0 8px; font-size: 2rem; }
+    header p { margin: 0; opacity: 0.9; }
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 32px 24px 64px;
+    }
+    section {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 28px;
+      margin-bottom: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    h2 { margin-top: 0; color: var(--accent); border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+    h3 { margin-top: 28px; color: var(--text); }
+    .legend {
+      display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0;
+    }
+    .legend span {
+      padding: 4px 12px; border-radius: 20px; font-size: 0.9rem; border: 1px solid var(--border);
+    }
+    .agent { background: var(--agent); }
+    .human { background: var(--human); }
+    .system { background: var(--system); }
+    .terminal { background: var(--terminal); }
+    .diagram-wrap {
+      background: #fff;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      overflow: auto;
+      margin: 16px 0;
+      position: relative;
+      min-height: 420px;
+    }
+    .mermaid {
+      min-width: 900px;
+      padding: 24px;
+    }
+    .zoom-bar {
+      display: flex; gap: 8px; justify-content: flex-end; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bg);
+    }
+    .zoom-bar button {
+      border: 1px solid var(--border); background: white; border-radius: 6px; padding: 4px 12px; cursor: pointer; font-size: 0.9rem;
+    }
+    .zoom-bar button:hover { background: var(--bg); }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+    th, td { border: 1px solid var(--border); padding: 10px 12px; text-align: left; vertical-align: top; }
+    th { background: var(--bg); }
+    code { background: #f0f1f2; padding: 2px 6px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, monospace; }
+    .note { border-left: 4px solid var(--accent); background: #f6f8fa; padding: 14px 18px; margin: 18px 0; border-radius: 0 8px 8px 0; }
+    .warn { border-left-color: var(--warn); background: #fff8c5; }
+    .bad { border-left-color: var(--bad); background: #ffebe9; }
+    .ok { border-left-color: var(--ok); background: #dafbe1; }
+    ul { padding-left: 22px; }
+    li { margin: 8px 0; }
+    .card-example {
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      background: #fafafa;
+      margin: 12px 0;
+    }
+    .card-example h4 { margin: 0 0 8px; color: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>MAC System 状态流转与卡片设计</h1>
+    <p>汇报卡片、流转卡片、质量确认卡片，以及人工中断处理</p>
+  </header>
+
+  <main>
+    <section>
+      <h2>0. 三种卡片要分开</h2>
+      <p>用户在微信/飞书里看到的不是“状态机”，而是<strong>三种不同职责的卡片</strong>：</p>
+      <table>
+        <tr><th>卡片类型</th><th>作用</th><th>触发时机</th><th>是否需要用户操作</th></tr>
+        <tr><td><strong>汇报卡片</strong></td><td>展示本轮 Agent 干了什么、产出了什么、关键结论是什么</td><td>Agent 执行完成，进入人工确认前</td><td>只读</td></tr>
+        <tr><td><strong>质量确认卡片</strong></td><td>让用户对本轮结果给出“通过 / 不通过”的明确意见</td><td>汇报卡片之后</td><td>必须操作（可默认通过）</td></tr>
+        <tr><td><strong>状态流转卡片</strong></td><td>通知“状态变了”，比如“需求确认已完成 → 进入方案设计”</td><td>状态发生 transition 后</td><td>只读</td></tr>
+      </table>
+      <div class="note warn">
+        <strong>现状问题：</strong> 目前只有“状态流转卡片”，把汇报和流转混在一起。用户看不到“本轮工作报告”，也没有机会对测试/Review 给出明确意见。
+      </div>
+    </section>
+
+    <section>
+      <h2>1. 推荐的新流程（多轮对齐、失败路由与条件自动确认）</h2>
+      <div class="legend">
+        <span class="agent">🤖 Agent 执行态</span>
+        <span class="human">👤 人工确认/输入态</span>
+        <span class="system">⚙️ 系统动作态</span>
+        <span class="terminal">🏁 终态</span>
+      </div>
+
+      <div class="diagram-wrap">
+        <div class="zoom-bar">
+          <button onclick="zoom(this,0.8)">缩小</button>
+          <button onclick="zoom(this,1.0)">重置</button>
+          <button onclick="zoom(this,1.4)">放大</button>
+        </div>
+        <div class="mermaid">
+%%{init: {'theme': 'default', 'themeVariables': { 'fontSize': '16px', 'fontFamily': 'system-ui' }}}%%
+flowchart TD
+    subgraph 规划阶段
+      INIT([INIT]) --> PLANNING_REQUIREMENTS
+      PLANNING_REQUIREMENTS -->|主动提问| REQUIREMENT_INPUT_PENDING
+      REQUIREMENT_INPUT_PENDING -->|用户回答<br/>新一轮| PLANNING_REQUIREMENTS
+      PLANNING_REQUIREMENTS --> REQUIREMENT_REPORT[汇报卡片<br/>需求理解]
+      REQUIREMENT_REPORT --> REQUIREMENT_CONFIRM_PENDING
+      REQUIREMENT_CONFIRM_PENDING -->|确认| PLANNING_ARCHITECTURE
+      REQUIREMENT_CONFIRM_PENDING -->|驳回| PLANNING_REQUIREMENTS
+      PLANNING_ARCHITECTURE --> ARCHITECTURE_REPORT[汇报卡片<br/>架构方案]
+      PLANNING_ARCHITECTURE -->|主动提问| ARCHITECTURE_INPUT_PENDING
+      ARCHITECTURE_INPUT_PENDING -->|用户回答<br/>新一轮| PLANNING_ARCHITECTURE
+      ARCHITECTURE_REPORT --> ARCHITECTURE_CONFIRM_PENDING
+      ARCHITECTURE_CONFIRM_PENDING -->|确认| PLANNING_SPECS
+      ARCHITECTURE_CONFIRM_PENDING -->|驳回| PLANNING_ARCHITECTURE
+      PLANNING_SPECS --> SPECS_REPORT[汇报卡片<br/>Spec 拆分]
+      PLANNING_SPECS -->|主动提问| SPEC_INPUT_PENDING
+      SPEC_INPUT_PENDING -->|用户回答<br/>新一轮| PLANNING_SPECS
+      SPECS_REPORT --> SPEC_CONFIRM_PENDING
+      SPEC_CONFIRM_PENDING -->|确认| CODING
+      SPEC_CONFIRM_PENDING -->|驳回| PLANNING_SPECS
+    end
+
+    subgraph 实现阶段
+      CODING --> CODING_REPORT[汇报卡片<br/>编码结果]
+      CODING_REPORT --> CODING_CONFIRM_PENDING
+	      CODING_CONFIRM_PENDING -->|通过<br/>按模式确认| TESTING
+      CODING_CONFIRM_PENDING -->|不通过| REWORK
+
+      TESTING --> TESTING_REPORT[汇报卡片<br/>测试报告]
+      TESTING -->|quality fail| REWORK
+      TESTING_REPORT --> TESTING_CONFIRM_PENDING
+	      TESTING_CONFIRM_PENDING -->|通过<br/>按模式确认| REVIEW
+      TESTING_CONFIRM_PENDING -->|不通过| REWORK
+
+      REVIEW --> REVIEW_REPORT[汇报卡片<br/>Review 结论]
+      REVIEW -->|blocking fail| REWORK
+      REVIEW_REPORT --> REVIEW_CONFIRM_PENDING
+	      REVIEW_CONFIRM_PENDING -->|通过<br/>按模式确认| ACCEPTANCE_PENDING
+      REVIEW_CONFIRM_PENDING -->|不通过| REWORK
+    end
+
+    REWORK --> REWORK_SELECT[质量确认卡片<br/>选择回退层级]
+    REWORK_SELECT -->|重新明确需求| PLANNING_REQUIREMENTS
+    REWORK_SELECT -->|重新设计方案| PLANNING_ARCHITECTURE
+    REWORK_SELECT -->|重新拆Spec| PLANNING_SPECS
+    REWORK_SELECT -->|直接重编码| CODING
+    REWORK_SELECT -->|修正测试| TESTING
+
+    ACCEPTANCE_PENDING -->|验收通过| MERGING
+    ACCEPTANCE_PENDING -->|验收驳回| REWORK
+    MERGING --> COMPLETED([COMPLETED])
+        </div>
+      </div>
+
+      <div class="note ok">
+        <strong>设计要点：</strong> 编码、测试、Review 都有质量确认，但只有 Agent 已明确判定 pass 时才允许按审批模式自动确认：
+        <ul>
+          <li>strict/normal 等待人工，night/auto 可立即确认 pass 结果；</li>
+          <li>代码里不会偷懒：每一轮都必须产出汇报卡片和质量确认卡片，即使自动通过；</li>
+          <li>不通过时统一进入 <code>REWORK</code>，由用户选择回退到哪一层。</li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2>2. 卡片示例</h2>
+
+      <h3>2.1 汇报卡片（只读）</h3>
+      <div class="card-example">
+        <h4>📋 测试报告 — 实现一个 Todo List CLI</h4>
+        <ul>
+          <li>运行测试：26 个全部通过</li>
+          <li>行覆盖率：88%（src/todo）</li>
+          <li>关键验证：add / list / complete / delete / --help 均正常</li>
+          <li>残留风险：配置文件路径未处理 ~ 展开</li>
+        </ul>
+      </div>
+
+      <h3>2.2 质量确认卡片（pass 时可按模式自动确认）</h3>
+      <div class="card-example">
+        <h4>✅ 测试是否通过？ — 实现一个 Todo List CLI</h4>
+        <p>本轮测试结果如上。strict/normal 等待人工；night/auto 仅在测试明确通过且没有中途反馈时自动确认。</p>
+        <p><strong>操作：</strong> [通过] [不通过，进入返工选择] [暂停]</p>
+      </div>
+
+      <h3>2.3 状态流转卡片（只读）</h3>
+      <div class="card-example">
+        <h4>🔄 状态流转 — 实现一个 Todo List CLI</h4>
+        <p>✅ 测试确认 已完成（第 1 轮）<br/>🔄 进入 Review</p>
+      </div>
+
+      <h3>2.4 REWORK 选择卡片（人工选择回退层级）</h3>
+      <div class="card-example">
+        <h4>🔧 测试不通过，请选择如何处理</h4>
+        <p>反馈：部分边界场景未覆盖。</p>
+        <p><strong>操作：</strong><br/>
+        [重新明确需求] [重新设计方案] [重新拆Spec] [直接重新编码]</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>3. 条件自动确认怎么做？</h2>
+      <p>有两种实现方式：</p>
+      <table>
+        <tr><th>方案</th><th>实现方式</th><th>优点</th><th>缺点</th></tr>
+        <tr>
+          <td>A. 状态机里仍用 human_confirmation，配置 auto_resolve</td>
+          <td><code>approval_mode=auto</code> 时，由 <code>project_manager</code> agent 自动选择“通过”</td>
+          <td>不改状态机，只改 approval_mode</td>
+          <td>project_manager 也要调一次 LLM，有 token 成本</td>
+        </tr>
+        <tr>
+          <td>B. 状态机里拆分出 agent_execution + 可选的 human_confirmation</td>
+          <td>新增 <code>CODING_CONFIRM_PENDING</code> 等状态；正常模式走 human_confirmation，night/auto 模式直接 <code>complete</code> 跳过</td>
+          <td>完全可控，不调用额外 LLM</td>
+          <td>状态机变复杂</td>
+        </tr>
+        <tr>
+          <td>C. 现行：pass-only 条件自动确认</td>
+          <td>strict/normal 等待人工；night/auto 对 pass 立即 confirm；fail、REWORK、验收永不自动确认</td>
+          <td>失败不会被静默放行，行为由审批模式明确控制</td>
+          <td>需要持久化结果类型和中途输入检查</td>
+        </tr>
+      </table>
+      <div class="note">
+        <strong>现行规则：</strong> 对编码、测试、Review 都产出独立汇报。只有明确 pass 且无 pending_user_inputs 时，night/auto 才自动确认；明确失败统一进入 REWORK，最终验收始终等待用户。
+      </div>
+    </section>
+
+    <section>
+      <h2>4. 状态机里考虑“人突然输入”了吗？</h2>
+      <p>当前实现是<strong>事件驱动</strong>的：人来一条消息/命令，就处理一次。状态机本身没有“中断态”。下面是各种突发情况的行为：</p>
+
+      <table>
+        <tr><th>用户行为</th><th>当前行为</th><th>问题</th><th>建议</th></tr>
+        <tr>
+          <td>Agent 正在编码时发 <code>/status</code></td>
+          <td>正常返回当前状态</td>
+          <td>无</td>
+          <td>保持</td>
+        </tr>
+        <tr>
+          <td>Agent 正在编码时发 <code>/cancel</code></td>
+          <td>取消项目，kill 子进程</td>
+          <td>无</td>
+          <td>保持</td>
+        </tr>
+        <tr>
+          <td>Agent 正在编码时发 <code>/confirm &lt;id&gt;</code></td>
+          <td>找不到 pending approval，回复“该审批已过期或不存在”</td>
+          <td>用户可能误操作</td>
+          <td>提示“当前没有待确认的审批，正在编码中，如需中断请用 /cancel”</td>
+        </tr>
+        <tr>
+          <td>Agent 正在编码时发任意自由文本</td>
+          <td>回复帮助信息</td>
+          <td>用户想追加需求/反馈却无法接入</td>
+          <td>识别为“追加反馈”，存入 <code>pending_user_input</code>，在下一轮确认/重试时注入</td>
+        </tr>
+        <tr>
+          <td>Agent 正在编码时发 <code>/reject &lt;id&gt;</code></td>
+          <td>同 /confirm，可能找不到 approval</td>
+          <td>同上</td>
+          <td>同上，或允许强制进入 REWORK</td>
+        </tr>
+        <tr>
+          <td>人工确认阶段长时间不响应</td>
+          <td>一直 pending，等用户点击/命令</td>
+          <td>可能卡住</td>
+          <td>非关键节点（编码/测试/Review）加超时自动通过；关键节点（需求/方案/Spec/验收）继续等待</td>
+        </tr>
+      </table>
+
+      <div class="note warn">
+        <strong>关键缺口：</strong> 当 Agent 正在运行时，用户除了 <code>/status</code> 和 <code>/cancel</code> 外，几乎无法对当前这一轮施加影响。建议引入 <code>pending_user_input</code> 机制：自由文本消息被暂存，Agent 本轮结束后先检查有没有 pending 输入，再决定是进入确认态还是直接进入 REWORK。
+      </div>
+    </section>
+
+    <section>
+      <h2>5. 建议的状态机变更</h2>
+      <p>在 <code>state_machines/feature.json</code> 里增加这些状态：</p>
+      <table>
+        <tr><th>新增状态</th><th>类型</th><th>事件</th></tr>
+        <tr><td><code>CODING_CONFIRM_PENDING</code></td><td>human_confirmation</td><td>confirm → TESTING；reject → REWORK</td></tr>
+        <tr><td><code>TESTING_CONFIRM_PENDING</code></td><td>human_confirmation</td><td>confirm → REVIEW；reject → REWORK</td></tr>
+        <tr><td><code>REVIEW_CONFIRM_PENDING</code></td><td>human_confirmation</td><td>confirm → ACCEPTANCE_PENDING；reject → REWORK</td></tr>
+        <tr><td><code>REWORK</code></td><td>human_confirmation</td><td>to_requirements / to_architecture / to_specs / to_coding</td></tr>
+      </table>
+
+      <p>同时调整：</p>
+      <ul>
+        <li><code>CODING</code> 完成后进入 <code>CODING_CONFIRM_PENDING</code>，不再直接到 <code>TESTING</code>；</li>
+        <li><code>TESTING</code> 完成后进入 <code>TESTING_CONFIRM_PENDING</code>；</li>
+        <li><code>REVIEW</code> 完成后进入 <code>REVIEW_CONFIRM_PENDING</code>；</li>
+        <li><code>ACCEPTANCE_PENDING</code> 的 reject 也进 <code>REWORK</code>，统一处理；</li>
+        <li>质量确认只有 pass 结果可按 approval mode 自动 confirm；失败结果不可自动通过。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>6. 总结</h2>
+      <ul>
+        <li><strong>汇报卡片 ≠ 状态流转卡片：</strong> 应该先有汇报卡片，再让用户确认，最后发流转通知。</li>
+        <li><strong>编码/测试/Review 都有质量确认：</strong> strict/normal 人工确认，night/auto 仅自动确认 pass。</li>
+        <li><strong>不通过统一进 REWORK：</strong> 由用户选择回到需求/方案/Spec/编码，而不是自动打回编码。</li>
+        <li><strong>上游文档需要变更确认：</strong> 回退到 PLANNING_* 后重新生成的文档，应该再经过一轮人工确认。</li>
+        <li><strong>突发输入需要处理：</strong> Agent 运行时用户的自由文本/命令应该被暂存为 <code>pending_user_input</code>，本轮结束后优先消费。</li>
+      </ul>
+    </section>
+  </main>
+
+  <script>
+    mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    function zoom(btn, scale) {
+      const wrap = btn.closest('.diagram-wrap');
+      const mm = wrap.querySelector('.mermaid');
+      mm.style.transform = 'scale(' + scale + ')';
+      mm.style.transformOrigin = 'top left';
+      if (scale === 1) {
+        mm.style.width = '';
+      } else {
+        mm.style.width = (900 * scale) + 'px';
+      }
+    }
+  </script>
+</body>
+</html>

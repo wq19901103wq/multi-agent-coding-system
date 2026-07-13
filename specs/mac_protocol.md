@@ -2,7 +2,7 @@
 
 > 版本：v1.0  
 > 用途：定义多 Agent 系统通过项目工作区 `.mac/` 目录交换上下文和产物的标准格式。  
-> 原则：所有结构化产物必须写成 JSON；所有需要人类阅读的长文本可额外写同名 `.md`；`STATE.json` 是 Orchestrator 与 Agent 之间的唯一状态真相源。
+> 原则：所有结构化产物必须写成 JSON；所有需要人类阅读的长文本可额外写同名 `.md`。数据库中的 Project / Task / Approval / PendingUserInput 是控制层真相源；`STATE.json` 是供 Agent 读取、可由数据库重建的一致性快照。
 
 ## 目录结构
 
@@ -36,6 +36,45 @@ projects/{project_id}/
 3. **状态真相源**：`STATE.json` 由 Orchestrator 在创建 worktree 前写入，Agent 可读取但不可修改；Agent 通过 `TASK.json` 的 `next_state_event` 字段请求状态迁移。
 4. **JSON Schema 校验**：所有 `.json` 文件必须能通过 `specs/schemas/` 下对应 schema 校验；校验失败时 Orchestrator 将输出视为失败并触发重试。
 5. **路径约定**：所有文件路径均相对于项目根目录（`projects/{project_id}/`），使用 POSIX 路径风格。
+6. **版本规则**：需求、方案、Spec 和 Agent Task 均带阶段轮次；新轮次不得覆盖旧 Task。主文件可指向最新版本，但历史版本必须可追溯。
+7. **反馈规则**：跨 Agent 或用户产生的修改意见使用 feedback packet，不得只依赖易被覆盖的 `latest_rejection_feedback`。
+8. **追踪规则**：REQ、AC、DEC、SPEC、TEST、REV 使用稳定 ID；详细规则见 `artifact_traceability_spec.md`。所有下游产物必须显式引用其上游 IDs 和 artifact version。
+9. **失效规则**：上游 confirmed artifact 发生语义变化时，引用受影响 ID 的下游 artifact、Task 和 Approval 标记 stale/expired；旧运行结果不得 merge 或推进状态。
+
+## Feedback Packet
+
+```json
+{
+  "feedback_id": "fb_...",
+  "project_id": "proj_...",
+  "source_stage": "REVIEW",
+  "source_task_id": "task_review_...",
+  "source_round": 2,
+  "kind": "quality_failure",
+  "failure_class": "implementation_bug",
+  "summary": "端口上界判断与 Spec 不符",
+  "blocking": true,
+  "recommended_rework_target": "CODING",
+  "evidence": [{"file": "src/config.py", "line": 42, "description": "65536 被接受"}],
+  "user_comment": "边界必须严格按 Spec",
+  "status": "open",
+  "resolved_by_task_id": null
+}
+```
+
+1. Tester fail、Reviewer blocking issue、验收驳回、用户中途修订都生成 feedback packet。
+2. 回退目标 Agent 的 TASK 输入包含所有 open feedback；Coder 必须输出 `addressed_feedback` 逐项响应。
+3. Reviewer 下一轮读取原 issues 和 Coder 响应，只有核验完成才能将 feedback 标为 resolved。
+4. `disputed` 不等于 resolved；若意见与已确认需求/Spec 冲突，进入对应上游 REWORK。
+5. feedback 只追加状态变更，不删除历史。
+
+## Pending User Input
+
+Agent 运行期间的自由文本写入数据库队列，并在 `STATE.json.context.pending_user_inputs` 中提供只读摘要。每条输入具有稳定 `input_id`、发送者、观察到的状态、分类和消费状态。Orchestrator 在 Agent 返回后、merge/transition 前再次检查；范围变更或纠正类输入必须阻止该轮自动确认。
+
+## Artifact Impact Report
+
+需求、方案或 Spec 新版本确认后生成 impact report：列出 changed IDs、受影响产物、正在运行 Task、过期审批、建议回退层和可以安全复用的证据。影响分析完成前项目不得自动进入后续 Agent 阶段。
 
 ## `STATE.json`
 
@@ -103,8 +142,14 @@ planner stage=requirements 的输出，结构化描述需求理解。
 ```json
 {
   "$schema": "./specs/schemas/requirements.json",
+  "artifact_id": "requirements",
+  "version": 1,
+  "round": 1,
+  "status": "pending_confirmation",
   "summary": "一句话需求摘要",
-  "goals": ["目标1", "目标2"],
+  "requirements": [
+    {"id": "REQ-CFG-001", "title": "配置校验", "description": "校验必填字段", "priority": "must", "kind": "functional", "source": "用户原始需求", "status": "confirmed"}
+  ],
   "constraints": ["约束1"],
   "ambiguities": [
     {
@@ -113,8 +158,10 @@ planner stage=requirements 的输出，结构化描述需求理解。
       "default_assumption": "MVP 仅支持 integer"
     }
   ],
-  "acceptance_criteria": ["标准1", "标准2"],
-  "assumptions": ["假设1"],
+  "acceptance_criteria": [
+    {"id": "AC-CFG-001", "requirement_ids": ["REQ-CFG-001"], "statement": "缺少必填字段时退出码为 1", "verification_method": "automated_test"}
+  ],
+  "assumptions": [],
   "out_of_scope": ["不做的事项"]
 }
 ```
@@ -159,15 +206,24 @@ planner stage=specs 的输出，把方案拆成可执行的 Spec 列表。
 ```json
 {
   "$schema": "./specs/schemas/specs.json",
+  "artifact_id": "specs",
+  "version": 1,
+  "round": 1,
+  "status": "pending_confirmation",
   "specs": [
     {
       "id": "spec_001",
       "title": "实现 schema 解析器",
       "description": "...",
-      "acceptance_criteria": ["..."],
+      "requirement_ids": ["REQ-CFG-001"],
+      "acceptance_criterion_ids": ["AC-CFG-001"],
+      "decision_ids": ["DEC-CFG-001"],
+      "acceptance_criteria": ["缺少必填字段时退出码为 1"],
       "dependencies": [],
       "affected_files": ["src/config_validator/schema.py"],
-      "assigned_agent": "coder",
+      "owners": {"implementation": "coder", "verification": "tester", "review": "reviewer"},
+      "test_cases": [{"id": "TEST-CFG-001", "type": "unit", "scenario": "缺少必填字段", "expected": "失败且退出码为 1", "acceptance_criterion_ids": ["AC-CFG-001"]}],
+      "definition_of_done": ["实现完成", "TEST-CFG-001 通过", "无 blocking review issue"],
       "estimated_effort": "small"
     }
   ]
@@ -258,6 +314,12 @@ planner stage=doc_outline 的输出（仅 documentation 任务）。
 | `output.notes` | array | 否 | 实现说明 |
 
 ## Orchestrator 与 Agent 的读写职责
+
+### 主动提问协议
+
+任一 Agent 可返回 `output.next_state_event = "ask_user"` 和 `output.questions`。Orchestrator 为每个问题分配/校验稳定 question_id，持久化 `resume_state`、agent_type、stage、task_id、round、artifact versions 和 trace IDs，并创建 input approval。
+
+回答记录只追加，至少包含 `question_id`、answer kind（option/free_text/accept_default）、selected keys、text、answered_by、source_chat_id 和 answered_at。新一轮 Agent 读取全部历史问答及仍未解决问题；blocking question 未解决时协议层拒绝 `complete`。
 
 | 文件 | Orchestrator 写 | Orchestrator 读 | Agent 写 | Agent 读 |
 |------|----------------|----------------|---------|---------|

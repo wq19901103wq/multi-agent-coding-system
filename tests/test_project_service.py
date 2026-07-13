@@ -1,4 +1,5 @@
 import pytest
+from contextlib import contextmanager
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from mac_system.core.project_service import (
@@ -6,7 +7,7 @@ from mac_system.core.project_service import (
     ProjectNotFoundError,
     ProjectService,
 )
-from mac_system.models import Project, Task
+from mac_system.models import FeedbackPacket, Project, Task
 
 
 @pytest.fixture
@@ -209,6 +210,43 @@ def test_recover_stale_tasks_empty(service):
     assert service.recover_stale_tasks() == []
 
 
+async def test_restart_recovery_reschedules_active_agent_project(
+    service, session, monkeypatch
+):
+    from mac_system.api import main as api_main
+
+    project = await service.create_project(
+        name="restart-recovery", task_type="feature", description="Test"
+    )
+    task = await service.create_task(
+        project_id=project.id,
+        agent_type="planner",
+        state=project.current_state,
+        input_data={},
+    )
+    await service.start_task(task.id, "/tmp/wt")
+    service.recover_stale_tasks()
+
+    @contextmanager
+    def same_session_scope():
+        yield session
+
+    ticked: list[str] = []
+
+    class StubOrchestrator:
+        feishu_bridge = None
+
+        async def tick(self, project_id: str) -> None:
+            ticked.append(project_id)
+
+    monkeypatch.setattr(api_main, "session_scope", same_session_scope)
+    monkeypatch.setattr(api_main, "_build_orchestrator", lambda _session: StubOrchestrator())
+
+    await api_main._resume_recovered_project(project.id)
+
+    assert ticked == [project.id]
+
+
 async def test_pending_intent_crud(service):
     intent = service.upsert_pending_intent(
         open_id="ou_123",
@@ -331,3 +369,125 @@ def test_event_dedup(service):
     service.mark_event_processed("evt_1", "message")
     service.session.commit()
     assert service.is_event_processed("evt_1") is True
+
+
+async def test_create_project_binds_chat_and_context(service):
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="Test",
+        creator_open_id="ou_123",
+        feishu_chat_id="chat_abc",
+        feishu_chat_type="group",
+    )
+    from mac_system.models import ProjectChat, ChatUserContext
+
+    chats = service.session.exec(
+        select(ProjectChat).where(ProjectChat.project_id == project.id)
+    ).all()
+    assert len(chats) == 1
+    assert chats[0].chat_id == "chat_abc"
+
+    ctx = service.session.exec(
+        select(ChatUserContext).where(
+            ChatUserContext.chat_id == "chat_abc",
+            ChatUserContext.open_id == "ou_123",
+        )
+    ).first()
+    assert ctx is not None
+    assert ctx.active_project_id == project.id
+
+
+async def test_chat_user_context_routing(service):
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="Test",
+        creator_open_id="ou_123",
+        feishu_chat_id="chat_abc",
+        feishu_chat_type="group",
+    )
+    active = service.get_chat_user_active_project("chat_abc", "ou_123")
+    assert active is not None
+    assert active.id == project.id
+
+    service.set_chat_user_context("chat_abc", "ou_123", "proj_nonexistent")
+    assert service.get_chat_user_active_project("chat_abc", "ou_123") is None
+
+
+async def test_list_projects_for_chat(service):
+    p1 = await service.create_project(
+        name="p1", task_type="feature", description="p1", feishu_chat_id="chat_x"
+    )
+    p2 = await service.create_project(
+        name="p2", task_type="feature", description="p2", feishu_chat_id="chat_x"
+    )
+    await service.cancel_project(p2.id)
+    projects = service.list_projects_for_chat("chat_x")
+    assert [p.id for p in projects] == [p1.id]
+
+
+async def test_create_approval_expires_existing_pending(service):
+    project = await service.create_project(
+        name="test", task_type="feature", description="Test"
+    )
+    old = await service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="REQUIREMENT_CONFIRM_PENDING",
+        approval_type="confirmation",
+        question="Old?",
+        options=[],
+    )
+    assert old.status == "pending"
+
+    new = await service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="REQUIREMENT_CONFIRM_PENDING",
+        approval_type="confirmation",
+        question="New?",
+        options=[],
+    )
+    service.session.refresh(old)
+    assert old.status == "expired"
+    assert new.status == "pending"
+
+
+async def test_resolve_approval_is_atomic(service):
+    project = await service.create_project(
+        name="test", task_type="feature", description="Test"
+    )
+    await service.transition_state(project.id, "complete")
+    approval = await service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="REQUIREMENT_CONFIRM_PENDING",
+        approval_type="confirmation",
+        question="Confirm?",
+        options=[{"action": "confirm", "label": "Confirm"}],
+    )
+    responded, updated = await service.resolve_approval(
+        approval.id, "confirm", responded_by="ou_123"
+    )
+    assert responded.status == "responded"
+    assert updated.current_state == "PLANNING_ARCHITECTURE"
+
+
+async def test_feedback_packet_commit_param(service):
+    project = await service.create_project(
+        name="test", task_type="feature", description="Test"
+    )
+    packet = await service.create_feedback_packet(
+        project_id=project.id,
+        source_stage="TESTING",
+        source_task_id=None,
+        source_round=1,
+        kind="quality_failure",
+        summary="x",
+        commit=False,
+    )
+    # Not committed yet
+    assert service.session.get(FeedbackPacket, packet.id) is packet
+    service.session.commit()
+    assert service.session.get(FeedbackPacket, packet.id) is not None

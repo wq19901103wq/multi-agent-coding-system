@@ -262,6 +262,61 @@ async def test_concurrent_ticks_serialized(orchestrator):
 
 
 @pytest.mark.asyncio
+async def test_tick_skips_when_task_already_running(orchestrator):
+    """_execute_agent must not start a new agent when a running task exists."""
+    service, wm, renderer = orchestrator
+
+    call_count = 0
+
+    class CountingRuntime(FakeRuntime):
+        async def execute(self, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return await super().execute(**kwargs)
+
+    runtime = CountingRuntime({
+        "planner": {
+            "success": True,
+            "next_state_event": "complete",
+            "summary": "test",
+            "goals": [],
+            "acceptance_criteria": [],
+        }
+    })
+
+    lock_manager = ProjectLockManager()
+    oc = AgentOrchestrator(service, wm, runtime, renderer, lock_manager=lock_manager)
+    project = await service.create_project(
+        name="dup-test",
+        task_type="feature",
+        description="test",
+        approval_mode="auto",
+    )
+
+    # Before ticking, manually insert a running task so _execute_agent
+    # sees it and skips starting a duplicate agent.
+    existing = await service.create_task(
+        project_id=project.id,
+        agent_type="planner",
+        state="PLANNING_REQUIREMENTS",
+        input_data={},
+    )
+    await service.start_task(existing.id)
+
+    # Now tick — it should detect the running task and skip agent execution.
+    await oc.tick(project.id)
+
+    # The runtime must NOT have been called.
+    assert call_count == 0
+
+    # The existing task must still be running (tick did not touch it).
+    tasks = service.session.exec(select(Task).where(Task.project_id == project.id)).all()
+    assert len(tasks) == 1
+    assert tasks[0].id == existing.id
+    assert tasks[0].status == "running"
+
+
+@pytest.mark.asyncio
 async def test_strict_mode_requires_bug_fix_confirmation(orchestrator):
     service, wm, renderer = orchestrator
 
@@ -328,6 +383,36 @@ async def test_night_mode_auto_confirms_bug_fix_confirmation(orchestrator, monke
     # Night mode only requires REQUIREMENT_CONFIRM_PENDING and ACCEPTANCE_PENDING,
     # so BUG_FIX_CONFIRM_PENDING is auto-confirmed and the flow reaches ACCEPTANCE_PENDING.
     assert updated.current_state == "ACCEPTANCE_PENDING"
+
+
+@pytest.mark.asyncio
+async def test_agent_transitions_failed_on_last_allowed_attempt(orchestrator):
+    service, wm, renderer = orchestrator
+    runtime = FakeRuntime({
+        "planner": {
+            "success": False,
+            "next_state_event": "fail",
+        }
+    })
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    oc.settings.max_agent_retries = 3
+    project = await service.create_project(
+        name="retry-exhaustion",
+        task_type="feature",
+        description="always fails",
+        approval_mode="normal",
+    )
+
+    await oc.tick(project.id)
+    assert service.get_project(project.id).current_state == "PLANNING_REQUIREMENTS"
+    await oc.tick(project.id)
+    assert service.get_project(project.id).current_state == "PLANNING_REQUIREMENTS"
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "FAILED"
+    assert updated.status == "failed"
+    assert not service._running_tasks(project.id)
 
 
 @pytest.mark.asyncio
@@ -448,3 +533,313 @@ async def test_auxiliary_agent_task_is_completed(orchestrator):
     assert tasks[0].agent_type == "project_manager"
     assert tasks[0].status == "completed"
     assert tasks[0].output_data["suggested_action"] == "confirm"
+
+
+@pytest.mark.asyncio
+async def test_tester_fail_creates_feedback_packet_and_goes_to_rework(orchestrator):
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "tester": {
+            "success": True,
+            "next_state_event": "complete",
+            "passed": False,
+            "report": "Add command is broken",
+            "failure_class": "implementation_bug",
+            "recommended_rework_target": "coding",
+            "failures": [{"test": "test_add", "error": "assertion failed"}],
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 Todo CLI",
+        approval_mode="auto",
+    )
+    project.current_state = "TESTING"
+    service.session.commit()
+
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "REWORK"
+    feedback = service.get_open_feedback_packets(project.id)
+    assert len(feedback) == 1
+    assert feedback[0].source_stage == "TESTING"
+    assert feedback[0].kind == "quality_failure"
+    assert feedback[0].recommended_rework_target == "coding"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_fail_creates_feedback_packet_and_goes_to_rework(orchestrator):
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "reviewer": {
+            "success": True,
+            "next_state_event": "complete",
+            "result": "fail",
+            "summary": "Missing error handling",
+            "recommended_rework_target": "coding",
+            "issues": [
+                {
+                    "id": "r1",
+                    "severity": "major",
+                    "category": "implementation",
+                    "description": "No validation",
+                    "blocking": True,
+                }
+            ],
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 Todo CLI",
+        approval_mode="auto",
+    )
+    project.current_state = "REVIEW"
+    service.session.commit()
+
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "REWORK"
+    feedback = service.get_open_feedback_packets(project.id)
+    assert len(feedback) == 1
+    assert feedback[0].source_stage == "REVIEW"
+
+
+@pytest.mark.asyncio
+async def test_pending_user_input_forces_quality_gate_to_rework(orchestrator):
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "tester": {
+            "success": True,
+            "next_state_event": "complete",
+            "passed": True,
+            "report": "All tests pass",
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 Todo CLI",
+        approval_mode="auto",
+    )
+    project.current_state = "TESTING"
+    service.session.commit()
+
+    await service.create_pending_user_input(
+        project_id=project.id,
+        sender_id="user_1",
+        observed_state="TESTING",
+        content="这里需要改成支持多用户",
+        kind="scope_change",
+    )
+
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "REWORK"
+    feedback = service.get_open_feedback_packets(project.id)
+    assert any(fb.kind == "scope_change" for fb in feedback)
+
+
+@pytest.mark.asyncio
+async def test_stage_round_number_increments_on_re_entry(orchestrator):
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "planner": {
+            "success": True,
+            "next_state_event": "complete",
+            "summary": "requirements v2",
+            "goals": ["g1"],
+            "acceptance_criteria": ["a1"],
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 CLI",
+        approval_mode="auto",
+    )
+
+    await oc.tick(project.id)
+    first_task = service.session.exec(
+        select(Task).where(Task.project_id == project.id)
+    ).first()
+    assert first_task.round_number == 1
+
+    # Re-enter the same state and tick again.
+    project.current_state = "PLANNING_REQUIREMENTS"
+    service.session.commit()
+    await oc.tick(project.id)
+
+    tasks = service.session.exec(
+        select(Task)
+        .where(Task.project_id == project.id)
+        .order_by(Task.created_at.asc())
+    ).all()
+    assert len(tasks) == 2
+    assert tasks[1].round_number == 2
+
+
+@pytest.mark.asyncio
+async def test_pending_user_input_discards_planner_result(orchestrator):
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "planner": {
+            "success": True,
+            "next_state_event": "complete",
+            "summary": "discarded plan",
+            "goals": ["实现 CLI"],
+            "acceptance_criteria": ["测试通过"],
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 config-validator CLI",
+        approval_mode="normal",
+    )
+
+    # Simulate a correction received while the planner is running.
+    await service.create_pending_user_input(
+        project_id=project.id,
+        sender_id="ou_123",
+        observed_state="PLANNING_REQUIREMENTS",
+        content="需求不对，要改",
+        kind="correction",
+    )
+
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "REQUIREMENT_INPUT_PENDING"
+
+    # The planner artifact should NOT have been copied to the workspace.
+    req_file = Path(updated.workspace_path) / ".mac" / "REQUIREMENTS.json"
+    assert not req_file.exists()
+
+    # A blocking feedback packet should have been created.
+    open_feedback = service.get_open_feedback_packets(project.id)
+    assert any(fb.kind == "correction" and fb.blocking for fb in open_feedback)
+
+
+@pytest.mark.asyncio
+async def test_pending_user_input_discards_coder_result(orchestrator):
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "planner": {
+            "success": True,
+            "next_state_event": "complete",
+            "summary": "plan",
+            "goals": ["实现 CLI"],
+            "acceptance_criteria": ["测试通过"],
+        },
+        "coder": {
+            "success": True,
+            "next_state_event": "complete",
+            "modified_files": [{"path": "src/main.py", "description": "add feature"}],
+        },
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 config-validator CLI",
+        approval_mode="auto",
+    )
+
+    # Advance to CODING. Auto mode confirms planning stages.
+    await oc.tick(project.id)  # requirements
+    await oc.tick(project.id)  # requirements confirm
+    await oc.tick(project.id)  # architecture
+    await oc.tick(project.id)  # architecture confirm
+    await oc.tick(project.id)  # specs
+    await oc.tick(project.id)  # specs confirm -> CODING
+
+    project = service.get_project(project.id)
+    assert project.current_state == "CODING"
+
+    await service.create_pending_user_input(
+        project_id=project.id,
+        sender_id="ou_123",
+        observed_state="CODING",
+        content="这里写错了",
+        kind="correction",
+    )
+
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "CLARIFICATION_PENDING"
+
+
+@pytest.mark.asyncio
+async def test_resume_applies_paused_agent_result(orchestrator):
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "planner": {
+            "success": True,
+            "next_state_event": "complete",
+            "summary": "paused plan",
+            "goals": ["实现 CLI"],
+            "acceptance_criteria": ["测试通过"],
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 config-validator CLI",
+        approval_mode="normal",
+    )
+
+    # Manually stash a paused agent result and set project paused.
+    task = await service.create_task(
+        project_id=project.id,
+        agent_type="planner",
+        state="PLANNING_REQUIREMENTS",
+        input_data={},
+    )
+    await service.start_task(task.id, str(Path(project.workspace_path) / "worktrees" / "wt"))
+    await service.complete_task(task.id, {"success": True, "next_state_event": "complete"})
+
+    project = service.require_project(project.id)
+    project.status = "paused"
+    project.context = {
+        **project.context,
+        "paused_agent_result": {
+            "task_id": task.id,
+            "state": "PLANNING_REQUIREMENTS",
+            "output": {"success": True, "next_state_event": "complete"},
+            "worktree_path": str(Path(project.workspace_path) / "worktrees" / "wt"),
+        },
+    }
+    service.session.commit()
+
+    await service.resume_project(project.id)
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "REQUIREMENT_CONFIRM_PENDING"
+    assert "paused_agent_result" not in updated.context

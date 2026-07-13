@@ -66,6 +66,8 @@ class PromptRenderer:
         task_id: str | None = None,
         output_schema_path: str | None = None,
         rejection_note: str = "",
+        open_feedback: list[dict] | None = None,
+        round_number: int = 1,
     ) -> str:
         agent_cfg = self.get_agent_config(agent_type)
         stage_cfg = self.get_stage_config(agent_type, stage)
@@ -96,6 +98,8 @@ class PromptRenderer:
             "workspace_path": str(project.workspace_path),
             "context_files": context_files_md,
             "rejection_note": rejection_note or "无",
+            "round_number": round_number,
+            "open_feedback_count": len(open_feedback) if open_feedback else 0,
         }
 
         prompt = self._replace_variables(template, variables)
@@ -106,6 +110,21 @@ class PromptRenderer:
             prompt += (
                 "\n\n## 用户驳回反馈（必须纳入本次输出）\n\n"
                 f"用户针对上一版结果提出了以下修改意见，请在本次输出中充分体现：\n\n{rejection_note}\n"
+            )
+
+        # Surface open feedback packets so agents can address them and report
+        # which ones they believe have been resolved.
+        if open_feedback:
+            prompt += "\n\n## 待解决的反馈（必须在本次输出中处理或回应）\n\n"
+            for idx, fb in enumerate(open_feedback, start=1):
+                target = fb.get("recommended_rework_target") or "未指定"
+                prompt += (
+                    f"{idx}. [{fb.get('source_stage')}] {fb.get('summary')}"
+                    f"（建议回退目标：{target}）\n"
+                )
+            prompt += (
+                "\n请在输出中说明每条反馈是否已解决；"
+                "如已解决，请在 `verified_feedback_ids` 中填入对应 feedback_id。\n"
             )
 
         return prompt

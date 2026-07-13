@@ -218,7 +218,9 @@ class MacApiClient:
         self.base_url = base_url.rstrip("/")
         self.dry_run = dry_run
         # Ticks can run the orchestrator for a while; allow up to 5 minutes.
-        self._client = httpx.AsyncClient(timeout=300.0)
+        # Trust env is disabled so macOS system HTTP proxies do not intercept
+        # localhost traffic and break status polling.
+        self._client = httpx.AsyncClient(timeout=300.0, trust_env=False)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -226,9 +228,21 @@ class MacApiClient:
     async def get_status(self, project_id: str) -> dict[str, Any]:
         if self.dry_run:
             return {"current_state": "DRYRUN", "pending_approval": None}
-        resp = await self._client.get(f"{self.base_url}/projects/{project_id}/status")
-        resp.raise_for_status()
-        return resp.json()
+        # The API may briefly become unresponsive while an agent tick is running;
+        # retry a few times before giving up.
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            try:
+                resp = await self._client.get(
+                    f"{self.base_url}/projects/{project_id}/status",
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as exc:
+                last_exc = exc
+                await asyncio.sleep(1.0 * (attempt + 1))
+        raise last_exc or RuntimeError("Failed to get project status")
 
     async def create_project(self, **fields: Any) -> dict[str, Any]:
         if self.dry_run:
@@ -260,14 +274,27 @@ class MacApiClient:
     async def clear_pending_intent(self, open_id: str) -> dict[str, Any]:
         if self.dry_run:
             return {"status": "ok"}
-        resp = await self._client.post(
-            f"{self.base_url}/test/clear_pending_intent/{open_id}",
-        )
-        # Ignore 404 if the endpoint is not present; best-effort cleanup.
-        if resp.status_code == 404:
-            return {"status": "skipped"}
-        resp.raise_for_status()
-        return resp.json()
+        # Best-effort cleanup; the test endpoint may be disabled or the server
+        # may be briefly unresponsive between ticks.
+        for attempt in range(5):
+            try:
+                resp = await self._client.post(
+                    f"{self.base_url}/test/clear_pending_intent/{open_id}",
+                    timeout=15.0,
+                )
+                if resp.status_code == 404:
+                    return {"status": "skipped"}
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (404,):
+                    return {"status": "skipped"}
+                eprint(f"  [warn] clear_pending_intent HTTP {exc.response.status_code}, retry {attempt + 1}")
+                await asyncio.sleep(1.0 * (attempt + 1))
+            except Exception as exc:
+                eprint(f"  [warn] clear_pending_intent failed: {exc}, retry {attempt + 1}")
+                await asyncio.sleep(1.0 * (attempt + 1))
+        return {"status": "skipped"}
 
     async def tick(self, project_id: str) -> dict[str, Any]:
         if self.dry_run:
@@ -302,7 +329,12 @@ async def tick_until_state(
     for _ in range(max_ticks):
         if time.monotonic() >= deadline:
             return None
-        status = await ctx.mac.get_status(project_id)
+        try:
+            status = await ctx.mac.get_status(project_id)
+        except Exception as exc:
+            eprint(f"  [warn] get_status failed, retrying: {exc}")
+            await asyncio.sleep(interval)
+            continue
         if status["current_state"] == state:
             return status
         eprint(f"  [tick] {status['current_state']} -> ...")
@@ -317,7 +349,11 @@ async def tick_until_state(
         poll_deadline = time.monotonic() + 10.0
         while time.monotonic() < poll_deadline:
             await asyncio.sleep(interval)
-            status = await ctx.mac.get_status(project_id)
+            try:
+                status = await ctx.mac.get_status(project_id)
+            except Exception as exc:
+                eprint(f"  [warn] get_status failed, retrying: {exc}")
+                continue
             if status["current_state"] == state:
                 eprint(f"  [tick] -> {status['current_state']}")
                 return status
@@ -340,7 +376,12 @@ async def wait_for_state(
         }
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        status = await ctx.mac.get_status(project_id)
+        try:
+            status = await ctx.mac.get_status(project_id)
+        except Exception as exc:
+            eprint(f"  [warn] get_status failed, retrying: {exc}")
+            await asyncio.sleep(interval)
+            continue
         if status["current_state"] == state:
             return status
         await asyncio.sleep(interval)
@@ -361,7 +402,12 @@ async def wait_for_pending_approval(
         }
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        status = await ctx.mac.get_status(project_id)
+        try:
+            status = await ctx.mac.get_status(project_id)
+        except Exception as exc:
+            eprint(f"  [warn] get_status failed, retrying: {exc}")
+            await asyncio.sleep(interval)
+            continue
         if status.get("pending_approval"):
             return status
         await asyncio.sleep(interval)
@@ -381,9 +427,14 @@ async def tick_until_pending(
         }
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        status = await ctx.mac.get_status(project_id)
-        if status.get("pending_approval"):
-            return status
+        try:
+            status = await ctx.mac.get_status(project_id)
+            if status.get("pending_approval"):
+                return status
+        except Exception as exc:
+            eprint(f"  [warn] get_status failed, retrying: {exc}")
+            await asyncio.sleep(2.0)
+            continue
         try:
             await ctx.mac.tick(project_id)
         except httpx.HTTPStatusError:
@@ -393,7 +444,11 @@ async def tick_until_pending(
         poll_deadline = time.monotonic() + 15.0
         while time.monotonic() < poll_deadline:
             await asyncio.sleep(2.0)
-            status = await ctx.mac.get_status(project_id)
+            try:
+                status = await ctx.mac.get_status(project_id)
+            except Exception as exc:
+                eprint(f"  [warn] get_status failed, retrying: {exc}")
+                continue
             if status.get("pending_approval"):
                 return status
     raise RuntimeError(f"Project {project_id} did not create a pending approval within {timeout}s")
@@ -634,39 +689,41 @@ async def scenario_requirement_confirm(ctx: ScenarioContext) -> None:
 
 
 async def scenario_requirement_reject(ctx: ScenarioContext) -> None:
-    """7. Reject the requirement understanding and roll back."""
+    """7. Reject the requirement understanding via /reject and roll back."""
     eprint("Scenario 7: requirement_reject")
-    project = await ctx.mac.create_project(
-        **_project_create_kwargs(
-            ctx,
-            name="req-reject",
-            task_type="feature",
-            description="实现 config-validator CLI",
-            approval_mode="normal",
-        )
+    msg_id = await send_feishu_text(
+        ctx, "/create --type=feature 实现 config-validator CLI"
     )
-    project_id = project["id"]
-    await ctx.mac.tick(project_id)
-    status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
-    if not status or not status.get("pending_approval"):
-        status = await tick_until_pending(ctx, project_id)
-    if status is None or not status.get("pending_approval"):
-        raise RuntimeError("Project did not reach REQUIREMENT_CONFIRM_PENDING with a pending approval")
-    approval_id = status["pending_approval"]["approval_id"]
-    await inject_action(
-        ctx,
-        open_id=ctx.args.open_id,
-        approval_id=approval_id,
-        action="reject",
-        state="REQUIREMENT_CONFIRM_PENDING",
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"已创建项目", after_message_id=msg_id, timeout=120.0
     )
+    if reply is None:
+        raise RuntimeError("MAC bot did not confirm project creation")
+    project_id = extract_project_id(reply.text)
+    if not project_id:
+        raise RuntimeError(f"Could not extract project_id from reply: {reply.text!r}")
+    eprint(f"  created project {project_id}")
+
+    approval_id, _ = await wait_for_next_approval(ctx, after_message_id=reply.message_id)
+    eprint(f"  requirement approval {approval_id}")
+    msg_id = await send_feishu_text(
+        ctx, f"/reject {approval_id} 需求范围太大了，先只做核心功能"
+    )
+
     # The reject handler ticks the orchestrator, which may immediately re-plan
     # and return to REQUIREMENT_CONFIRM_PENDING.  Verify rollback by looking at
     # the recent event log for the REQUIREMENT_CONFIRM_PENDING -> PLANNING_REQUIREMENTS
     # transition.
-    if ctx.dry_run:
-        eprint("  [dry-run] rolled back to PLANNING_REQUIREMENTS")
-        return
+    assert ctx.sim is not None
+    # Wait for the rejection summary / re-plan confirmation card.
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"反馈汇总|重新设计|第.*轮", after_message_id=msg_id, timeout=120.0
+    )
+    if reply is None:
+        eprint("  [warn] did not see rejection feedback card")
     status = await ctx.mac.get_status(project_id)
     rolled_back = any(
         "REQUIREMENT_CONFIRM_PENDING -> PLANNING_REQUIREMENTS" in e.get("message", "")
@@ -882,70 +939,169 @@ async def scenario_api_message_and_decision(ctx: ScenarioContext) -> None:
     eprint(f"  state after message: {status['current_state']}")
 
 
+async def wait_for_next_approval(
+    ctx: ScenarioContext,
+    after_message_id: str | None = None,
+    timeout: float = 300.0,
+) -> tuple[str, FeishuMessage]:
+    """Wait for the bot to send a card containing an approval id."""
+    # Real coding/rework rounds can legitimately run until the configured
+    # 20-minute Agent timeout. The full flow must not fail at 10 minutes while
+    # the task is still healthy and deliver its approval moments later.
+    if ctx.args.scenario == "full_feature_flow":
+        timeout = max(timeout, 1500.0)
+    if ctx.dry_run:
+        return "appr_dryrun", FeishuMessage("msg_dryrun", "", "")
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"审批ID.*appr_",
+        after_message_id=after_message_id,
+        timeout=timeout,
+    )
+    if reply is None:
+        raise RuntimeError("Did not receive an approval card from MAC bot")
+    approval_id = extract_approval_id(reply.text)
+    if not approval_id:
+        raise RuntimeError(f"Could not extract approval_id from reply: {reply.text!r}")
+    return approval_id, reply
+
+
 async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
-    """14. Walk a feature project through requirements->specs->coding->acceptance."""
-    eprint("Scenario 14: full_feature_flow")
-    project = await ctx.mac.create_project(
-        **_project_create_kwargs(
-            ctx,
-            name="full-flow",
-            task_type="feature",
-            description="实现一个 Todo List CLI",
-            approval_mode="normal",
+    """14. Drive a feature project through all stages with full branch coverage.
+
+    Branch coverage:
+    - Requirement:  reject → re-plan → confirm
+    - Architecture: select_option → re-plan → confirm
+    - Spec:         reject → re-plan → confirm
+    - Coding:       reject → REWORK → to_coding → re-plan → confirm
+    - Testing:      reject → REWORK → to_testing → re-plan → confirm
+    - Review:       reject → REWORK → to_coding → re-plan → confirm
+    - Acceptance:   reject → REWORK → to_requirements → full replay → COMPLETED
+    """
+    eprint("Scenario 14: full_feature_flow (with full branch coverage)")
+    msg_id = await send_feishu_text(
+        ctx, "/create --type=feature 实现一个 Todo List CLI"
+    )
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"已创建项目", after_message_id=msg_id, timeout=120.0
+    )
+    if reply is None:
+        raise RuntimeError("MAC bot did not confirm project creation")
+    project_id = extract_project_id(reply.text)
+    if not project_id:
+        raise RuntimeError(f"Could not extract project_id from reply: {reply.text!r}")
+    eprint(f"  created project {project_id}")
+
+    # ── 1. Requirements: reject then confirm ──────────────────────────────
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=reply.message_id)
+    eprint(f"  requirement approval {approval_id} (will reject)")
+    msg_id = await send_feishu_text(
+        ctx, f"/reject {approval_id} 需求描述过于笼统，需要补充具体的功能列表和非功能性要求"
+    )
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  requirement re-approval {approval_id} (now confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+    # ── 2. Architecture: reject then confirm ──────────────────────────
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  architecture approval {approval_id} (will reject)")
+    msg_id = await send_feishu_text(
+        ctx, f"/reject {approval_id} 技术方案缺少备选方案对比和选型理由"
+    )
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  architecture re-approval {approval_id} (now confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+    # ── 3. Spec: reject then confirm ──────────────────────────────────────
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  spec approval {approval_id} (will reject)")
+    msg_id = await send_feishu_text(
+        ctx, f"/reject {approval_id} Spec 未覆盖边界条件和异常场景"
+    )
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  spec re-approval {approval_id} (now confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+    # ── 4. Coding: confirm → reject → REWORK → to_coding → re-run ─────
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  coding approval {approval_id} (will reject)")
+    msg_id = await send_feishu_text(
+        ctx, f"/reject {approval_id} 代码缺少单元测试和错误处理"
+    )
+    # After reject → REWORK, wait for REWORK selection card
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  coding rework approval {approval_id} (select to_coding)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} to_coding")
+    # Coder re-runs, lands in CODING_CONFIRM_PENDING
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  coding re-approval {approval_id} (now confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+    # ── 5. Testing: reject → REWORK → to_testing → re-run ──────────────
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  testing approval {approval_id} (will reject)")
+    msg_id = await send_feishu_text(
+        ctx, f"/reject {approval_id} 测试用例未覆盖边界值和异常输入"
+    )
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  testing rework approval {approval_id} (select to_testing)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} to_testing")
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  testing re-approval {approval_id} (now confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+    # ── 6. Review: reject → REWORK → to_coding → re-run ────────────────
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  review approval {approval_id} (will reject)")
+    msg_id = await send_feishu_text(
+        ctx, f"/reject {approval_id} 存在硬编码配置项，需要抽取为配置参数"
+    )
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  review rework approval {approval_id} (select to_coding)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} to_coding")
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  post-review coding approval {approval_id} (confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  post-review testing approval {approval_id} (confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  review re-approval {approval_id} (now confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+    # ── 7. Acceptance: reject → REWORK → to_requirements → full replay ──
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  acceptance approval {approval_id} (will reject to_requirements)")
+    msg_id = await send_feishu_text(
+        ctx, f"/reject {approval_id} 需求分析不够全面，缺少用户权限和数据持久化的规划"
+    )
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  acceptance rework approval {approval_id} (select to_requirements)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} to_requirements")
+
+    # Full replay: requirements → architecture → specs → coding → testing → review → acceptance
+    for stage_label in ("replay-requirement", "replay-architecture", "replay-spec",
+                        "replay-coding", "replay-testing", "replay-review"):
+        approval_id, reply = await wait_for_next_approval(
+            ctx, after_message_id=msg_id, timeout=600.0
         )
-    )
-    project_id = project["id"]
+        eprint(f"  {stage_label} approval {approval_id} (confirm)")
+        msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
-    # Requirements -> Architecture
-    status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
-    if not status or not status.get("pending_approval"):
-        status = await tick_until_pending(ctx, project_id)
-    if status is None or not status.get("pending_approval"):
-        raise RuntimeError("Project did not receive a pending approval at requirements")
-    await inject_action(
-        ctx,
-        open_id=ctx.args.open_id,
-        approval_id=status["pending_approval"]["approval_id"],
-        action="confirm",
-        state="REQUIREMENT_CONFIRM_PENDING",
-    )
+    # Final acceptance → COMPLETED
+    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  final acceptance approval {approval_id} (confirm)")
+    msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
-    # Architecture -> Specs
-    status = await wait_for_state(ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", timeout=500.0)
+    status = await wait_for_state(ctx, project_id, "COMPLETED", timeout=1500.0)
     if status is None:
-        raise RuntimeError("Project did not reach ARCHITECTURE_CONFIRM_PENDING")
-    if not status.get("pending_approval"):
-        status = await tick_until_pending(ctx, project_id)
-    if status is None or not status.get("pending_approval"):
-        raise RuntimeError("Project did not receive a pending approval at architecture")
-    await inject_action(
-        ctx,
-        open_id=ctx.args.open_id,
-        approval_id=status["pending_approval"]["approval_id"],
-        action="confirm",
-        state="ARCHITECTURE_CONFIRM_PENDING",
-    )
-
-    # Specs -> Coding
-    status = await wait_for_state(ctx, project_id, "SPEC_CONFIRM_PENDING", timeout=500.0)
-    if status is None:
-        raise RuntimeError("Project did not reach SPEC_CONFIRM_PENDING")
-    if not status.get("pending_approval"):
-        status = await tick_until_pending(ctx, project_id)
-    if status is None or not status.get("pending_approval"):
-        raise RuntimeError("Project did not receive a pending approval at specs")
-    await inject_action(
-        ctx,
-        open_id=ctx.args.open_id,
-        approval_id=status["pending_approval"]["approval_id"],
-        action="confirm",
-        state="SPEC_CONFIRM_PENDING",
-    )
-
-    # Coding -> Testing -> Review -> Acceptance (requires multiple ticks)
-    status = await tick_until_state(ctx, project_id, "ACCEPTANCE_PENDING", timeout=600.0)
-    if status is None:
-        raise RuntimeError("Project did not reach ACCEPTANCE_PENDING")
+        status = await ctx.mac.get_status(project_id)
+        raise RuntimeError(
+            f"Project did not complete (current={status.get('current_state')})"
+        )
     eprint(f"  reached {status['current_state']}")
 
 

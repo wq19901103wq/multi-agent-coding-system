@@ -3,9 +3,30 @@
   "$id": "https://mac-system.local/schemas/architecture.json",
   "title": "ARCHITECTURE.json",
   "type": "object",
-  "required": ["summary", "tech_stack", "modules", "decisions"],
+  "required": ["artifact_id", "version", "round", "status", "summary", "tech_stack", "modules", "decisions", "invariants", "failure_modes"],
   "additionalProperties": false,
   "properties": {
+    "artifact_id": {"const": "architecture"},
+    "version": {"type": "integer", "minimum": 1},
+    "round": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["draft", "pending_confirmation", "confirmed", "stale", "superseded", "rejected"]},
+    "based_on_requirement_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "content_hash": {"type": "string"},
+    "supersedes_round": {"type": ["integer", "null"], "minimum": 1},
+    "open_questions": {"type": "array", "items": {"type": "string"}},
+    "resolved_questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["question", "answer", "source_input_id"],
+        "additionalProperties": false,
+        "properties": {
+          "question": {"type": "string"},
+          "answer": {"type": "string"},
+          "source_input_id": {"type": "string"}
+        }
+      }
+    },
     "summary": {"type": "string"},
     "tech_stack": {
       "type": "array",
@@ -31,10 +52,12 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "topic", "options", "recommended", "reason"],
+        "required": ["id", "topic", "options", "recommended", "reason", "affected_requirement_ids", "affected_acceptance_criterion_ids"],
         "additionalProperties": false,
         "properties": {
           "id": {"type": "string"},
+          "affected_requirement_ids": {"type": "array", "items": {"type": "string"}},
+          "affected_acceptance_criterion_ids": {"type": "array", "items": {"type": "string"}},
           "topic": {"type": "string"},
           "options": {
             "type": "array",
@@ -51,7 +74,9 @@
             }
           },
           "recommended": {"type": "string"},
-          "reason": {"type": "string"}
+          "reason": {"type": "string"},
+          "constraints": {"type": "array", "items": {"type": "string"}},
+          "revisit_when": {"type": "array", "items": {"type": "string"}}
         }
       }
     },
@@ -63,6 +88,56 @@
       "type": "array",
       "items": {"type": "string"}
     },
+    "data_models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "owner", "fields", "invariants"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "owner": {"type": "string"},
+          "fields": {"type": "array", "items": {"type": "string"}},
+          "invariants": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "interfaces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "producer", "consumer", "contract"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "kind": {"enum": ["api", "event", "command", "file", "database"]},
+          "producer": {"type": "string"},
+          "consumer": {"type": "string"},
+          "contract": {"type": "string"},
+          "idempotency_key": {"type": "string"},
+          "error_contract": {"type": "string"}
+        }
+      }
+    },
+    "invariants": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "failure_modes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["scenario", "detection", "recovery"],
+        "additionalProperties": false,
+        "properties": {
+          "scenario": {"type": "string"},
+          "detection": {"type": "string"},
+          "recovery": {"type": "string"}
+        }
+      }
+    },
+    "security_boundaries": {"type": "array", "items": {"type": "string"}},
+    "observability": {"type": "array", "items": {"type": "string"}},
+    "migration_plan": {"type": "array", "items": {"type": "string"}},
+    "rollback_plan": {"type": "array", "items": {"type": "string"}},
     "resolved_decisions": {
       "type": "array",
       "items": {

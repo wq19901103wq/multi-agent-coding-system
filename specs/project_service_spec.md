@@ -86,6 +86,16 @@ class ProjectService:
     ) -> Approval:
         """记录用户对审批的响应。"""
 
+    async def resolve_approval(
+        self,
+        approval_id: str,
+        action: str,
+        responded_by: str,
+        expected_state: str,
+        payload: dict | None = None,
+    ) -> Project:
+        """原子校验并响应审批、失效旧审批、转换项目状态。"""
+
     async def log_event(
         self,
         project_id: str,
@@ -125,6 +135,33 @@ class ProjectService:
 4. 若事件非法：
    - 抛出 `InvalidStateTransitionError`
    - 状态不变
+
+## 一致性与幂等约束
+
+1. 数据库中的 `Project`、`Task`、`Approval` 和用户输入记录是控制层真相源；`STATE.json` 是可重建快照。
+2. 同一项目最多一个 `status=pending` 的 Approval。创建前若同状态已有 pending 记录则复用；不同状态的旧记录标记为 `expired`。
+3. `resolve_approval` 在一个事务内校验 approval 状态、项目当前状态和允许 action，然后同时提交 approval 响应与状态转换。
+4. 重复请求不得二次转换；服务返回第一次处理后的项目状态和 `already_resolved=true`。
+5. 每次状态转换都带 `expected_current_state` 或状态版本号，防止旧 Agent、旧卡片覆盖新状态。
+6. `STATE.json` 在事务成功后以临时文件加原子 rename 刷新；写入失败记录恢复事件，服务启动时从数据库重建。
+
+## PendingUserInput
+
+ProjectService 提供创建、查询和消费中途输入的接口。输入只追加、不覆盖，至少保存发送者、原始内容、观察到的状态、分类、处理状态、消费 Task 和时间戳。取消项目后到达的输入保留审计记录但标记为 `ignored_cancelled`。
+
+## 会话路由接口
+
+ProjectService 或独立 ConversationService 提供：
+
+```python
+bind_project_user(project_id, open_id, role)
+bind_project_chat(project_id, chat_id, chat_type, relation, notification_level)
+set_active_project(chat_id, open_id, project_id | None)
+resolve_message_project(chat_id, open_id, explicit_project_id=None) -> Project | Ambiguous
+list_projects_for_context(chat_id, open_id) -> list[Project]
+```
+
+权限关系、聊天订阅和 active context 分开持久化。`resolve_message_project` 不得回退到“用户最近更新项目”；无唯一上下文时返回 Ambiguous，由交互层展示选择卡片。
 
 ## ID 生成规则
 

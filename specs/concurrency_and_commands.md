@@ -35,6 +35,14 @@ MAX_CONCURRENT_AGENT_EXECUTIONS = 2  # 默认同时最多 2 个 Agent
 
 用户可通过飞书或 API 发送命令。命令以 `/` 开头。
 
+### `/use {project_id}` 与 `/current`
+
+- `/use` 更新 `(chat_id, open_id)` 的 ChatUserContext，不改变 Project.current_state/status，不中断正在运行的 Agent。
+- `/current` 只读返回当前上下文。
+- 卡片 approval_id 和显式 project_id 不受当前上下文切换影响。
+- pending user input 在创建时已固化 project_id，切换后不得迁移到新项目。
+- 群聊中上下文按用户隔离；不同成员切换项目互不影响。
+
 ### `/pause {project_id}`
 
 - **触发**：用户要求暂停项目
@@ -116,6 +124,39 @@ t3: Coder Agent 执行完成，输出 complete
 t4: Orchestrator 检查到 Project.status == PAUSED
 t5: Orchestrator 丢弃 Coder 输出，发送「已暂停」消息
 ```
+
+## 中途自由文本队列
+
+Agent 运行期间收到的非命令文本不得直接注入正在运行的进程，也不得当作普通闲聊丢弃。系统写入持久化 `pending_user_inputs`：
+
+```json
+{
+  "input_id": "input_...",
+  "project_id": "proj_...",
+  "sender_id": "ou_...",
+  "observed_state": "CODING",
+  "content": "补充：Windows 路径也必须支持",
+  "kind": "scope_change",
+  "status": "pending",
+  "created_at": "...",
+  "consumed_by_task_id": null
+}
+```
+
+消费规则：
+
+1. 控制命令优先于自由文本；`cancel > rollback > pause > approval response > feedback > question`。
+2. Agent 完成后、merge 和 transition 前重新查询队列。
+3. `scope_change` / `correction` 阻止自动确认并进入 `REWORK`；`question` 可由 project_manager 回答，但不得改变已确认范围。
+4. 多条输入按 `created_at, input_id` 顺序处理，成功处理后记录消费 Task，不物理删除。
+5. 服务重启后从数据库继续消费，不能依赖内存队列。
+
+## Approval 与自动确认竞态
+
+- 每项目最多一个 pending approval；重复 tick 复用该 approval，不重复发卡。
+- 自动确认只适用于 Agent 已明确 pass 的质量门。
+- 自动确认与用户响应通过条件更新 `WHERE status='pending'` 竞争；更新行数为 0 的一方读取最终结果并返回幂等响应。
+- pause、rollback 或新 scope-change feedback 到达后，应取消该轮自动确认资格，即使自动任务已排队。
 
 ## 飞书消息命令解析
 

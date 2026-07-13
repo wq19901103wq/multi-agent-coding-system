@@ -1,4 +1,6 @@
+import asyncio
 from contextlib import asynccontextmanager
+import logging
 from typing import Any
 
 from datetime import datetime, timezone
@@ -25,20 +27,76 @@ from mac_system.models import ProjectCreate, ProjectOut
 from mac_system.state_machine import StateMachine
 
 from mac_system.api import admin_routes, feishu_routes
-from mac_system.api.dependencies import get_orchestrator, get_project_service
+from mac_system.api.dependencies import (
+    _build_orchestrator,
+    get_orchestrator,
+    get_project_service,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _confirmation_source_stage(confirmation_state: str) -> str:
+    """Map a human-confirmation state back to the agent stage that produced it."""
+    return {
+        "REQUIREMENT_CONFIRM_PENDING": "PLANNING_REQUIREMENTS",
+        "ARCHITECTURE_CONFIRM_PENDING": "PLANNING_ARCHITECTURE",
+        "SPEC_CONFIRM_PENDING": "PLANNING_SPECS",
+        "BUG_FIX_CONFIRM_PENDING": "BUG_ANALYSIS",
+        "OUTLINE_CONFIRM_PENDING": "DOC_OUTLINE",
+        "CODING_CONFIRM_PENDING": "CODING",
+        "TESTING_CONFIRM_PENDING": "TESTING",
+        "REVIEW_CONFIRM_PENDING": "REVIEW",
+        "ACCEPTANCE_PENDING": "ACCEPTANCE",
+    }.get(confirmation_state, confirmation_state)
+
+
+async def _resume_recovered_project(project_id: str) -> None:
+    """Restart one interrupted agent state through the normal tick path."""
+    with session_scope() as session:
+        service = ProjectService(session)
+        project = service.get_project(project_id)
+        if project is None or project.status != "active":
+            return
+        state_machine = StateMachine(project.task_type)
+        if state_machine.state_type(project.current_state) != "agent_execution":
+            return
+
+        orchestrator = _build_orchestrator(session)
+        try:
+            await orchestrator.tick(project_id)
+            await service.log_event(
+                project_id=project_id,
+                level="INFO",
+                message="Interrupted agent task rescheduled after service restart",
+                meta={"state": project.current_state},
+            )
+        except Exception as exc:
+            logger.exception("Failed to resume project %s after restart", project_id)
+            await service.log_event(
+                project_id=project_id,
+                level="ERROR",
+                message=f"Failed to resume interrupted agent task: {exc}",
+                meta={"state": project.current_state},
+            )
+        finally:
+            bridge = orchestrator.feishu_bridge
+            if bridge is not None:
+                await bridge.close()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    recovered_project_ids: set[str] = set()
     with session_scope() as session:
         service = ProjectService(session)
         recovered = service.recover_stale_tasks()
         if recovered:
-            import logging
-
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "Recovered %d stale running tasks as failed", len(recovered)
             )
+            recovered_project_ids = {task.project_id for task in recovered}
     settings = get_settings()
     ws_client: FeishuWebSocketClient | None = None
     if (
@@ -48,9 +106,21 @@ async def lifespan(app: FastAPI):
     ):
         ws_client = FeishuWebSocketClient()
         ws_client.start()
+    recovery_tasks = {
+        asyncio.create_task(
+            _resume_recovered_project(project_id),
+            name=f"resume-{project_id}",
+        )
+        for project_id in recovered_project_ids
+    }
     try:
         yield
     finally:
+        for task in recovery_tasks:
+            if not task.done():
+                task.cancel()
+        if recovery_tasks:
+            await asyncio.gather(*recovery_tasks, return_exceptions=True)
         if ws_client is not None:
             ws_client.stop()
 
@@ -153,23 +223,36 @@ async def submit_decision(
         )
 
     try:
-        approval = await service.respond_approval(
+        approval = service.get_approval(req.approval_id)
+    except ApprovalNotFoundError:
+        raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
+
+    if req.action == "reject" and req.message:
+        source_stage = _confirmation_source_stage(approval.state)
+        await service.create_feedback_packet(
+            project_id=project_id,
+            source_stage=source_stage,
+            source_task_id=approval.task_id,
+            source_round=approval.payload.get("round_number", 1),
+            kind="human_rejection",
+            summary=req.message,
+            blocking=True,
+            failure_class="human_rejection",
+            user_comment=req.message,
+            commit=False,
+        )
+
+    try:
+        approval, project = await service.resolve_approval(
             approval_id=req.approval_id,
-            response=req.action,
+            event=req.action,
             responded_by="api_user",
+            payload={"message": req.message} if req.message else None,
         )
     except ApprovalNotFoundError:
         raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-    try:
-        project = await service.transition_state(
-            project_id=project_id,
-            event=req.action,
-            payload={"message": req.message} if req.message else None,
-            triggered_by="user",
-        )
     except ProjectNotFoundError:
         raise HTTPException(status_code=404, detail="PROJECT_NOT_FOUND")
     except InvalidStateTransitionError as e:
@@ -229,19 +312,17 @@ async def _process_user_message(project_id: str, content: str) -> None:
                 if suggested_action == "answer" and pending_approval["type"] == "input":
                     answer = output.get("clarification_answer") or content
                     approval = service.get_approval(pending_approval["approval_id"])
-                    await service.respond_approval(approval.id, "answer", "api_user")
-                    await service.transition_state(
-                        project_id,
+                    await service.resolve_approval(
+                        approval.id,
                         "answer",
+                        responded_by="api_user",
                         payload={"clarification_answer": answer},
-                        triggered_by="user",
                     )
                     await orchestrator.tick(project_id)
                 elif suggested_action in valid_actions:
                     approval = service.get_approval(pending_approval["approval_id"])
-                    await service.respond_approval(approval.id, suggested_action, "api_user")
-                    await service.transition_state(
-                        project_id, suggested_action, triggered_by="user"
+                    await service.resolve_approval(
+                        approval.id, suggested_action, responded_by="api_user"
                     )
                     await orchestrator.tick(project_id)
         finally:
@@ -293,19 +374,17 @@ async def submit_message(
             if suggested_action == "answer" and pending_approval["type"] == "input":
                 answer = output.get("clarification_answer") or req.content
                 approval = service.get_approval(pending_approval["approval_id"])
-                await service.respond_approval(approval.id, "answer", "api_user")
-                await service.transition_state(
-                    project_id,
+                await service.resolve_approval(
+                    approval.id,
                     "answer",
+                    responded_by="api_user",
                     payload={"clarification_answer": answer},
-                    triggered_by="user",
                 )
                 await orchestrator.tick(project_id)
             elif suggested_action in valid_actions:
                 approval = service.get_approval(pending_approval["approval_id"])
-                await service.respond_approval(approval.id, suggested_action, "api_user")
-                await service.transition_state(
-                    project_id, suggested_action, triggered_by="user"
+                await service.resolve_approval(
+                    approval.id, suggested_action, responded_by="api_user"
                 )
                 await orchestrator.tick(project_id)
         return UserMessageResponse(
@@ -405,6 +484,18 @@ class InjectCardActionRequest(BaseModel):
     extras: dict[str, Any] = Field(default_factory=dict)
 
 
+async def _run_inject_card_action(action: ButtonAction) -> None:
+    """Run an injected card action in a fresh DB session/orchestrator."""
+    with session_scope() as session:
+        orchestrator = _build_orchestrator(session)
+        ctx = FeishuHandlerContext(
+            bridge=orchestrator.feishu_bridge or NullFeishuBridge(),
+            service=orchestrator.project_service,
+            orchestrator=orchestrator,
+        )
+        await handle_card_action(ctx, action)
+
+
 @app.post("/test/inject_card_action")
 async def inject_card_action(
     req: InjectCardActionRequest,
@@ -415,16 +506,16 @@ async def inject_card_action(
     This lets an automated end-to-end driver "click" approval/menu cards
     without a real Feishu user interaction.  It is disabled unless
     ``FEISHU_TEST_MODE`` is enabled.
+
+    For production runtimes the card action is executed in the background so
+    the HTTP request does not block for minutes while the orchestrator ticks
+    through agent executions.  FakeRuntime tests still run synchronously so
+    assertions on the immediate state continue to work.
     """
     settings = get_settings()
     if not settings.feishu_test_mode:
         raise HTTPException(status_code=404, detail="NOT_FOUND")
 
-    ctx = FeishuHandlerContext(
-        bridge=orchestrator.feishu_bridge or NullFeishuBridge(),
-        service=orchestrator.project_service,
-        orchestrator=orchestrator,
-    )
     action = ButtonAction(
         open_id=req.open_id,
         approval_id=req.approval_id,
@@ -436,13 +527,24 @@ async def inject_card_action(
         chat_id=req.chat_id,
         chat_type=req.chat_type,
     )
-    try:
-        await handle_card_action(ctx, action)
-    except Exception as exc:
-        import logging
 
-        logging.getLogger(__name__).exception("inject_card_action failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"inject_card_action failed: {exc}")
+    if isinstance(orchestrator.runtime, FakeRuntime):
+        ctx = FeishuHandlerContext(
+            bridge=orchestrator.feishu_bridge or NullFeishuBridge(),
+            service=orchestrator.project_service,
+            orchestrator=orchestrator,
+        )
+        try:
+            await handle_card_action(ctx, action)
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception("inject_card_action failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"inject_card_action failed: {exc}")
+        return {"status": "ok"}
+
+    # Real runtimes: kick off the action in the background and return immediately.
+    asyncio.create_task(_run_inject_card_action(action))
     return {"status": "ok"}
 
 

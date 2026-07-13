@@ -1,8 +1,9 @@
+import json
 from pathlib import Path
 
 import pytest
 
-from mac_system.agents.runtime import ClaudeCodeRuntime, FakeRuntime, ToolExecutionError
+from mac_system.agents.runtime import ClaudeCodeRuntime, FakeRuntime
 
 
 def test_build_claude_command():
@@ -108,79 +109,46 @@ async def test_fake_runtime():
     assert result.output_json["next_state_event"] == "complete"
 
 
-def test_tool_bash_runs_command(tmp_path):
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    result = runtime._tool_bash({"command": "echo hello world"}, cwd=tmp_path)
-    assert "hello world" in result
-
-
-def test_tool_bash_empty_command(tmp_path):
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    with pytest.raises(ToolExecutionError):
-        runtime._tool_bash({"command": ""}, cwd=tmp_path)
-
-
-def test_tool_bash_failure(tmp_path):
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    with pytest.raises(ToolExecutionError) as exc_info:
-        runtime._tool_bash(
-            {"command": "python3 -c 'import sys; sys.exit(42)'"}, cwd=tmp_path
-        )
-    assert "42" in str(exc_info.value)
-
-
-def test_tool_bash_no_shell_injection(tmp_path):
-    """Shell metacharacters should be treated as arguments, not executed."""
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    # If this were run with shell=True, the touch command after the semicolon
-    # would create a file. With shell=False it is just an argument to echo.
-    marker = tmp_path / "injected_marker"
-    result = runtime._tool_bash(
-        {"command": f"echo safe; touch {marker}"}, cwd=tmp_path
+@pytest.mark.asyncio
+async def test_stream_tool_use_is_observed_but_not_executed(tmp_path):
+    """Large tool events are read fully but never executed by Runtime."""
+    target = tmp_path / "runtime_must_not_write.txt"
+    fake_cli = tmp_path / "fake-claude"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "sys.stdin.readline()\n"
+        f"tool = {{'type':'assistant','message':{{'content':[{{'type':'tool_use','id':'tool-1','name':'Write','input':{{'file_path':{str(target)!r},'content':'x' * 100000}}}}]}}}}\n"
+        "print(json.dumps(tool), flush=True)\n"
+        "print(json.dumps({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'tool-1','content':'CLI handled it','is_error':False}]},'isReplay':True}), flush=True)\n"
+        "print(json.dumps({'type':'result','is_error':False,'result':'{\\\"success\\\":true,\\\"next_state_event\\\":\\\"complete\\\"}'}), flush=True)\n",
+        encoding="utf-8",
     )
-    assert "safe" in result
-    assert not marker.exists()
+    fake_cli.chmod(0o755)
+    runtime = ClaudeCodeRuntime(fake_cli)
 
+    progress: list[tuple[str, str]] = []
 
-def test_tool_write_inside_worktree(tmp_path):
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    target = tmp_path / "subdir" / "file.txt"
-    runtime._tool_write({"file_path": str(target), "content": "hello"}, cwd=tmp_path)
-    assert target.read_text(encoding="utf-8") == "hello"
+    async def on_progress(event_type: str, content: str) -> None:
+        progress.append((event_type, content))
 
-
-def test_tool_write_outside_worktree(tmp_path):
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    outside = tmp_path.parent / "runtime_outside_write.txt"
-    with pytest.raises(ToolExecutionError):
-        runtime._tool_write({"file_path": str(outside), "content": "x"}, cwd=tmp_path)
-    assert not outside.exists()
-
-
-def test_tool_write_traversal_escape(tmp_path):
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    target = (tmp_path / ".." / "runtime_traversal_write.txt").resolve()
-    with pytest.raises(ToolExecutionError):
-        runtime._tool_write({"file_path": str(target), "content": "x"}, cwd=tmp_path)
-
-
-def test_tool_edit_inside_worktree(tmp_path):
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    target = tmp_path / "file.txt"
-    target.write_text("old content", encoding="utf-8")
-    runtime._tool_edit(
-        {"file_path": str(target), "old_string": "old", "new_string": "new"},
-        cwd=tmp_path,
+    result = await runtime.execute(
+        agent_type="planner",
+        task_prompt="test",
+        system_prompt="system",
+        workspace=tmp_path,
+        worktree=tmp_path,
+        context_files=[],
+        output_schema=tmp_path / "schema.json",
+        allowed_tools=["Write"],
+        readonly_dirs=[],
+        timeout_seconds=5,
+        progress_callback=on_progress,
     )
-    assert target.read_text(encoding="utf-8") == "new content"
 
-
-def test_tool_edit_outside_worktree(tmp_path):
-    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
-    outside = tmp_path.parent / "runtime_outside_edit.txt"
-    outside.write_text("old content", encoding="utf-8")
-    with pytest.raises(ToolExecutionError):
-        runtime._tool_edit(
-            {"file_path": str(outside), "old_string": "old", "new_string": "new"},
-            cwd=tmp_path,
-        )
+    assert result.success
+    assert result.output_json["next_state_event"] == "complete"
+    assert not target.exists()
+    tool_progress = json.loads(next(content for kind, content in progress if kind == "tool"))
+    assert tool_progress["input"]["content_length"] == 100000
+    assert "content" not in tool_progress["input"]

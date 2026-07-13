@@ -178,3 +178,54 @@ Orchestrator 将 `output_schema` 文件路径传给 `claude -p --json-schema`，
 - next_state_event 可选值：complete / fail / clarify / conflict / spec_question
 - 必须列出所有 modified_files
 ```
+## 多轮与反馈输入（v1.1）
+
+所有 planner/coder/tester/reviewer prompt 必须包含当前阶段 `round_number`、本轮基于的产物版本、未消费用户输入和 open feedback packets。
+
+- Planner：逐条引用用户回答的 `input_id`，在产物中区分 open_questions 与 resolved_questions。
+- Coder：逐条处理 Tester/Reviewer/用户反馈，并输出 `addressed_feedback`；不得在未说明的情况下忽略 blocking feedback。
+- Tester：`passed=false` 时必须给出 failure_class、evidence 和 recommended_rework_target；不得把环境故障伪装成实现缺陷。
+- Reviewer：每个 issue 使用稳定 ID，标记 blocking/category；下一轮必须核验 Coder 对旧 feedback 的响应并输出 verified_feedback_ids。
+- 任何 Agent 若发现反馈与已确认上游产物冲突，应请求回退到对应层，不得自行改写需求或 Spec。
+
+## 追踪与交接要求（v1.2）
+
+- Requirements Agent 为每条 requirement 和 acceptance criterion 生成稳定 ID，覆盖功能、安全、可靠性、性能、兼容性、可观测性、成本和数据治理。
+- Architecture Agent 的每个 decision 引用受影响 REQ/AC，并输出数据模型、接口、事务/幂等、失败恢复、安全边界、迁移、回滚和可观测性。
+- Specs Agent 的每项 Spec 引用 REQ/AC/DEC，dependencies 只能引用 Spec ID 且必须无环；每项包含错误场景、测试用例和 Definition of Done。
+- Tester 按 AC 输出 test_evidence，明确 uncovered AC 和 unknown 环境结果；测试命令成功不等于需求覆盖完整。
+- Reviewer 逐 AC 检查覆盖和违背情况，报告 stale artifacts，默认只读，不通过直接修改代码“顺手修复”。
+- Acceptance Evaluator 构建逐 AC 验收矩阵；存在缺失映射、缺少证据、blocking issue、stale artifact、未消费范围变更或 unknown 测试时禁止建议 confirm。
+
+## 所有 Agent 的 ask_user 输出（v1.3）
+
+每个 Agent prompt 都必须声明：信息不足且选择会改变范围、契约、风险、成本或验收结果时，返回 `next_state_event=ask_user`，禁止猜测。Agent 可以在用户回答后继续 ask_user，形成多轮 grill-me。
+
+`questions` 每项至少包含：
+
+```json
+{
+  "question_id": "Q-AGENT-001",
+  "question": "需要用户决定的问题",
+  "reason": "为什么不能由 Agent 唯一推导",
+  "blocking": true,
+  "allow_free_text": true,
+  "options": [
+    {"key": "a", "label": "方案 A", "impact": "影响", "recommended": true},
+    {"key": "b", "label": "方案 B", "impact": "影响", "recommended": false}
+  ],
+  "default_assumption": null,
+  "affected_trace_ids": ["REQ-...", "AC-...", "DEC-...", "SPEC-..."]
+}
+```
+
+Agent 专属触发条件以 `product_requirements.md` 的矩阵为准。Coder/Tester/Reviewer 的回答必须恢复给原 Agent，不得统一交给 Planner。能够从已确认产物或代码唯一推导的问题不应打断用户。
+
+所有 Agent 输出 schema 必须复用同一 `question` 定义，而不是仅在 prompt 文本中约定。约束如下：
+
+- 当 `next_state_event=ask_user` 时，`questions` 必填且至少一项；当事件不是 `ask_user` 时不得携带 blocking question。
+- `question_id` 在同一 task/round 内唯一；重试同一语义问题时沿用幂等键，真正的追问使用新 ID 并通过 `parent_question_id` 关联。
+- `blocking`、`reason`、`allow_free_text`、`options`、`default_assumption` 和 `affected_trace_ids` 由 schema 校验。
+- `success` 表示本轮 Agent 正常形成了“需要提问”的结论，不等同于阶段已完成；Orchestrator 不得因为 `success=true` 跳过 input pending。
+
+Project Manager 的路由选择问题也使用该结构，但不得伪造业务 Agent 的问题或回答。
