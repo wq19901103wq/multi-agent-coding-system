@@ -262,3 +262,58 @@ def build_directory_candidate_card(
         "header": _header("选择要绑定的目录", "blue"),
         "elements": elements,
     }
+
+
+def build_bind_dir_for_create_card(
+    candidates: list[dict[str, str]],
+    description: str,
+    task_type: str,
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Show agent-recommended repos during `/create <description>` flow.
+
+    User picks a candidate -> bind that dir then create the project.
+    User clicks "skip" -> create the project with the system workspace.
+    """
+    elements: list[dict[str, Any]] = []
+    preview = description if len(description) <= 200 else description[:200] + "…"
+    elements.append(
+        {
+            "tag": "div",
+            "text": _lark_md(
+                f"根据你的需求描述，检测到可能匹配的代码目录：\n\n> {preview}\n\n"
+                "选择一个目录绑定后再创建项目，或跳过使用系统工作区。"
+            ),
+        }
+    )
+    actions: list[dict[str, Any]] = []
+    for c in candidates:
+        label = f"{c['name']} ({c['path']})"
+        actions.append(
+            _menu_button(
+                label, f"bind_dir_for_create_select:{c['path']}",
+                chat_id=chat_id, chat_type=chat_type,
+            )
+        )
+    rows: list[dict[str, Any]] = []
+    for i in range(0, len(actions), 2):
+        rows.append({"tag": "action", "actions": actions[i : i + 2]})
+    elements.extend(rows)
+    elements.append(
+        {
+            "tag": "action",
+            "actions": [
+                _menu_button(
+                    "跳过，使用系统工作区", "bind_dir_for_create_skip",
+                    chat_id=chat_id, chat_type=chat_type,
+                ),
+            ],
+        }
+    )
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header(f"为 {task_type} 项目选择目录", "blue"),
+        "elements": elements,
+    }

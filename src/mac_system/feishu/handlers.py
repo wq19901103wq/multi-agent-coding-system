@@ -27,6 +27,7 @@ from mac_system.feishu.card import (
     build_transition_card,
 )
 from mac_system.feishu.menu import (
+    build_bind_dir_for_create_card,
     build_create_prompt_card,
     build_directory_candidate_card,
     build_intent_confirm_card,
@@ -57,6 +58,36 @@ def _reply_target(ctx: FeishuHandlerContext, open_id: str) -> tuple[str, str]:
     if ctx.chat_type == "group" and ctx.chat_id:
         return ctx.chat_id, "chat_id"
     return open_id, "open_id"
+
+
+def _encode_create_state(task_type: str, description: str) -> str:
+    """Encode (task_type, description) into a JSON string for PendingIntent.
+
+    Used by the `/create` flow when we pause to ask the user to pick a bind
+    directory. We can't add a `task_type` column without a schema migration,
+    so we stash it in the existing `description` field as JSON.
+    """
+    return json.dumps(
+        {"task_type": task_type, "description": description},
+        ensure_ascii=False,
+    )
+
+
+def _decode_create_state(raw: str | None) -> tuple[str | None, str | None]:
+    """Decode a JSON-encoded create state from PendingIntent.description.
+
+    Returns (task_type, description). If `raw` is not JSON, returns (None, raw)
+    so callers can fall back to treating it as a plain description.
+    """
+    if not raw:
+        return None, None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "task_type" in data and "description" in data:
+            return data["task_type"], data["description"]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None, raw
 
 
 def _confirmation_source_stage(confirmation_state: str) -> str:
@@ -175,7 +206,21 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         task_type, description = _parse_create_command(rest)
         if description:
             if task_type:
-                await _create_project(ctx, open_id, task_type, description)
+                # Explicit type: skip intent routing but still try bind_dir
+                # recommendation so the user can pick a matching repo.
+                if await _maybe_pause_for_bind_dir_recommendation(
+                    ctx,
+                    open_id,
+                    task_type=task_type,
+                    description=description,
+                    chat_id=ctx.chat_id,
+                    chat_type=ctx.chat_type,
+                ):
+                    return
+                name = suggest_name(description)
+                await _create_project(
+                    ctx, open_id, task_type, description, name=name,
+                )
             else:
                 await _route_and_create(ctx, open_id, description)
         else:
@@ -1684,10 +1729,185 @@ async def _route_and_create(
         )
         return
 
+    # If the chat has no directory binding and allowed roots are configured,
+    # try the project_manager bind_dir agent to recommend a matching repo
+    # based on the description. If candidates are found, pause the create
+    # flow and show a pick card. Otherwise proceed with system workspace.
+    if await _maybe_pause_for_bind_dir_recommendation(
+        ctx,
+        open_id,
+        task_type=decision.task_type,
+        description=description,
+        chat_id=effective_chat_id,
+        chat_type=effective_chat_type,
+    ):
+        return
+
     name = suggest_name(description)
     await _create_project(
         ctx, open_id, decision.task_type, description, name=name,
         chat_id=effective_chat_id, chat_type=effective_chat_type,
+    )
+
+
+async def _maybe_pause_for_bind_dir_recommendation(
+    ctx: FeishuHandlerContext,
+    open_id: str,
+    *,
+    task_type: str,
+    description: str,
+    chat_id: str | None,
+    chat_type: str | None,
+) -> bool:
+    """Try to recommend a bind dir based on description; pause create if found.
+
+    Returns True if the create flow should pause (card was shown), False if
+    the create flow should proceed normally.
+    """
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    if not chat_id:
+        return False
+    # Already bound - no need to recommend.
+    if ctx.service.get_chat_directory_binding(chat_id) is not None:
+        return False
+    from mac_system.config import get_allowed_bind_roots
+
+    allowed_roots = get_allowed_bind_roots()
+    if not allowed_roots:
+        return False
+
+    # Don't recommend if there are active/paused projects (same constraint as
+    # /bind - the user would have to cancel them first).
+    blockers = _blocking_projects_for_directory_change(ctx, chat_id)
+    if blockers:
+        return False
+
+    await ctx.bridge.send_text(
+        receive_id,
+        "正在根据需求描述查找可能匹配的代码目录…",
+        receive_id_type=receive_id_type,
+    )
+
+    allowed_roots_str = "\n".join(str(r) for r in allowed_roots)
+    try:
+        output = await ctx.orchestrator.run_chat_scoped_agent(
+            agent_type="project_manager",
+            stage="bind_dir",
+            input_data={
+                "allowed_bind_roots": [str(r) for r in allowed_roots],
+                "description": description,
+            },
+            extra_variables={
+                "allowed_bind_roots": allowed_roots_str,
+                "description": description,
+            },
+        )
+    except Exception as exc:
+        logger.warning("project_manager bind_dir agent crashed in /create: %s", exc)
+        return False
+
+    if not output or not output.get("success") or not output.get("candidates"):
+        return False
+
+    valid: list[dict[str, str]] = []
+    for c in output["candidates"][:8]:
+        path_str = c.get("path", "")
+        if not path_str:
+            continue
+        path = Path(path_str).expanduser()
+        try:
+            path = path.resolve()
+        except Exception:
+            continue
+        if not _path_within_allowed_roots(path, allowed_roots):
+            logger.warning(
+                "project_manager returned path outside allowed roots: %s", path
+            )
+            continue
+        if not (path / ".git").exists():
+            continue
+        valid.append({"path": str(path), "name": c.get("name") or path.name})
+    if not valid:
+        return False
+
+    ctx.service.upsert_pending_intent(
+        open_id,
+        description=_encode_create_state(task_type, description),
+        stage="awaiting_bind_dir_for_create",
+        chat_id=chat_id,
+        chat_type=chat_type or "p2p",
+    )
+    await ctx.bridge._send_interactive(
+        receive_id,
+        build_bind_dir_for_create_card(
+            valid,
+            description=description,
+            task_type=task_type,
+            chat_id=chat_id,
+            chat_type=chat_type or "p2p",
+        ),
+        receive_id_type=receive_id_type,
+    )
+    return True
+
+
+async def _resume_create_with_bind_dir(
+    ctx: FeishuHandlerContext,
+    open_id: str,
+    *,
+    directory: str | None,
+) -> None:
+    """Resume the `/create` flow after the user picked (or skipped) a bind dir.
+
+    Reads the JSON-encoded (task_type, description) from the user's pending
+    intent, optionally binds the directory, then proceeds with project
+    creation. If binding fails, we still create the project in the system
+    workspace so the user's intent isn't lost.
+    """
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    pending = ctx.service.get_pending_intent(open_id)
+    if pending is None or pending.stage != "awaiting_bind_dir_for_create":
+        await ctx.bridge.send_text(
+            receive_id,
+            "没有正在等待的创建流程，请重新使用 `/create <描述>`。",
+            receive_id_type=receive_id_type,
+        )
+        return
+    task_type, description = _decode_create_state(pending.description)
+    if not task_type or not description:
+        ctx.service.delete_pending_intent(open_id)
+        await ctx.bridge.send_text(
+            receive_id,
+            "创建流程状态已损坏，请重新使用 `/create <描述>`。",
+            receive_id_type=receive_id_type,
+        )
+        return
+    chat_id = pending.chat_id or ctx.chat_id
+    chat_type = pending.chat_type or ctx.chat_type
+    ctx.service.delete_pending_intent(open_id)
+
+    if directory:
+        try:
+            ctx.service.bind_directory_to_chat(
+                chat_id, directory, bound_by=open_id
+            )
+        except (ValueError, OSError) as exc:
+            await ctx.bridge.send_text(
+                receive_id,
+                f"绑定目录失败：{exc}\n将使用系统工作区继续创建项目。",
+                receive_id_type=receive_id_type,
+            )
+        else:
+            await ctx.bridge.send_text(
+                receive_id,
+                f"已绑定到 `{directory}`，开始创建项目…",
+                receive_id_type=receive_id_type,
+            )
+
+    name = suggest_name(description)
+    await _create_project(
+        ctx, open_id, task_type, description, name=name,
+        chat_id=chat_id, chat_type=chat_type,
     )
 
 
@@ -2202,6 +2422,15 @@ async def _handle_menu_action(
         await ctx.bridge.send_text(
             receive_id, "已取消目录绑定。", receive_id_type=receive_id_type
         )
+        return
+
+    if option.startswith("bind_dir_for_create_select:"):
+        directory = option.split(":", 1)[1]
+        await _resume_create_with_bind_dir(ctx, open_id, directory=directory)
+        return
+
+    if option == "bind_dir_for_create_skip":
+        await _resume_create_with_bind_dir(ctx, open_id, directory=None)
         return
 
     await _show_menu(ctx, open_id)

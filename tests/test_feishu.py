@@ -2269,3 +2269,459 @@ async def test_question_batch_submit_choice_then_free_text_card_appears(feishu_c
     approval_after = feishu_ctx.service.get_approval(approval.id)
     reply_map = approval_after.payload.get("reply_message_to_question", {})
     assert any(v == "q_note" for v in reply_map.values())
+
+
+# ---------------------------------------------------------------------------
+# /create <description> flow: bind_dir agent recommendation integration
+# ---------------------------------------------------------------------------
+
+
+async def test_create_with_description_calls_bind_dir_agent_when_no_binding(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When chat has no binding and allowed roots are configured, /create calls the agent."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    repo = allowed_root / "matched-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_agent"
+    feishu_ctx.chat_type = "group"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={
+            "success": True,
+            "candidates": [
+                {"path": str(repo), "name": "matched-repo", "description": "matches"}
+            ],
+            "notes": [],
+        }
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="m1",
+            text="/create --type=feature 实现 config-validator CLI",
+            is_command=True,
+        ),
+    )
+
+    # Agent was invoked with bind_dir stage and the description was passed.
+    assert feishu_ctx.orchestrator.agent_calls
+    call = feishu_ctx.orchestrator.agent_calls[0]
+    assert call["agent_type"] == "project_manager"
+    assert call["stage"] == "bind_dir"
+    assert "config-validator" in call["extra_variables"]["description"]
+
+    # A pick card was shown and the create flow is paused.
+    cards = [c for c in feishu_ctx.bridge.sent if c[0] == "interactive"]
+    assert cards
+    payload = cards[-1][2]
+    assert str(repo) in str(payload)
+    assert "matched-repo" in str(payload)
+
+    intent = feishu_ctx.service.get_pending_intent("ou_1")
+    assert intent is not None
+    assert intent.stage == "awaiting_bind_dir_for_create"
+
+    # No project should have been created yet.
+    assert not feishu_ctx.orchestrator.ticked
+
+
+async def test_create_with_description_skips_agent_when_chat_already_bound(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When chat already has a directory binding, /create does not call the agent."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_bound"
+    feishu_ctx.chat_type = "group"
+
+    bound_dir = tmp_path / "already-bound"
+    bound_dir.mkdir()
+    (bound_dir / ".git").mkdir()
+    feishu_ctx.service.bind_directory_to_chat(
+        "oc_create_bound", str(bound_dir), bound_by="ou_1"
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={"success": True, "candidates": [], "notes": []}
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="m1",
+            text="/create --type=feature 实现 config-validator CLI",
+            is_command=True,
+        ),
+    )
+
+    # Agent was NOT invoked because the chat is already bound.
+    assert not feishu_ctx.orchestrator.agent_calls
+    # Project was created directly.
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
+
+
+async def test_create_with_description_skips_agent_when_no_allowed_roots(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When no allowed roots are configured, /create does not call the agent."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: []
+    )
+
+    feishu_ctx.chat_id = "oc_create_no_roots"
+    feishu_ctx.chat_type = "group"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={"success": True, "candidates": [], "notes": []}
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="m1",
+            text="/create --type=feature 实现 config-validator CLI",
+            is_command=True,
+        ),
+    )
+
+    assert not feishu_ctx.orchestrator.agent_calls
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
+
+
+async def test_create_with_description_skips_agent_when_chat_has_active_project(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When chat has an active/paused project, /create does not call the agent."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_blocked"
+    feishu_ctx.chat_type = "group"
+
+    # Create a project in this chat; it defaults to active status.
+    await feishu_ctx.service.create_project(
+        name="blocked-project",
+        task_type="feature",
+        description="desc",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_create_blocked",
+        feishu_chat_type="group",
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={"success": True, "candidates": [], "notes": []}
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="m1",
+            text="/create --type=feature 另一个项目",
+            is_command=True,
+        ),
+    )
+
+    # Agent was NOT invoked because chat has an active project.
+    assert not feishu_ctx.orchestrator.agent_calls
+    # Project was still created (the blocker only blocks /bind, not /create).
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
+
+
+async def test_create_with_description_falls_back_when_agent_returns_no_candidates(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When the agent returns no valid candidates, /create proceeds with system workspace."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_empty"
+    feishu_ctx.chat_type = "group"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={"success": True, "candidates": [], "notes": []}
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="m1",
+            text="/create --type=feature 实现 config-validator CLI",
+            is_command=True,
+        ),
+    )
+
+    # Agent was invoked but returned no candidates, so project was created directly.
+    assert feishu_ctx.orchestrator.agent_calls
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
+    # No pending intent left.
+    intent = feishu_ctx.service.get_pending_intent("ou_1")
+    assert intent is None
+
+
+async def test_create_with_description_falls_back_when_agent_crashes(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When the agent raises, /create proceeds with system workspace."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_crash"
+    feishu_ctx.chat_type = "group"
+
+    class _CrashingOrchestrator(_FakeOrchestratorWithBindDir):
+        async def run_chat_scoped_agent(self, *args, **kwargs):
+            raise RuntimeError("agent crashed")
+
+    feishu_ctx.orchestrator = _CrashingOrchestrator()
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="m1",
+            text="/create --type=feature 实现 config-validator CLI",
+            is_command=True,
+        ),
+    )
+
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
+    intent = feishu_ctx.service.get_pending_intent("ou_1")
+    assert intent is None
+
+
+async def test_create_with_description_filters_agent_candidates_outside_allowed_roots(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """Agent-returned paths outside allowed roots are filtered; if all are out, no card."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    outside_repo = tmp_path / "outside" / "outside-repo"
+    outside_repo.mkdir(parents=True)
+    (outside_repo / ".git").mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_filter"
+    feishu_ctx.chat_type = "group"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={
+            "success": True,
+            "candidates": [
+                {"path": str(outside_repo), "name": "outside-repo"},
+            ],
+            "notes": [],
+        }
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="m1",
+            text="/create --type=feature 实现 config-validator CLI",
+            is_command=True,
+        ),
+    )
+
+    # All candidates were filtered out, so no pick card and project was created directly.
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
+    intent = feishu_ctx.service.get_pending_intent("ou_1")
+    assert intent is None
+
+
+async def test_create_bind_dir_select_binds_directory_and_creates_project(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """Clicking a candidate in the /create pick card binds the dir and creates the project."""
+    from mac_system.feishu.handlers import _handle_menu_action
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    repo = allowed_root / "matched-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_pick"
+    feishu_ctx.chat_type = "group"
+
+    # Simulate the state after _maybe_pause_for_bind_dir_recommendation paused.
+    import json as _json
+    feishu_ctx.service.upsert_pending_intent(
+        "ou_1",
+        description=_json.dumps(
+            {"task_type": "feature", "description": "实现 config-validator CLI"},
+            ensure_ascii=False,
+        ),
+        stage="awaiting_bind_dir_for_create",
+        chat_id="oc_create_pick",
+        chat_type="group",
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir()
+
+    action = ButtonAction(
+        open_id="ou_1",
+        approval_id="",
+        action="menu",
+        state="",
+        decision_id=None,
+        option_key=f"bind_dir_for_create_select:{repo}",
+        extras={},
+    )
+    await _handle_menu_action(feishu_ctx, action)
+
+    # Pending intent was cleared.
+    assert feishu_ctx.service.get_pending_intent("ou_1") is None
+    # Directory was bound.
+    binding = feishu_ctx.service.get_chat_directory_binding("oc_create_pick")
+    assert binding is not None
+    assert binding.directory == str(repo.resolve())
+    # Project was created and ticked.
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
+    assert any(
+        "已绑定到" in str(c[2]) for c in feishu_ctx.bridge.sent if c[0] == "text"
+    )
+
+
+async def test_create_bind_dir_skip_creates_project_with_system_workspace(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """Clicking 'skip' creates the project in the system workspace without binding."""
+    from mac_system.feishu.handlers import _handle_menu_action
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_skip"
+    feishu_ctx.chat_type = "group"
+
+    import json as _json
+    feishu_ctx.service.upsert_pending_intent(
+        "ou_1",
+        description=_json.dumps(
+            {"task_type": "feature", "description": "实现 config-validator CLI"},
+            ensure_ascii=False,
+        ),
+        stage="awaiting_bind_dir_for_create",
+        chat_id="oc_create_skip",
+        chat_type="group",
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir()
+
+    action = ButtonAction(
+        open_id="ou_1",
+        approval_id="",
+        action="menu",
+        state="",
+        decision_id=None,
+        option_key="bind_dir_for_create_skip",
+        extras={},
+    )
+    await _handle_menu_action(feishu_ctx, action)
+
+    # Pending intent was cleared.
+    assert feishu_ctx.service.get_pending_intent("ou_1") is None
+    # No directory binding.
+    assert feishu_ctx.service.get_chat_directory_binding("oc_create_skip") is None
+    # Project was still created.
+    assert len(feishu_ctx.orchestrator.ticked) >= 1
+
+
+async def test_create_bind_dir_action_without_pending_intent_recovers(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """If the user clicks a pick card button without a pending intent, send an error."""
+    from mac_system.feishu.handlers import _handle_menu_action
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_create_stale"
+    feishu_ctx.chat_type = "group"
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir()
+
+    action = ButtonAction(
+        open_id="ou_1",
+        approval_id="",
+        action="menu",
+        state="",
+        decision_id=None,
+        option_key="bind_dir_for_create_skip",
+        extras={},
+    )
+    await _handle_menu_action(feishu_ctx, action)
+
+    # No project created; user sees an error message.
+    assert not feishu_ctx.orchestrator.ticked
+    assert any(
+        "没有正在等待的创建流程" in str(c[2])
+        for c in feishu_ctx.bridge.sent
+        if c[0] == "text"
+    )

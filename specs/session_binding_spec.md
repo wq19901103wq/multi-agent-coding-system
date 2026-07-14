@@ -90,6 +90,21 @@ repository/
 
 `run_chat_scoped_agent` 是 orchestrator 提供的 chat-scoped agent 调用通道：不创建 Task、不依赖 Project，使用临时目录作为 worktree，适用于 `/bind`（无参）这类没有项目上下文的控制面决策。
 
+## 5A. `/create <描述>` 流程的 bind_dir 推荐
+
+`/create <描述>`（含 `--type=` 显式指定）在创建项目前，如果当前会话尚未绑定目录且配置了 `MAC_ALLOWED_BIND_ROOTS`，会调用同一个 `project_manager` + `bind_dir` 阶段根据描述推荐匹配的代码仓库：
+
+- 触发条件：会话无目录绑定、`MAC_ALLOWED_BIND_ROOTS` 非空、当前会话无活跃/暂停项目；
+- Agent 接收 `description` 作为额外上下文，可在 `MAC_ALLOWED_BIND_ROOTS` 范围内推理匹配的仓库；
+- Handler 层执行与 `/bind` 无参相同的路径校验（`_path_within_allowed_roots` + `.git` 存在性）；
+- 返回有效候选时，发送「选择要绑定的目录」卡片（`build_bind_dir_for_create_card`），用户：
+  - 点击候选 -> 绑定目录后创建项目；
+  - 点击「跳过，使用系统工作区」-> 不绑定，直接用系统工作区创建项目；
+- Agent 调用失败、返回空候选或所有候选被过滤时，不暂停，直接用系统工作区创建项目；
+- 会话已绑定目录、未配置 `MAC_ALLOWED_BIND_ROOTS` 或存在活跃/暂停项目时，跳过 Agent 调用，直接创建项目。
+
+`PendingIntent` 在暂停期间用 `stage=awaiting_bind_dir_for_create` 标识，`(task_type, description)` 以 JSON 编码存入 `description` 字段，避免 schema 迁移。
+
 ## 6. 并发与安全
 
 - 同目录多个项目可以并存，但合并代码时仍受 Git 冲突约束。
