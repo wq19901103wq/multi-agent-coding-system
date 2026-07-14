@@ -1,7 +1,7 @@
 # 会话绑定目录规范
 
-> 版本：v2.1  
-> 状态：核心绑定、继承、切换与隔离已实现；候选目录推荐卡待补  
+> 版本：v2.2  
+> 状态：核心绑定、继承、切换与隔离已实现；候选目录推荐卡待补；命令名 v2.2 重命名（`/bind-dir`→`/bind`、`/unbind-dir`→`/unbind`、`/current-dir` 合并进 `/current`）  
 > 目标：让一个飞书聊天会话绑定一个本地 Git 仓库，之后在该会话创建的项目默认修改该仓库。
 
 ## 1. 核心语义
@@ -10,7 +10,7 @@
 - 一个目录可以承载多个 MAC 项目；项目是一次交付任务，不等同于聊天窗口或代码仓库。
 - 绑定只影响之后创建的项目。切换或解绑不会迁移、删除或改写已有项目。
 - 未绑定时继续使用 `projects/{project_id}` 系统工作区。
-- 用户可通过 `/use <project_id>` 在同一聊天中的多个项目间切换；目录绑定与当前项目选择是两种不同上下文。
+- 用户可通过 `/switch <project_id>` 或 `/switch`（无参选择卡）在同一聊天中的多个项目间切换；目录绑定与当前项目选择是两种不同上下文。
 
 ## 2. 数据模型
 
@@ -56,9 +56,11 @@ repository/
 ## 4. 当前交互
 
 ```text
-/bind-dir <绝对路径>  绑定或切换当前聊天的目录
-/current-dir          查看当前聊天绑定
-/unbind-dir           解绑；只影响之后创建的项目
+/bind <绝对路径>  绑定或切换当前聊天的目录
+/bind             推目录候选卡（扫描 MAC_ALLOWED_BIND_ROOTS + 手输兜底）
+/current          查看当前聊天绑定目录与 active project
+/unbind           解绑；只影响之后创建的项目
+```
 ```
 
 绑定成功后，当前聊天中的 `/create` 自动继承该目录。项目创建后仍自动成为该用户在当前聊天的 active project。
@@ -73,28 +75,34 @@ repository/
 
 ## 5. 目标候选目录卡
 
-首次 `/create` 且聊天未绑定目录时，后续版本可展示一次性选择卡：
+`/bind`（无参）触发候选目录卡，由 Handler 层确定性扫描 `MAC_ALLOWED_BIND_ROOTS` 实现：
 
-- 检测到的已有仓库；
-- 根据需求推断的新目录；
-- 用户手工输入绝对路径；
-- 不绑定，使用系统工作区。
+- 在允许根目录下递归最多 2 层，列出含有 `.git` 的目录作为候选；
+- 候选列表上限 12 项，超出截断；
+- 卡片固定包含「手输绝对路径」和「取消」按钮；
+- 用户点击候选 -> Handler 调用 `_prepare_bound_directory` 校验后写入 `ChatDirectoryBinding`；
+- 用户点击「手输绝对路径」-> 设置 `PendingIntent.stage=awaiting_bind_dir`，下一条文本消息作为路径处理；
+- 未配置 `MAC_ALLOWED_BIND_ROOTS` 时降级为提示用户使用 `/bind <绝对路径>`。
 
-目录扫描必须限制在配置允许的根目录内，不能让业务 Agent 任意遍历整台机器。候选选择复用 `QuestionInteraction`，但最终绑定由确定性路径校验代码执行，不由 Agent 直接写数据库或执行 `git init`。
+目录扫描严格限制在 `MAC_ALLOWED_BIND_ROOTS` 内，不允许 Agent 任意遍历整台机器。最终绑定由确定性路径校验代码执行，不由 Agent 直接写数据库或执行 `git init`。
+
+LLM 增强层（`project_manager` Agent + Bash + `bind_dir` 阶段）作为后续增强项，本阶段不依赖；当前 `/bind`（无参）的候选判断由确定性 Python 扫描完成，没有 LLM 调用开销。
 
 ## 6. 并发与安全
 
 - 同目录多个项目可以并存，但合并代码时仍受 Git 冲突约束。
 - 每个项目的 Agent 分支名和 worktree 路径包含 `project_id`，不得复用。
 - 群聊中只有绑定到该群的项目允许群成员操作；私聊仍要求 `ProjectUser` 绑定。
-- API 直接传入 `bound_directory` 与飞书 `/bind-dir` 走同一校验逻辑。
+- API 直接传入 `bound_directory` 与飞书 `/bind` 走同一校验逻辑。
 - 目录不存在时允许创建；绑定动作必须由用户明确触发。候选推荐本身不创建目录。
-- 当前本地 MVP 假定飞书来源聊天和 Control API 都是可信控制面。进入多人生产环境前，必须增加“允许绑定的根目录”配置，并限制 `/bind-dir` 为聊天管理员/系统 owner；否则任意群成员可能把 Agent 指向宿主机上的非预期目录。
+- 当前本地 MVP 假定飞书来源聊天和 Control API 都是可信控制面。进入多人生产环境前，必须增加"允许绑定的根目录"配置，并限制 `/bind` 为聊天管理员/系统 owner；否则任意群成员可能把 Agent 指向宿主机上的非预期目录。
+- **目录切换/解绑受活跃项目约束**：当前 chat 存在 `active` 或 `paused` 状态项目时，`/bind <new-path>` 和 `/unbind` 必须拒绝，并提示阻塞项目列表。用户须先 `/cancel` 或等项目进入 `completed`/`failed`/`cancelled` 后才能切换目录。`completed`/`failed`/`cancelled` 项目不阻塞，因为其 `bound_directory` 快照已固化。
 
 ## 7. 验收标准
 
 - 两个聊天可绑定不同目录，互不影响。
 - 同一聊天后续两个项目继承同一仓库，但各自拥有独立 STATE 和规划产物。
-- `/unbind-dir` 后新项目回到系统工作区，旧项目仍指向原仓库。
+- `/unbind` 后新项目回到系统工作区，旧项目仍指向原仓库。
 - 绑定仓库中的 Agent worktree 能创建、合并和清理，不污染另一个项目的元数据。
 - 服务重启后绑定关系和项目目录仍能恢复。
+- chat 存在 `active`/`paused` 项目时，`/bind` 和 `/unbind` 必须拒绝并提示阻塞项目；`completed`/`failed`/`cancelled` 不阻塞。

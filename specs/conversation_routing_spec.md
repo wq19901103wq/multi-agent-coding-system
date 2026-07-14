@@ -59,15 +59,16 @@
 | `selected_at` | 选择时间 |
 | `expires_at` | 可选的上下文过期时间 |
 
-群聊上下文必须按用户隔离。一个成员执行 `/use A` 不得改变群内其他成员的 active project。
+群聊上下文必须按用户隔离。一个成员执行 `/switch A` 不得改变群内其他成员的 active project。
 
 ## 项目选择命令
 
 | 命令 | 行为 |
 |---|---|
 | `/projects` | 列出当前聊天关联且用户有权访问的项目 |
-| `/use <project_id>` | 设置当前 `(chat_id, open_id)` 的 active project |
-| `/current` | 显示当前项目 |
+| `/switch` | 推项目选择卡，点击按钮切换 active project |
+| `/switch <project_id>` | 设置当前 `(chat_id, open_id)` 的 active project |
+| `/current` | 显示当前 active project 与绑定目录 |
 | `/leave-project` | 清除当前会话上下文 |
 | `/status [project_id]` | 有参数时查指定项目，无参数时查当前项目 |
 | `/create ...` | 创建后关联当前聊天，并把创建者的 active project 切换到新项目 |
@@ -94,7 +95,7 @@
 
 - `ChatDirectoryBinding(chat_id)` 决定该聊天之后新建项目的默认代码仓库，群成员共享；
 - `ChatUserContext(chat_id, open_id)` 决定某个用户当前正在讨论哪个既有项目，群成员互不覆盖；
-- `/use` 不改变目录绑定，`/bind-dir` 也不改变已有项目或其他成员的 active project。
+- `/switch` 不改变目录绑定，`/bind` 也不改变已有项目或其他成员的 active project。
 
 一个聊天最多有一个默认目录，但可以关联多个项目；一个仓库也可承载多个项目。项目元数据必须按 `.mac/projects/{project_id}` 隔离，不能把“一个聊天”“一个项目”“一个仓库”视为同一实体。
 

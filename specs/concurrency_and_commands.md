@@ -35,10 +35,11 @@ MAX_CONCURRENT_AGENT_EXECUTIONS = 2  # 默认同时最多 2 个 Agent
 
 用户可通过飞书或 API 发送命令。命令以 `/` 开头。
 
-### `/use {project_id}` 与 `/current`
+### `/switch {project_id}` 与 `/current`
 
-- `/use` 更新 `(chat_id, open_id)` 的 ChatUserContext，不改变 Project.current_state/status，不中断正在运行的 Agent。
-- `/current` 只读返回当前上下文。
+- `/switch <project_id>` 更新 `(chat_id, open_id)` 的 ChatUserContext，不改变 Project.current_state/status，不中断正在运行的 Agent。
+- `/switch`（无参）推项目选择卡，点击按钮等价于 `/switch <project_id>`。
+- `/current` 只读返回当前 active project 与绑定目录。
 - 卡片 approval_id 和显式 project_id 不受当前上下文切换影响。
 - pending user input 在创建时已固化 project_id，切换后不得迁移到新项目。
 - 群聊中上下文按用户隔离；不同成员切换项目互不影响。

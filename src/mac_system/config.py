@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     # Admin panel
     admin_token: str | None = Field(default=None, alias="ADMIN_TOKEN")
 
+    # Directory binding (chat-scoped /bind)
+    # Comma-separated list of absolute paths the bot is allowed to scan and
+    # bind to. Empty by default - /bind (no-args) falls back to asking the
+    # user to type an absolute path explicitly.
+    mac_allowed_bind_roots: str = Field(default="", alias="MAC_ALLOWED_BIND_ROOTS")
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -99,3 +105,20 @@ def load_workflow_profile(task_type: str) -> dict[str, Any]:
     """Load task-specific stages without duplicating lifecycle transitions."""
     path = get_settings().workflow_profiles_dir / f"{task_type}.json"
     return _load_json(path, label=f"Workflow profile for task_type={task_type}")
+
+
+def get_allowed_bind_roots() -> list[Path]:
+    """Return the list of absolute paths `/bind` (no-args) is allowed to scan."""
+    raw = get_settings().mac_allowed_bind_roots
+    if not raw:
+        return []
+    roots: list[Path] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        path = Path(part).expanduser()
+        if not path.is_absolute():
+            continue
+        roots.append(path)
+    return roots

@@ -43,6 +43,38 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
+def _walk_dirs(root: Path, *, max_depth: int = 2):
+    """Yield subdirectories of ``root`` up to ``max_depth`` levels deep.
+
+    ``root`` itself is yielded first (depth 0). Symlinks are skipped to avoid
+    cycles. Used only by ``scan_candidate_repositories`` to enforce that the
+    bot never scans outside ``MAC_ALLOWED_BIND_ROOTS``.
+    """
+    root = root.resolve()
+    yield root
+    if max_depth <= 0:
+        return
+    queue: list[tuple[Path, int]] = [(root, 0)]
+    while queue:
+        current, depth = queue.pop(0)
+        if depth >= max_depth:
+            continue
+        try:
+            entries = list(current.iterdir())
+        except (PermissionError, OSError):
+            continue
+        for entry in entries:
+            if entry.is_symlink():
+                continue
+            if not entry.is_dir():
+                continue
+            # Skip hidden directories like .git, .venv, node_modules.
+            if entry.name.startswith(".") or entry.name in {"node_modules", "__pycache__"}:
+                continue
+            yield entry
+            queue.append((entry, depth + 1))
+
+
 class InvalidStateTransitionError(Exception):
     def __init__(self, current_state: str, event: str):
         self.current_state = current_state
@@ -284,6 +316,32 @@ class ProjectService:
         self.session.delete(binding)
         self.session.commit()
         return True
+
+    @staticmethod
+    def scan_candidate_repositories(
+        allowed_roots: list[Path], *, max_depth: int = 2, limit: int = 12
+    ) -> list[dict[str, str]]:
+        """Walk each allowed root up to ``max_depth`` levels and return git repos.
+
+        Returns a list of ``{"path": <abs path>, "name": <dir name>}`` dicts,
+        deduplicated and truncated to ``limit``. The bot is only allowed to
+        scan inside ``allowed_roots`` - never anywhere else on the host.
+        """
+        seen: set[Path] = set()
+        out: list[dict[str, str]] = []
+        for root in allowed_roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            for entry in _walk_dirs(root, max_depth=max_depth):
+                if entry in seen:
+                    continue
+                if not (entry / ".git").exists():
+                    continue
+                seen.add(entry)
+                out.append({"path": str(entry), "name": entry.name})
+                if len(out) >= limit:
+                    return out
+        return out
 
     async def cancel_project(
         self,

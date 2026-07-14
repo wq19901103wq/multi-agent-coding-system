@@ -862,13 +862,334 @@ async def test_bind_dir_command_binds_directory_to_chat(feishu_ctx, tmp_path):
 
     await handle_text_message(
         feishu_ctx,
-        TextMessage(open_id="ou_1", message_id="m1", text=f"/bind-dir {target_dir}", is_command=True),
+        TextMessage(open_id="ou_1", message_id="m1", text=f"/bind {target_dir}", is_command=True),
     )
 
     binding = feishu_ctx.service.get_chat_directory_binding("oc_bind")
     assert binding is not None
     assert binding.directory == str(target_dir.resolve())
     assert any("已将当前会话绑定到" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_unbind_command_removes_directory_binding(feishu_ctx, tmp_path):
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_unbind"
+    feishu_ctx.chat_type = "group"
+    target_dir = tmp_path / "bound-repo"
+    target_dir.mkdir()
+    feishu_ctx.service.bind_directory_to_chat("oc_unbind", str(target_dir), "ou_1")
+    assert feishu_ctx.service.get_chat_directory_binding("oc_unbind") is not None
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/unbind", is_command=True),
+    )
+
+    assert feishu_ctx.service.get_chat_directory_binding("oc_unbind") is None
+    assert any("已解绑" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_bind_rejected_when_chat_has_active_project(feishu_ctx, tmp_path):
+    """`/bind` must be rejected when the chat has an active or paused project."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_block_bind"
+    feishu_ctx.chat_type = "group"
+    target_dir = tmp_path / "repo"
+    target_dir.mkdir()
+
+    project = await feishu_ctx.service.create_project(
+        name="blocker",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_block_bind",
+        feishu_chat_type="group",
+    )
+    assert project.status == "active"
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text=f"/bind {target_dir}", is_command=True),
+    )
+
+    assert feishu_ctx.service.get_chat_directory_binding("oc_block_bind") is None
+    assert any("活跃或暂停项目" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_unbind_rejected_when_chat_has_active_project(feishu_ctx, tmp_path):
+    """`/unbind` must be rejected when the chat has an active or paused project."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_block_unbind"
+    feishu_ctx.chat_type = "group"
+    target_dir = tmp_path / "repo"
+    target_dir.mkdir()
+    feishu_ctx.service.bind_directory_to_chat(
+        "oc_block_unbind", str(target_dir), "ou_1"
+    )
+
+    await feishu_ctx.service.create_project(
+        name="blocker",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_block_unbind",
+        feishu_chat_type="group",
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/unbind", is_command=True),
+    )
+
+    # Binding should still exist (reject happened before removal).
+    assert feishu_ctx.service.get_chat_directory_binding("oc_block_unbind") is not None
+    assert any("活跃或暂停项目" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_bind_allowed_when_chat_only_has_terminal_projects(feishu_ctx, tmp_path):
+    """`/bind` is allowed when chat projects are all completed/failed/cancelled."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_terminal"
+    feishu_ctx.chat_type = "group"
+    target_dir = tmp_path / "repo"
+    target_dir.mkdir()
+
+    project = await feishu_ctx.service.create_project(
+        name="done",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_terminal",
+        feishu_chat_type="group",
+    )
+    await feishu_ctx.service.cancel_project(project.id, reason="done")
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text=f"/bind {target_dir}", is_command=True),
+    )
+
+    binding = feishu_ctx.service.get_chat_directory_binding("oc_terminal")
+    assert binding is not None
+    assert any("已将当前会话绑定到" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_bind_no_args_without_allowed_roots_falls_back(feishu_ctx, monkeypatch):
+    """`/bind` (no args) without configured roots tells user to use /bind <path>."""
+    from mac_system.feishu.handlers import handle_text_message
+    import mac_system.config as cfg_module
+
+    monkeypatch.setattr(cfg_module, "get_allowed_bind_roots", lambda: [])
+    # Also patch the imported reference inside handlers.
+    import mac_system.feishu.handlers as h_module
+    monkeypatch.setattr(
+        "mac_system.config.get_allowed_bind_roots", lambda: []
+    )
+
+    feishu_ctx.chat_id = "oc_bind_noargs"
+    feishu_ctx.chat_type = "group"
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/bind", is_command=True),
+    )
+
+    sent_text = " ".join(str(c[2]) for c in feishu_ctx.bridge.sent if c[0] == "text")
+    assert "MAC_ALLOWED_BIND_ROOTS" in sent_text
+    assert "/bind <绝对路径>" in sent_text
+
+
+async def test_bind_no_args_with_allowed_roots_shows_candidate_card(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """`/bind` (no args) with configured roots scans and sends a card."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    # Set up an allowed root with a git repo inside.
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    repo = allowed_root / "my-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_bind_card"
+    feishu_ctx.chat_type = "group"
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/bind", is_command=True),
+    )
+
+    cards = [c for c in feishu_ctx.bridge.sent if c[0] == "interactive"]
+    assert cards
+    payload = cards[-1][2]
+    assert "bind_dir_select:" in str(payload)
+    assert str(repo) in str(payload)
+    assert "bind_dir_manual" in str(payload)
+    assert "bind_dir_cancel" in str(payload)
+
+
+async def test_bind_dir_select_card_action_binds_directory(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """Clicking `bind_dir_select:<path>` should bind that directory."""
+    from mac_system.feishu.handlers import handle_card_action
+    from mac_system.feishu.models import ButtonAction
+
+    feishu_ctx.chat_id = "oc_bind_select"
+    feishu_ctx.chat_type = "group"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    # _prepare_bound_directory expects a real git repo with HEAD; initialize one.
+    import subprocess
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"],
+        cwd=repo, capture_output=True, check=True,
+    )
+
+    await handle_card_action(
+        feishu_ctx,
+        ButtonAction(
+            open_id="ou_1",
+            approval_id="",
+            action="menu",
+            state="",
+            decision_id=None,
+            option_key=f"bind_dir_select:{repo}",
+            extras={},
+            chat_id="oc_bind_select",
+            chat_type="group",
+            message_id="m1",
+        ),
+    )
+
+    binding = feishu_ctx.service.get_chat_directory_binding("oc_bind_select")
+    assert binding is not None
+    assert binding.directory == str(repo.resolve())
+
+
+async def test_bind_dir_manual_action_sets_pending_intent(feishu_ctx, monkeypatch):
+    """Clicking `bind_dir_manual` should set a pending intent for path input."""
+    from mac_system.feishu.handlers import handle_card_action
+    from mac_system.feishu.models import ButtonAction
+
+    feishu_ctx.chat_id = "oc_bind_manual"
+    feishu_ctx.chat_type = "group"
+
+    await handle_card_action(
+        feishu_ctx,
+        ButtonAction(
+            open_id="ou_1",
+            approval_id="",
+            action="menu",
+            state="",
+            decision_id=None,
+            option_key="bind_dir_manual",
+            extras={},
+            chat_id="oc_bind_manual",
+            chat_type="group",
+            message_id="m1",
+        ),
+    )
+
+    pending = feishu_ctx.service.get_pending_intent("ou_1")
+    assert pending is not None
+    assert pending.stage == "awaiting_bind_dir"
+    assert any("绝对路径" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_bind_manual_input_path_binds_directory(feishu_ctx, tmp_path, monkeypatch):
+    """After `bind_dir_manual`, typing a path should bind that directory."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_bind_path"
+    feishu_ctx.chat_type = "group"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    import subprocess
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"],
+        cwd=repo, capture_output=True, check=True,
+    )
+
+    # Set pending intent as if user had clicked "manual input".
+    feishu_ctx.service.upsert_pending_intent(
+        "ou_1", description=None, stage="awaiting_bind_dir",
+        chat_id="oc_bind_path", chat_type="group",
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text=str(repo), is_command=False),
+    )
+
+    binding = feishu_ctx.service.get_chat_directory_binding("oc_bind_path")
+    assert binding is not None
+    assert binding.directory == str(repo.resolve())
+    assert feishu_ctx.service.get_pending_intent("ou_1") is None
+
+
+async def test_bind_dir_cancel_action_sends_cancel_message(feishu_ctx, monkeypatch):
+    """Clicking `bind_dir_cancel` should send a cancel message and not bind."""
+    from mac_system.feishu.handlers import handle_card_action
+    from mac_system.feishu.models import ButtonAction
+
+    feishu_ctx.chat_id = "oc_bind_cancel"
+    feishu_ctx.chat_type = "group"
+
+    await handle_card_action(
+        feishu_ctx,
+        ButtonAction(
+            open_id="ou_1",
+            approval_id="",
+            action="menu",
+            state="",
+            decision_id=None,
+            option_key="bind_dir_cancel",
+            extras={},
+            chat_id="oc_bind_cancel",
+            chat_type="group",
+            message_id="m1",
+        ),
+    )
+
+    assert any("已取消" in str(c[2]) for c in feishu_ctx.bridge.sent)
+    assert feishu_ctx.service.get_chat_directory_binding("oc_bind_cancel") is None
+
+
+async def test_scan_candidate_repositories_finds_git_dirs(tmp_path):
+    """The scanner should find directories with `.git` under allowed roots."""
+    from mac_system.core.project_service import ProjectService
+
+    root = tmp_path / "root"
+    root.mkdir()
+    repo1 = root / "repo1"
+    repo1.mkdir()
+    (repo1 / ".git").mkdir()
+    repo2 = root / "subdir" / "repo2"
+    repo2.mkdir(parents=True)
+    (repo2 / ".git").mkdir()
+    non_repo = root / "not-a-repo"
+    non_repo.mkdir()
+
+    candidates = ProjectService.scan_candidate_repositories([root], max_depth=3)
+    paths = {c["path"] for c in candidates}
+    assert str(repo1) in paths
+    assert str(repo2) in paths
+    assert str(non_repo) not in paths
 
 
 async def test_create_in_bound_directory_uses_binding(feishu_ctx, tmp_path):
@@ -1059,6 +1380,130 @@ async def test_current_and_leave_project_commands(feishu_ctx):
         TextMessage(open_id="ou_1", message_id="m2", text="/leave-project", is_command=True),
     )
     assert any("已清除" in str(c[2]) or "离开" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_current_shows_bound_directory_and_active_project(feishu_ctx, tmp_path):
+    """`/current` should show both the chat's bound directory and active project."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_current_dir"
+    feishu_ctx.chat_type = "group"
+    target_dir = tmp_path / "repo"
+    target_dir.mkdir()
+    feishu_ctx.service.bind_directory_to_chat(
+        "oc_current_dir", str(target_dir), "ou_1"
+    )
+    project = await feishu_ctx.service.create_project(
+        name="with-dir",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_current_dir",
+        feishu_chat_type="group",
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/current", is_command=True),
+    )
+
+    sent_text = " ".join(str(c[2]) for c in feishu_ctx.bridge.sent if c[0] == "text")
+    assert str(target_dir.resolve()) in sent_text
+    assert project.id in sent_text
+
+
+async def test_switch_command_sets_active_project(feishu_ctx):
+    """`/switch <project_id>` should set the active project for this user."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_switch"
+    feishu_ctx.chat_type = "group"
+    project = await feishu_ctx.service.create_project(
+        name="switch-test",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_switch",
+        feishu_chat_type="group",
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="m1",
+            text=f"/switch {project.id}", is_command=True,
+        ),
+    )
+
+    active = feishu_ctx.service.get_chat_user_active_project("oc_switch", "ou_1")
+    assert active is not None
+    assert active.id == project.id
+    assert any("默认项目" in str(c[2]) for c in feishu_ctx.bridge.sent)
+
+
+async def test_switch_no_args_pushes_project_card(feishu_ctx):
+    """`/switch` (no args) should push a project selection card."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_switch_card"
+    feishu_ctx.chat_type = "group"
+    project = await feishu_ctx.service.create_project(
+        name="switch-card-test",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_switch_card",
+        feishu_chat_type="group",
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/switch", is_command=True),
+    )
+
+    # An interactive card should have been sent.
+    cards = [c for c in feishu_ctx.bridge.sent if c[0] == "interactive"]
+    assert cards
+    payload = cards[-1][2]
+    assert "switch" in str(payload)
+    assert project.id in str(payload)
+
+
+async def test_switch_card_button_sets_active_project(feishu_ctx):
+    """Clicking a `switch:<project_id>` button should set the active project."""
+    from mac_system.feishu.handlers import handle_card_action
+    from mac_system.feishu.models import ButtonAction
+
+    feishu_ctx.chat_id = "oc_switch_btn"
+    feishu_ctx.chat_type = "group"
+    project = await feishu_ctx.service.create_project(
+        name="switch-btn-test",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_switch_btn",
+        feishu_chat_type="group",
+    )
+
+    await handle_card_action(
+        feishu_ctx,
+        ButtonAction(
+            open_id="ou_1",
+            approval_id="",
+            action="menu",
+            state="",
+            decision_id=None,
+            option_key=f"switch:{project.id}",
+            extras={},
+            chat_id="oc_switch_btn",
+            chat_type="group",
+            message_id="m1",
+        ),
+    )
+
+    active = feishu_ctx.service.get_chat_user_active_project("oc_switch_btn", "ou_1")
+    assert active is not None
+    assert active.id == project.id
 
 
 async def test_question_batch_answer_all_recommended_resolves(feishu_ctx):

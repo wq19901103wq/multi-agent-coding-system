@@ -27,6 +27,7 @@ from mac_system.feishu.card import (
 )
 from mac_system.feishu.menu import (
     build_create_prompt_card,
+    build_directory_candidate_card,
     build_intent_confirm_card,
     build_main_menu_card,
     build_project_list_card,
@@ -112,21 +113,28 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
     # If the user is in the middle of creating a project, treat the reply as
     # the project description instead of a command.
     pending = ctx.service.get_pending_intent(open_id)
-    if pending is not None and not text.startswith("/"):
-        ctx.service.delete_pending_intent(open_id)
-        if pending.stage == "awaiting_type_confirm" and pending.description:
-            # User typed again while we were waiting for type confirmation;
-            # treat the new text as a fresh description.
-            await _route_and_create(
-                ctx, open_id, text,
-                chat_id=pending.chat_id, chat_type=pending.chat_type,
-            )
-        else:
-            await _route_and_create(
-                ctx, open_id, text,
-                chat_id=pending.chat_id, chat_type=pending.chat_type,
-            )
-        return
+    if pending is not None:
+        if pending.stage == "awaiting_bind_dir":
+            # User is replying with an absolute path for /bind manual input.
+            # Don't require it to not start with "/" - absolute paths do.
+            ctx.service.delete_pending_intent(open_id)
+            await _bind_directory(ctx, open_id, text.strip())
+            return
+        if not text.startswith("/"):
+            ctx.service.delete_pending_intent(open_id)
+            if pending.stage == "awaiting_type_confirm" and pending.description:
+                # User typed again while we were waiting for type confirmation;
+                # treat the new text as a fresh description.
+                await _route_and_create(
+                    ctx, open_id, text,
+                    chat_id=pending.chat_id, chat_type=pending.chat_type,
+                )
+            else:
+                await _route_and_create(
+                    ctx, open_id, text,
+                    chat_id=pending.chat_id, chat_type=pending.chat_type,
+                )
+            return
 
     # In group chats, only respond to slash commands or explicit @bot mentions.
     if ctx.chat_type == "group" and not text.startswith("/") and not getattr(msg, "is_at_bot", False):
@@ -143,21 +151,17 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         await _leave_project(ctx, open_id)
         return
 
-    if text.startswith("/bind-dir "):
-        await _bind_directory(ctx, open_id, text[len("/bind-dir "):].strip())
-        return
-
-    if text == "/unbind-dir":
-        await _unbind_directory(ctx, open_id)
-        return
-
-    if text == "/current-dir":
-        await _show_current_directory(ctx, open_id)
-        return
-
     if text.startswith("/bind "):
-        project_id = text[len("/bind "):].strip()
-        await _bind_project(ctx, open_id, project_id)
+        directory = text[len("/bind "):].strip()
+        await _bind_directory(ctx, open_id, directory)
+        return
+
+    if text == "/bind":
+        await _show_bind_candidate_card(ctx, open_id)
+        return
+
+    if text == "/unbind":
+        await _unbind_directory(ctx, open_id)
         return
 
     if text.startswith("/status "):
@@ -208,9 +212,13 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         await _list_my_projects(ctx, open_id)
         return
 
-    if text.startswith("/use "):
-        project_id = text[len("/use "):].strip()
-        await _use_project(ctx, open_id, project_id)
+    if text.startswith("/switch "):
+        project_id = text[len("/switch "):].strip()
+        await _switch_project(ctx, open_id, project_id)
+        return
+
+    if text == "/switch":
+        await _show_project_switch_card(ctx, open_id)
         return
 
     if text == "/current":
@@ -919,19 +927,31 @@ async def _show_help(ctx: FeishuHandlerContext, open_id: str) -> None:
         "/cancel [项目ID] — 终止项目（省略 ID 则终止最近活跃项目）\n"
         "/list            — 列出我的项目\n"
         "/projects        — 列出当前会话绑定的项目\n"
-        "/use <项目ID>    — 将某项目设为当前会话默认项目\n"
-        "/current         — 查看当前会话默认项目\n"
-        "/leave-project   — 清除当前会话默认项目\n"
-        "/bind-dir <绝对路径> — 将当前会话绑定到已有代码目录\n"
-        "/current-dir     — 查看当前会话绑定目录\n"
-        "/unbind-dir      — 解绑目录（不影响现有项目）\n"
-        "/status <项目ID> — 查看项目状态\n"
-        "/bind <项目ID>   — 绑定到项目\n"
+        "/switch <项目ID> - 切换当前会话默认项目\n"
+        "/switch          - 推项目选择卡\n"
+        "/current         - 查看当前会话绑定目录与默认项目\n"
+        "/leave-project   - 清除当前会话默认项目\n"
+        "/bind <绝对路径> - 绑定当前会话到代码目录（仅在没有活跃/暂停项目时可切换）\n"
+        "/bind            - 推目录候选卡\n"
+        "/unbind          - 解绑目录（仅在没有活跃/暂停项目时可解绑）\n"
+        "/status <项目ID> - 查看项目状态\n"
         "/menu            — 打开菜单\n"
         "/help            — 显示本帮助\n\n"
         "直接发消息不会创建项目；如需创建请使用 /create。"
     )
     await ctx.bridge.send_text(receive_id, help_text, receive_id_type=receive_id_type)
+
+
+def _blocking_projects_for_directory_change(
+    ctx: FeishuHandlerContext, chat_id: str
+) -> list[Project]:
+    """Return chat-bound projects that block a directory bind/unbind.
+
+    Only `active` and `paused` projects block. `completed`/`failed`/`cancelled`
+    projects do not block because their `bound_directory` snapshot is frozen.
+    """
+    projects = ctx.service.list_projects_for_chat(chat_id)
+    return [p for p in projects if p.status in ("active", "paused")]
 
 
 async def _bind_directory(
@@ -942,6 +962,16 @@ async def _bind_directory(
         await ctx.bridge.send_text(
             receive_id, "当前消息缺少会话标识，无法绑定目录。",
             receive_id_type=receive_id_type,
+        )
+        return
+    blockers = _blocking_projects_for_directory_change(ctx, ctx.chat_id)
+    if blockers:
+        lines = ["当前会话存在活跃或暂停项目，不能切换目录："]
+        for p in blockers:
+            lines.append(f"- {p.id} {p.name or ''} [{p.status}] {p.current_state}")
+        lines.append("\n请先 `/cancel` 这些项目或等其进入终态后再切换目录。")
+        await ctx.bridge.send_text(
+            receive_id, "\n".join(lines), receive_id_type=receive_id_type
         )
         return
     try:
@@ -968,6 +998,16 @@ async def _unbind_directory(ctx: FeishuHandlerContext, open_id: str) -> None:
             receive_id_type=receive_id_type,
         )
         return
+    blockers = _blocking_projects_for_directory_change(ctx, ctx.chat_id)
+    if blockers:
+        lines = ["当前会话存在活跃或暂停项目，不能解绑目录："]
+        for p in blockers:
+            lines.append(f"- {p.id} {p.name or ''} [{p.status}] {p.current_state}")
+        lines.append("\n请先 `/cancel` 这些项目或等其进入终态后再解绑目录。")
+        await ctx.bridge.send_text(
+            receive_id, "\n".join(lines), receive_id_type=receive_id_type
+        )
+        return
     removed = ctx.service.unbind_directory_from_chat(ctx.chat_id)
     message = (
         "已解绑当前会话目录；后续新项目将使用系统工作区，已有项目不受影响。"
@@ -978,20 +1018,51 @@ async def _unbind_directory(ctx: FeishuHandlerContext, open_id: str) -> None:
     )
 
 
-async def _show_current_directory(
+async def _show_bind_candidate_card(
     ctx: FeishuHandlerContext, open_id: str
 ) -> None:
+    """Push a candidate-directory selection card for `/bind` (no args).
+
+    Scans `MAC_ALLOWED_BIND_ROOTS` for git repos and shows them as buttons.
+    Always offers "manual input" and "cancel" buttons. If no allowed roots
+    are configured, falls back to telling the user to use `/bind <path>`.
+    """
     receive_id, receive_id_type = _reply_target(ctx, open_id)
-    binding = (
-        ctx.service.get_chat_directory_binding(ctx.chat_id)
-        if ctx.chat_id else None
-    )
-    message = (
-        f"当前会话绑定目录：`{binding.directory}`"
-        if binding else "当前会话没有绑定目录。"
-    )
-    await ctx.bridge.send_text(
-        receive_id, message, receive_id_type=receive_id_type
+    if not ctx.chat_id:
+        await ctx.bridge.send_text(
+            receive_id, "当前消息缺少会话标识，无法绑定目录。",
+            receive_id_type=receive_id_type,
+        )
+        return
+    blockers = _blocking_projects_for_directory_change(ctx, ctx.chat_id)
+    if blockers:
+        lines = ["当前会话存在活跃或暂停项目，不能切换目录："]
+        for p in blockers:
+            lines.append(f"- {p.id} {p.name or ''} [{p.status}] {p.current_state}")
+        lines.append("\n请先 `/cancel` 这些项目或等其进入终态后再切换目录。")
+        await ctx.bridge.send_text(
+            receive_id, "\n".join(lines), receive_id_type=receive_id_type
+        )
+        return
+
+    from mac_system.config import get_allowed_bind_roots
+
+    allowed_roots = get_allowed_bind_roots()
+    if not allowed_roots:
+        await ctx.bridge.send_text(
+            receive_id,
+            "未配置 `MAC_ALLOWED_BIND_ROOTS`，请使用 `/bind <绝对路径>` 显式指定目录。",
+            receive_id_type=receive_id_type,
+        )
+        return
+
+    candidates = ProjectService.scan_candidate_repositories(allowed_roots)
+    await ctx.bridge._send_interactive(
+        receive_id,
+        build_directory_candidate_card(
+            candidates, chat_id=ctx.chat_id, chat_type=ctx.chat_type
+        ),
+        receive_id_type=receive_id_type,
     )
 
 
@@ -1013,7 +1084,7 @@ async def _leave_project(
     )
 
 
-async def _use_project(
+async def _switch_project(
     ctx: FeishuHandlerContext, open_id: str, project_id: str
 ) -> None:
     """Set the active project for this user in the current chat."""
@@ -1061,24 +1132,66 @@ async def _use_project(
 async def _show_current_project(
     ctx: FeishuHandlerContext, open_id: str
 ) -> None:
-    """Show the active project for this user in the current chat."""
+    """Show the bound directory and active project for this user in this chat."""
     receive_id, receive_id_type = _reply_target(ctx, open_id)
     if ctx.chat_id is None:
         await ctx.bridge.send_text(
             receive_id, "当前会话缺少 chat 上下文。", receive_id_type=receive_id_type
         )
         return
+    binding = ctx.service.get_chat_directory_binding(ctx.chat_id)
+    directory_line = (
+        f"当前会话绑定目录：`{binding.directory}`"
+        if binding else "当前会话没有绑定目录。"
+    )
     project = ctx.service.get_chat_user_active_project(ctx.chat_id, open_id)
     if project is None:
         await ctx.bridge.send_text(
             receive_id,
-            "当前会话没有默认项目。可用 `/use <项目ID>` 或 `/projects` 选择。",
+            f"{directory_line}\n当前会话没有默认项目。可用 `/switch <项目ID>` 或 `/switch` 选择。",
             receive_id_type=receive_id_type,
         )
         return
     await ctx.bridge.send_text(
         receive_id,
-        f"当前默认项目：{project.id} {project.name or ''} [{project.status}] {project.current_state}",
+        f"{directory_line}\n当前默认项目：{project.id} {project.name or ''} [{project.status}] {project.current_state}",
+        receive_id_type=receive_id_type,
+    )
+
+
+async def _show_project_switch_card(
+    ctx: FeishuHandlerContext, open_id: str
+) -> None:
+    """Push a project selection card for `/switch` (no args).
+
+    Lists projects the user can see in this chat and lets them pick one to
+    become the active project. Clicking a button is equivalent to
+    `/switch <project_id>`.
+    """
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    if ctx.chat_id is None:
+        await ctx.bridge.send_text(
+            receive_id, "当前会话缺少 chat 上下文。", receive_id_type=receive_id_type
+        )
+        return
+    projects = ctx.service.list_projects_for_chat(ctx.chat_id)
+    if not projects:
+        await ctx.bridge.send_text(
+            receive_id, "当前会话还没有绑定任何项目。", receive_id_type=receive_id_type
+        )
+        return
+    payload = [
+        {"id": p.id, "name": p.name or p.id, "current_state": p.current_state}
+        for p in projects
+    ]
+    await ctx.bridge._send_interactive(
+        receive_id,
+        build_project_list_card(
+            payload,
+            mode="switch",
+            chat_id=ctx.chat_id,
+            chat_type=ctx.chat_type,
+        ),
         receive_id_type=receive_id_type,
     )
 
@@ -1105,7 +1218,7 @@ async def _list_chat_projects(
         lines.append(
             f"{marker}{p.id} {p.name or '(未命名)'} [{p.status}] {p.current_state}"
         )
-    lines.append("\n使用 `/use <项目ID>` 切换默认项目")
+    lines.append("\n使用 `/switch <项目ID>` 切换默认项目")
     await ctx.bridge.send_text(
         receive_id, "\n".join(lines), receive_id_type=receive_id_type
     )
@@ -1975,6 +2088,45 @@ async def _handle_menu_action(
     if option.startswith("bind:"):
         project_id = option.split(":", 1)[1]
         await _bind_project(ctx, open_id, project_id)
+        return
+
+    if option.startswith("switch:"):
+        project_id = option.split(":", 1)[1]
+        await _switch_project(ctx, open_id, project_id)
+        return
+
+    if option.startswith("bind_dir_select:"):
+        directory = option.split(":", 1)[1]
+        await _bind_directory(ctx, open_id, directory)
+        return
+
+    if option == "bind_dir_manual":
+        receive_id, receive_id_type = _reply_target(ctx, open_id)
+        if not ctx.chat_id:
+            await ctx.bridge.send_text(
+                receive_id, "当前消息缺少会话标识，无法绑定目录。",
+                receive_id_type=receive_id_type,
+            )
+            return
+        ctx.service.upsert_pending_intent(
+            open_id,
+            description=None,
+            stage="awaiting_bind_dir",
+            chat_id=ctx.chat_id,
+            chat_type=ctx.chat_type,
+        )
+        await ctx.bridge.send_text(
+            receive_id,
+            "请回复要绑定的目录绝对路径（例如 `/Users/you/projects/my-repo`）。",
+            receive_id_type=receive_id_type,
+        )
+        return
+
+    if option == "bind_dir_cancel":
+        receive_id, receive_id_type = _reply_target(ctx, open_id)
+        await ctx.bridge.send_text(
+            receive_id, "已取消目录绑定。", receive_id_type=receive_id_type
+        )
         return
 
     await _show_menu(ctx, open_id)

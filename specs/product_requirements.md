@@ -103,7 +103,7 @@ Workflow Profile 只描述阶段顺序、Agent/Prompt stage、展示名称、可
 
 ### REQ-CONV-004：切换只改变会话焦点
 
-`/projects` 展示当前会话可访问项目，`/use <project>` 切换 active project。切换不会暂停项目、迁移 pending question 或改变其他会话的 active project。
+`/projects` 展示当前会话可访问项目，`/switch` 推选择卡、`/switch <project>` 直接切换 active project。切换不会暂停项目、迁移 pending question 或改变其他会话的 active project。
 
 ### AC-CONV
 
@@ -119,7 +119,7 @@ Workflow Profile 只描述阶段顺序、Agent/Prompt stage、展示名称、可
 
 ### AC-DIRECTORY
 
-- **AC-DIR-001**：`/bind-dir`、`/current-dir`、`/unbind-dir` 可完成绑定、查询和解绑。
+- **AC-DIR-001**：`/bind <绝对路径>`、`/current`、`/unbind` 可完成目录绑定、查询和解绑。`/current` 同时显示 active project 与绑定目录。
 - **AC-DIR-002**：同一聊天创建的两个项目继承同一代码仓库，但使用不同的 `.mac/projects/{project_id}`。
 - **AC-DIR-003**：不同聊天的目录绑定和 active project 独立。
 - **AC-DIR-004**：回复 Agent 问题卡片按 `parent_id → approval → interaction → project` 路由，不受 `/use` 切换影响。

@@ -150,7 +150,7 @@ Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInt
 - project 未确定时创建 `ConversationInteraction`；不得创建 project Approval，也不得调用 LLM 猜测。
 - Agent 运行中收到的自由文本先确定 project，再写入 `PendingUserInput`；scope change/correction 会使旧结果失效。
 - 同一 approval/question 投递多个聊天时，只允许一次 CAS 成功，其他卡片更新为已处理。
-- 聊天可用 `/bind-dir` 设置后续新项目的默认仓库；绑定按 `chat_id` 共享，active project 仍按 `(chat_id, open_id)` 隔离。
+- 聊天可用 `/bind <绝对路径>` 设置后续新项目的默认仓库；绑定按 `chat_id` 共享，active project 仍按 `(chat_id, open_id)` 隔离。
 - 回复问题卡片按 `parent_id → reply_message_ids → QuestionInteraction → Project` 路由，优先级高于 active project。
 - 同一仓库的多个项目分别使用 `.mac/projects/{project_id}` 和 `.mac/worktrees/{project_id}`，不得共享 STATE 或规划产物。
 
@@ -205,9 +205,9 @@ Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInt
 ### 已知问题（未修复）
 
 1. **ask_user 卡片在真实飞书未观测到**：代码已实现 `build_question_batch_card` 和 parent_id 回复路由，但尚未在真实飞书群验证下拉组件、按钮和自由文本回复的完整组合。
-2. **目录候选选择卡尚未实现**：当前使用显式 `/bind-dir <绝对路径>`。自动候选只能扫描配置允许的根目录，不能让 Agent 任意遍历整台机器。
-3. **驳回后的两步回复卡尚未实现**：当前可用 `/reject <approval_id> <feedback>` 或点击驳回后发送反馈；目标交互是先发一张可回复的反馈卡，再决定回退。
-4. **目录绑定仍是可信控制面模型**：当前会校验绝对路径和 Git 根目录，但还没有允许根目录白名单、群管理员角色和 Control API 鉴权；部署到不受信任的多人群前必须补齐。
+2. **驳回后的两步回复卡尚未实现**：当前可用 `/reject <approval_id> <feedback>` 或点击驳回后发送反馈；目标交互是先发一张可回复的反馈卡，再决定回退。
+3. **目录绑定仍是可信控制面模型**：当前会校验绝对路径和 Git 根目录，并要求 `/bind`、`/unbind` 在没有活跃/暂停项目时才能切换；但还没有群管理员角色和 Control API 鉴权；部署到不受信任的多人群前必须补齐。
+4. **`/bind` 无参候选卡未走 LLM**：当前实现用确定性 Python 扫描 `MAC_ALLOWED_BIND_ROOTS`，没有调用 `project_manager` Agent。LLM 增强层（`project_manager` + Bash + `bind_dir` 阶段）作为后续增强项；需要先解决 `_execute_auxiliary_agent` 是 project-scoped 的问题才能让 agent 在 chat-scoped 操作中复用。
 
 ## 9. 下一步工作（按优先级）
 

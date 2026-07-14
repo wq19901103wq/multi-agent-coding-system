@@ -72,7 +72,8 @@ def build_project_list_card(
 ) -> dict[str, Any]:
     """List projects as clickable buttons.
 
-    ``mode`` is either ``status`` (view status) or ``bind`` (bind user).
+    ``mode`` is one of ``status`` (view status), ``bind`` (bind user),
+    or ``switch`` (set as active project in this chat).
     """
     if not projects:
         return {
@@ -91,6 +92,8 @@ def build_project_list_card(
         label = f"{p.get('name') or project_id} ({p['current_state']})"
         if mode == "status":
             actions.append(_menu_button(label, f"status:{project_id}", chat_id=chat_id, chat_type=chat_type))
+        elif mode == "switch":
+            actions.append(_menu_button(label, f"switch:{project_id}", chat_id=chat_id, chat_type=chat_type))
         else:
             actions.append(_menu_button(label, f"bind:{project_id}", chat_id=chat_id, chat_type=chat_type))
 
@@ -99,7 +102,12 @@ def build_project_list_card(
     for i in range(0, len(actions), 2):
         rows.append({"tag": "action", "actions": actions[i : i + 2]})
 
-    title = "选择项目查看状态" if mode == "status" else "选择项目绑定"
+    if mode == "status":
+        title = "选择项目查看状态"
+    elif mode == "switch":
+        title = "选择项目设为默认"
+    else:
+        title = "选择项目绑定"
     elements.append({"tag": "div", "text": _lark_md("点击一个项目：")})
     elements.extend(rows)
     elements.append({"tag": "action", "actions": [_menu_button("返回", "show_menu", chat_id=chat_id, chat_type=chat_type)]})
@@ -201,4 +209,56 @@ def build_restart_type_card(
                 ],
             },
         ],
+    }
+
+
+def build_directory_candidate_card(
+    candidates: list[dict[str, str]],
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Show detected repositories and let the user pick one to bind.
+
+    ``candidates`` is a list of ``{"path": <abs path>, "name": <dir name>}``.
+    Always appended at the end: a "manual input" button and a "cancel" button.
+    """
+    elements: list[dict[str, Any]] = []
+    if candidates:
+        elements.append({"tag": "div", "text": _lark_md("检测到以下 Git 仓库，点击绑定：")})
+        actions: list[dict[str, Any]] = []
+        for c in candidates:
+            label = f"{c['name']} ({c['path']})"
+            actions.append(
+                _menu_button(label, f"bind_dir_select:{c['path']}", chat_id=chat_id, chat_type=chat_type)
+            )
+        # Group into rows of 2 for readability.
+        rows: list[dict[str, Any]] = []
+        for i in range(0, len(actions), 2):
+            rows.append({"tag": "action", "actions": actions[i : i + 2]})
+        elements.extend(rows)
+    else:
+        elements.append(
+            {"tag": "div", "text": _lark_md("未在 `MAC_ALLOWED_BIND_ROOTS` 下检测到 Git 仓库。")}
+        )
+
+    elements.append(
+        {
+            "tag": "div",
+            "text": _lark_md("也可以手输绝对路径，或取消绑定。"),
+        }
+    )
+    elements.append(
+        {
+            "tag": "action",
+            "actions": [
+                _menu_button("手输绝对路径", "bind_dir_manual", "primary", chat_id, chat_type),
+                _menu_button("取消", "bind_dir_cancel", chat_id=chat_id, chat_type=chat_type),
+            ],
+        }
+    )
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header("选择要绑定的目录", "blue"),
+        "elements": elements,
     }

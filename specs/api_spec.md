@@ -54,7 +54,7 @@
 }
 ```
 
-`bound_directory` 可省略。传入时必须是绝对路径；系统会校验 Git 仓库根目录，并把项目元数据写入 `.mac/projects/{project_id}/`。不传时使用系统项目工作区。飞书聊天通过 `/bind-dir` 维护聊天级默认目录，该交互不等同于新增一套 Control API 会话状态。
+`bound_directory` 可省略。传入时必须是绝对路径；系统会校验 Git 仓库根目录，并把项目元数据写入 `.mac/projects/{project_id}/`。不传时使用系统项目工作区。飞书聊天通过 `/bind` 维护聊天级默认目录，该交互不等同于新增一套 Control API 会话状态。
 
 ### `GET /projects/{project_id}`
 

@@ -451,7 +451,7 @@ ButtonAction(
 ### 8.2 后续绑定
 
 - 用户通过菜单 **绑定到项目** → 选择项目 → 创建 `project_users` 记录。
-- 文本 fallback：`/bind <project_id>`。
+- 跨 chat 接入或接手他人项目走 admin API（如 `POST /admin/projects/{id}/bind-chat`），不再暴露文本命令。
 
 ### 8.3 多用户
 
@@ -473,17 +473,17 @@ ButtonAction(
 | 指令 | 说明 |
 |------|------|
 | `/whoami` | 返回 open_id |
-| `/bind <project_id>` | 绑定到项目 |
 | `/projects` | 列出当前聊天可用项目 |
-| `/use <project_id>` | 切换当前用户在当前聊天中的项目上下文 |
-| `/current` | 查看当前项目 |
+| `/switch` | 推项目选择卡，点击切换 active project |
+| `/switch <project_id>` | 直接切换当前用户在当前聊天中的 active project |
+| `/current` | 查看当前 active project 与绑定目录 |
 | `/leave-project` | 清除当前项目上下文 |
 | `/status <project_id>` | 查询项目状态 |
 | `/create [--type=<task_type>] <描述>` | 创建项目；省略 `--type` 时由 IntentRouter 自动分类 |
 | `/input <approval_id> <回答>` | 提交人工输入 |
-| `/bind-dir <绝对路径>` | 将当前聊天绑定到已有代码仓库 |
-| `/current-dir` | 查看当前聊天绑定目录 |
-| `/unbind-dir` | 解绑目录；不影响已有项目 |
+| `/bind <绝对路径>` | 将当前聊天绑定到已有代码仓库 |
+| `/bind` | 推目录候选卡（agent 扫描允许根目录 + 推荐 + 手输兜底）；待实现 |
+| `/unbind` | 解绑目录；不影响已有项目 |
 
 ---
 

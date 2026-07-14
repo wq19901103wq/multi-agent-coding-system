@@ -151,9 +151,14 @@ cd /Users/yihanwang/multi-agent-coding-system/.worktrees/feat-core
 | 指令 | 说明 |
 |------|------|
 | `/whoami` | 返回 open_id |
-| `/bind <project_id>` | 绑定到项目 |
+| `/switch <project_id>` | 切换 active project |
+| `/switch` | 推项目选择卡 |
+| `/current` | 查看当前聊天绑定目录与 active project |
 | `/status <project_id>` | 查询项目状态 |
 | `/create <task_type> <描述>` | 创建项目 |
+| `/bind <绝对路径>` | 绑定目录（仅在没有活跃/暂停项目时可切换） |
+| `/bind` | 推目录候选卡（扫描 `MAC_ALLOWED_BIND_ROOTS`） |
+| `/unbind` | 解绑目录（仅在没有活跃/暂停项目时可解绑） |
 | `/input <approval_id> <回答>` | 提交人工输入 |
 
 ---
