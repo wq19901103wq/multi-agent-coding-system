@@ -6,6 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlmodel import select
@@ -1023,9 +1024,11 @@ async def _show_bind_candidate_card(
 ) -> None:
     """Push a candidate-directory selection card for `/bind` (no args).
 
-    Scans `MAC_ALLOWED_BIND_ROOTS` for git repos and shows them as buttons.
-    Always offers "manual input" and "cancel" buttons. If no allowed roots
-    are configured, falls back to telling the user to use `/bind <path>`.
+    Tries the `project_manager` agent (stage=`bind_dir`) first to scan
+    `MAC_ALLOWED_BIND_ROOTS` via Bash and produce candidate recommendations.
+    Falls back to the deterministic Python scanner if the agent is unavailable,
+    returns no candidates, or any error occurs. The agent never writes to the
+    database - Handler runs path validation before binding.
     """
     receive_id, receive_id_type = _reply_target(ctx, open_id)
     if not ctx.chat_id:
@@ -1056,7 +1059,7 @@ async def _show_bind_candidate_card(
         )
         return
 
-    candidates = ProjectService.scan_candidate_repositories(allowed_roots)
+    candidates = await _collect_bind_dir_candidates(ctx, allowed_roots)
     await ctx.bridge._send_interactive(
         receive_id,
         build_directory_candidate_card(
@@ -1064,6 +1067,78 @@ async def _show_bind_candidate_card(
         ),
         receive_id_type=receive_id_type,
     )
+
+
+async def _collect_bind_dir_candidates(
+    ctx: FeishuHandlerContext, allowed_roots: list[Path]
+) -> list[dict[str, str]]:
+    """Try the project_manager agent first; fall back to deterministic scan.
+
+    The agent is asked (via `bind_dir` stage prompt) to scan allowed roots
+    with Bash and return candidate repos. If the agent fails or returns an
+    empty list, we fall back to the pure-Python scanner so the user always
+    gets a usable card.
+    """
+    allowed_roots_str = "\n".join(str(r) for r in allowed_roots)
+    try:
+        output = await ctx.orchestrator.run_chat_scoped_agent(
+            agent_type="project_manager",
+            stage="bind_dir",
+            input_data={"allowed_bind_roots": [str(r) for r in allowed_roots]},
+            extra_variables={"allowed_bind_roots": allowed_roots_str},
+        )
+    except Exception as exc:
+        logger.warning("project_manager bind_dir agent crashed: %s", exc)
+        output = None
+
+    if output and output.get("success") and output.get("candidates"):
+        # Filter candidates to those that actually exist and have .git, as a
+        # safety net against the agent returning paths outside allowed roots.
+        valid: list[dict[str, str]] = []
+        for c in output["candidates"][:12]:
+            path_str = c.get("path", "")
+            if not path_str:
+                continue
+            path = Path(path_str).expanduser()
+            try:
+                path = path.resolve()
+            except Exception:
+                continue
+            if not _path_within_allowed_roots(path, allowed_roots):
+                logger.warning(
+                    "project_manager returned path outside allowed roots: %s",
+                    path,
+                )
+                continue
+            if not (path / ".git").exists():
+                continue
+            valid.append({"path": str(path), "name": c.get("name") or path.name})
+        if valid:
+            return valid
+
+    # Fallback: deterministic Python scan.
+    return ProjectService.scan_candidate_repositories(allowed_roots)
+
+
+def _path_within_allowed_roots(path: Path, allowed_roots: list[Path]) -> bool:
+    """Return True if `path` is equal to or nested inside an allowed root."""
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    for root in allowed_roots:
+        try:
+            resolved_root = root.resolve()
+        except Exception:
+            continue
+        if resolved == resolved_root:
+            return True
+        try:
+            resolved.relative_to(resolved_root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 async def _leave_project(

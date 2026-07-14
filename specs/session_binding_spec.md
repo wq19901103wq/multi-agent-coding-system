@@ -75,18 +75,20 @@ repository/
 
 ## 5. 目标候选目录卡
 
-`/bind`（无参）触发候选目录卡，由 Handler 层确定性扫描 `MAC_ALLOWED_BIND_ROOTS` 实现：
+`/bind`（无参）触发候选目录卡，由 `project_manager` Agent + Bash + `bind_dir` 阶段实现，确定性扫描作为兜底：
 
-- 在允许根目录下递归最多 2 层，列出含有 `.git` 的目录作为候选；
-- 候选列表上限 12 项，超出截断；
+- Handler 先调用 `project_manager` Agent（stage=`bind_dir`），prompt 注入 `MAC_ALLOWED_BIND_ROOTS` 严格约束扫描范围；
+- Agent 用 Bash `ls`/`find` 在允许根目录下列出含 `.git` 的子目录，输出 `candidates` JSON；
+- Handler 校验 Agent 返回的路径都在 `MAC_ALLOWED_BIND_ROOTS` 内、且确实含 `.git`，过滤越界路径；
+- Agent 调用失败或返回空候选时，降级到确定性 Python 扫描（`ProjectService.scan_candidate_repositories`，递归 2 层，上限 12 个）；
 - 卡片固定包含「手输绝对路径」和「取消」按钮；
 - 用户点击候选 -> Handler 调用 `_prepare_bound_directory` 校验后写入 `ChatDirectoryBinding`；
 - 用户点击「手输绝对路径」-> 设置 `PendingIntent.stage=awaiting_bind_dir`，下一条文本消息作为路径处理；
 - 未配置 `MAC_ALLOWED_BIND_ROOTS` 时降级为提示用户使用 `/bind <绝对路径>`。
 
-目录扫描严格限制在 `MAC_ALLOWED_BIND_ROOTS` 内，不允许 Agent 任意遍历整台机器。最终绑定由确定性路径校验代码执行，不由 Agent 直接写数据库或执行 `git init`。
+目录扫描严格限制在 `MAC_ALLOWED_BIND_ROOTS` 内。Agent 不直接写数据库、不执行 `git init`--所有写操作由 Handler 层确定性代码执行。
 
-LLM 增强层（`project_manager` Agent + Bash + `bind_dir` 阶段）作为后续增强项，本阶段不依赖；当前 `/bind`（无参）的候选判断由确定性 Python 扫描完成，没有 LLM 调用开销。
+`run_chat_scoped_agent` 是 orchestrator 提供的 chat-scoped agent 调用通道：不创建 Task、不依赖 Project，使用临时目录作为 worktree，适用于 `/bind`（无参）这类没有项目上下文的控制面决策。
 
 ## 6. 并发与安全
 

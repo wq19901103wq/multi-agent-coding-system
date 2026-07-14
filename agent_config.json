@@ -82,12 +82,18 @@
     },
     "project_manager": {
       "model": "claude-sonnet-4-20250514",
-      "description": "处理用户追问、生成确认摘要、推荐下一步动作",
+      "description": "处理用户追问、生成确认摘要、推荐下一步动作、目录候选推荐",
       "skills": [],
-      "default_allowed_tools": ["Read"],
+      "default_allowed_tools": ["Read", "Bash"],
       "prompt_file": "prompts/project_manager.md",
       "output_file": "TASK.json",
-      "output_schema": "specs/schemas/project_manager_output.json"
+      "output_schema": "specs/schemas/project_manager_output.json",
+      "stages": {
+        "bind_dir": {
+          "prompt_file": "prompts/project_manager_bind_dir.md",
+          "output_schema": "specs/schemas/project_manager_bind_dir_output.json"
+        }
+      }
     }
   }
 }

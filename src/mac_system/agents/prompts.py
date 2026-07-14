@@ -59,7 +59,7 @@ class PromptRenderer:
         self,
         agent_type: str,
         stage: str | None,
-        project: Project,
+        project: Project | None,
         state: str,
         worktree: Path,
         context_files: list[Path],
@@ -69,6 +69,7 @@ class PromptRenderer:
         open_feedback: list[dict] | None = None,
         round_number: int = 1,
         qa_history: list[dict] | None = None,
+        extra_variables: dict[str, str] | None = None,
     ) -> str:
         agent_cfg = self.get_agent_config(agent_type)
         stage_cfg = self.get_stage_config(agent_type, stage)
@@ -86,22 +87,24 @@ class PromptRenderer:
         )
 
         variables = {
-            "project_id": project.id,
+            "project_id": project.id if project else "",
             "task_id": task_id or "",
             "agent_type": agent_type,
             "state": state,
-            "task_type": project.task_type,
-            "description": project.description or "",
+            "task_type": project.task_type if project else "",
+            "description": project.description or "" if project else "",
             "state_json_path": str(worktree / ".mac" / "STATE.json"),
             "task_json_path": str(worktree / ".mac" / "TASK.json"),
             "output_schema_path": output_schema_path or "",
             "worktree_path": str(worktree),
-            "workspace_path": str(project.workspace_path),
+            "workspace_path": str(project.workspace_path) if project else str(worktree),
             "context_files": context_files_md,
             "rejection_note": rejection_note or "无",
             "round_number": round_number,
             "open_feedback_count": len(open_feedback) if open_feedback else 0,
         }
+        if extra_variables:
+            variables.update(extra_variables)
 
         prompt = self._replace_variables(template, variables)
 

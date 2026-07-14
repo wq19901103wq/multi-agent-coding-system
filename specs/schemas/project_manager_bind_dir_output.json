@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/project_manager_bind_dir_output.json",
+  "title": "Project Manager Bind Dir Output",
+  "type": "object",
+  "required": ["success", "candidates"],
+  "additionalProperties": false,
+  "properties": {
+    "success": {"type": "boolean"},
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "name"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "name": {"type": "string"},
+          "description": {"type": "string"}
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

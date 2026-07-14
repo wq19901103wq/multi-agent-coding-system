@@ -207,7 +207,7 @@ Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInt
 1. **ask_user 卡片在真实飞书未观测到**：代码已实现 `build_question_batch_card` 和 parent_id 回复路由，但尚未在真实飞书群验证下拉组件、按钮和自由文本回复的完整组合。
 2. **驳回后的两步回复卡尚未实现**：当前可用 `/reject <approval_id> <feedback>` 或点击驳回后发送反馈；目标交互是先发一张可回复的反馈卡，再决定回退。
 3. **目录绑定仍是可信控制面模型**：当前会校验绝对路径和 Git 根目录，并要求 `/bind`、`/unbind` 在没有活跃/暂停项目时才能切换；但还没有群管理员角色和 Control API 鉴权；部署到不受信任的多人群前必须补齐。
-4. **`/bind` 无参候选卡未走 LLM**：当前实现用确定性 Python 扫描 `MAC_ALLOWED_BIND_ROOTS`，没有调用 `project_manager` Agent。LLM 增强层（`project_manager` + Bash + `bind_dir` 阶段）作为后续增强项；需要先解决 `_execute_auxiliary_agent` 是 project-scoped 的问题才能让 agent 在 chat-scoped 操作中复用。
+4. **`/bind` 无参候选卡 Agent 路径未在真实飞书验证**：代码已实现 `project_manager` + Bash + `bind_dir` 阶段调用 `run_chat_scoped_agent`，确定性扫描作为兜底；但未在真实飞书群观测到 Agent 实际扫描行为和返回的候选卡。`run_chat_scoped_agent` 不创建 Task、不依赖 Project，使用临时 worktree；不留下审计轨迹。
 
 ## 9. 下一步工作（按优先级）
 

@@ -635,6 +635,86 @@ class AgentOrchestrator:
         await self.project_service.complete_task(task.id, result.output_json, result.cost_info)
         return result.output_json
 
+    async def run_chat_scoped_agent(
+        self,
+        agent_type: str,
+        stage: str | None,
+        input_data: dict[str, Any],
+        extra_variables: dict[str, str] | None = None,
+        *,
+        worktree: Path | None = None,
+    ) -> dict[str, Any] | None:
+        """Run an auxiliary agent for a chat-scoped (non-project) operation.
+
+        Used by operations like `/bind` (no-args) which need an LLM agent but
+        don't have a Project context. Uses a temp directory as the worktree
+        since there's no project workspace. Does NOT create a Task row in the
+        database - this is fire-and-forget LLM invocation with no audit trail.
+
+        Returns the agent output JSON, or None if execution failed.
+        """
+        import tempfile
+
+        if worktree is None:
+            worktree = Path(tempfile.mkdtemp(prefix=f"mac_chat_scoped_{agent_type}_"))
+        try:
+            try:
+                system_prompt = self.prompt_renderer.render_system_prompt(agent_type, stage)
+                output_schema = self.prompt_renderer.get_output_schema_path(agent_type, stage)
+                task_prompt = self.prompt_renderer.render_task_prompt(
+                    agent_type=agent_type,
+                    stage=stage,
+                    project=None,
+                    state="chat_scoped",
+                    worktree=worktree,
+                    context_files=[],
+                    output_schema_path=str(output_schema),
+                    extra_variables=extra_variables,
+                )
+                allowed_tools = self.prompt_renderer.get_allowed_tools(agent_type)
+            except Exception as e:
+                logger.error(
+                    "Chat-scoped agent %s/%s prompt rendering failed: %s",
+                    agent_type, stage, e,
+                )
+                return None
+
+            try:
+                result = await self.runtime.execute(
+                    agent_type=agent_type,
+                    task_prompt=task_prompt,
+                    system_prompt=system_prompt,
+                    workspace=worktree,
+                    worktree=worktree,
+                    context_files=[],
+                    output_schema=output_schema,
+                    allowed_tools=allowed_tools,
+                    readonly_dirs=[worktree],
+                    timeout_seconds=self.settings.agent_timeout_seconds,
+                )
+            except Exception as e:
+                logger.error(
+                    "Chat-scoped agent %s/%s runtime failed: %s",
+                    agent_type, stage, e,
+                )
+                return None
+
+            if not result.success or not result.output_json:
+                logger.warning(
+                    "Chat-scoped agent %s/%s returned failure: %s",
+                    agent_type, stage, result.logs or "no output",
+                )
+                return None
+            return result.output_json
+        finally:
+            # Best-effort cleanup of the temp dir. Don't raise on failure.
+            try:
+                if worktree.exists():
+                    import shutil
+                    shutil.rmtree(worktree, ignore_errors=True)
+            except Exception:
+                pass
+
     async def _choose_action_with_project_manager(
         self,
         project: Project,

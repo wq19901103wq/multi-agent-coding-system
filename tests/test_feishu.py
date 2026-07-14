@@ -1192,6 +1192,206 @@ async def test_scan_candidate_repositories_finds_git_dirs(tmp_path):
     assert str(non_repo) not in paths
 
 
+class _FakeOrchestratorWithBindDir:
+    """Fake orchestrator that returns canned bind_dir agent output."""
+
+    def __init__(self, agent_output=None):
+        self.ticked = []
+        self.cancelled = []
+        self.agent_output = agent_output
+        self.agent_calls = []
+
+    async def tick(self, project_id: str) -> None:
+        self.ticked.append(project_id)
+
+    async def cancel_project(self, project_id: str, reason: str = "") -> None:
+        self.cancelled.append((project_id, reason))
+
+    async def run_chat_scoped_agent(
+        self, agent_type, stage, input_data, extra_variables=None, *, worktree=None
+    ):
+        self.agent_calls.append({
+            "agent_type": agent_type,
+            "stage": stage,
+            "input_data": input_data,
+            "extra_variables": extra_variables,
+        })
+        return self.agent_output
+
+    def _agent_label_for_state(self, state: str) -> str:
+        return state
+
+
+async def test_bind_no_args_uses_agent_candidates_when_available(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When the project_manager agent returns candidates, they appear on the card."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    repo = allowed_root / "agent-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_bind_agent"
+    feishu_ctx.chat_type = "group"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={
+            "success": True,
+            "candidates": [
+                {"path": str(repo), "name": "agent-repo", "description": "from agent"}
+            ],
+            "notes": [],
+        }
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/bind", is_command=True),
+    )
+
+    # Agent was invoked with bind_dir stage.
+    assert feishu_ctx.orchestrator.agent_calls
+    call = feishu_ctx.orchestrator.agent_calls[0]
+    assert call["agent_type"] == "project_manager"
+    assert call["stage"] == "bind_dir"
+    assert "allowed_bind_roots" in call["extra_variables"]
+
+    cards = [c for c in feishu_ctx.bridge.sent if c[0] == "interactive"]
+    assert cards
+    payload = cards[-1][2]
+    assert str(repo) in str(payload)
+    assert "agent-repo" in str(payload)
+
+
+async def test_bind_no_args_falls_back_when_agent_returns_no_candidates(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When the agent returns empty candidates, fall back to deterministic scan."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    repo = allowed_root / "scanned-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_bind_fallback"
+    feishu_ctx.chat_type = "group"
+    # Agent returns success but empty candidate list.
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={"success": True, "candidates": [], "notes": []}
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/bind", is_command=True),
+    )
+
+    cards = [c for c in feishu_ctx.bridge.sent if c[0] == "interactive"]
+    assert cards
+    payload = cards[-1][2]
+    # Deterministic scan should have found the repo.
+    assert str(repo) in str(payload)
+    assert "scanned-repo" in str(payload)
+
+
+async def test_bind_no_args_falls_back_when_agent_crashes(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When the agent raises, fall back to deterministic scan."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    repo = allowed_root / "fallback-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_bind_crash"
+    feishu_ctx.chat_type = "group"
+
+    class _CrashingOrchestrator(_FakeOrchestratorWithBindDir):
+        async def run_chat_scoped_agent(self, *args, **kwargs):
+            raise RuntimeError("agent crashed")
+
+    feishu_ctx.orchestrator = _CrashingOrchestrator()
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/bind", is_command=True),
+    )
+
+    cards = [c for c in feishu_ctx.bridge.sent if c[0] == "interactive"]
+    assert cards
+    payload = cards[-1][2]
+    assert str(repo) in str(payload)
+
+
+async def test_bind_no_args_filters_agent_candidates_outside_allowed_roots(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """Agent-returned paths outside allowed roots are filtered out."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    inside_repo = allowed_root / "inside-repo"
+    inside_repo.mkdir()
+    (inside_repo / ".git").mkdir()
+
+    # A path outside allowed_root that the agent should not have returned.
+    outside_repo = tmp_path / "outside" / "outside-repo"
+    outside_repo.mkdir(parents=True)
+    (outside_repo / ".git").mkdir()
+
+    import mac_system.config as cfg_module
+    monkeypatch.setattr(
+        cfg_module, "get_allowed_bind_roots", lambda: [allowed_root]
+    )
+
+    feishu_ctx.chat_id = "oc_bind_filter"
+    feishu_ctx.chat_type = "group"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir(
+        agent_output={
+            "success": True,
+            "candidates": [
+                {"path": str(inside_repo), "name": "inside-repo"},
+                {"path": str(outside_repo), "name": "outside-repo"},
+            ],
+            "notes": [],
+        }
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(open_id="ou_1", message_id="m1", text="/bind", is_command=True),
+    )
+
+    cards = [c for c in feishu_ctx.bridge.sent if c[0] == "interactive"]
+    assert cards
+    payload = cards[-1][2]
+    # Inside repo appears, outside is filtered.
+    assert str(inside_repo) in str(payload)
+    assert str(outside_repo) not in str(payload)
+
+
 async def test_create_in_bound_directory_uses_binding(feishu_ctx, tmp_path):
     from mac_system.feishu.handlers import handle_text_message
 
