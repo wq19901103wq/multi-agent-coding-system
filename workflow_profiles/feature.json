@@ -1,0 +1,80 @@
+{
+  "version": "1.0",
+  "task_type": "feature",
+  "description": "新功能开发流程",
+  "stages": [
+    {
+      "id": "requirements",
+      "kind": "planning",
+      "execution_state": "PLANNING_REQUIREMENTS",
+      "agent": "planner",
+      "stage": "requirements",
+      "display": "需求分析中",
+      "inputs": [{"state": "REQUIREMENT_INPUT_PENDING", "display": "等待需求澄清", "default": true}],
+      "confirmation": {"state": "REQUIREMENT_CONFIRM_PENDING", "display": "等待确认需求", "subject": "需求理解"}
+    },
+    {
+      "id": "architecture",
+      "kind": "planning",
+      "execution_state": "PLANNING_ARCHITECTURE",
+      "agent": "planner",
+      "stage": "architecture",
+      "display": "方案设计中",
+      "inputs": [{"state": "ARCHITECTURE_INPUT_PENDING", "display": "等待方案澄清", "default": true}],
+      "confirmation": {"state": "ARCHITECTURE_CONFIRM_PENDING", "display": "等待确认方案", "subject": "技术方案", "routes": {"select_option": "$stage:architecture"}}
+    },
+    {
+      "id": "specs",
+      "kind": "planning",
+      "execution_state": "PLANNING_IMPLEMENTATION_SPECS",
+      "agent": "planner",
+      "stage": "specs",
+      "display": "实现计划编制中",
+      "inputs": [{"state": "IMPLEMENTATION_SPEC_INPUT_PENDING", "display": "等待实现计划澄清", "default": true}],
+      "confirmation": {"state": "IMPLEMENTATION_SPEC_CONFIRM_PENDING", "display": "等待确认实现计划", "subject": "实现计划"}
+    },
+    {
+      "id": "coding",
+      "kind": "implementation",
+      "execution_state": "CODING",
+      "agent": "coder",
+      "display": "编码中",
+      "inputs": [
+        {"state": "CLARIFICATION_PENDING", "display": "等待澄清", "default": true, "event": "clarify", "return_events": {"answer": "$stage:coding", "needs_spec_change": "$stage:specs", "needs_architecture_change": "$stage:architecture"}},
+        {"state": "CONFLICT_PENDING", "display": "等待冲突裁决", "purpose": "conflict_resolution", "event": "conflict", "return_events": {"resolve": "$stage:coding", "needs_spec_change": "$stage:specs", "needs_architecture_change": "$stage:architecture"}}
+      ],
+      "routes": {"new_requirement": "$stage:requirements", "architecture_question": "$stage:architecture", "spec_question": "$stage:specs"},
+      "confirmation": {"state": "CODING_CONFIRM_PENDING", "display": "等待确认编码结果"}
+    },
+    {
+      "id": "testing",
+      "kind": "quality",
+      "execution_state": "TESTING",
+      "agent": "tester",
+      "display": "测试中",
+      "inputs": [{"state": "TESTING_INPUT_PENDING", "display": "等待测试澄清", "default": true}],
+      "confirmation": {"state": "TESTING_CONFIRM_PENDING", "display": "等待确认测试结果"}
+    },
+    {
+      "id": "review",
+      "kind": "quality",
+      "execution_state": "REVIEW",
+      "agent": "reviewer",
+      "display": "Review 中",
+      "inputs": [{"state": "REVIEW_INPUT_PENDING", "display": "等待 Review 澄清", "default": true}],
+      "confirmation": {"state": "REVIEW_CONFIRM_PENDING", "display": "等待确认 Review 结果"}
+    }
+  ],
+  "rework_targets": [
+    {"action": "to_requirements", "label": "重新明确需求", "target_stage": "requirements"},
+    {"action": "to_architecture", "label": "重新设计方案", "target_stage": "architecture"},
+    {"action": "to_specs", "label": "重新制定实现计划", "target_stage": "specs"},
+    {"action": "to_coding", "label": "直接重新编码", "target_stage": "coding"},
+    {"action": "to_testing", "label": "直接重新测试", "target_stage": "testing"}
+  ],
+  "acceptance_targets": [
+    {"action": "reject_to_requirements", "label": "驳回到需求", "target_stage": "requirements"},
+    {"action": "reject_to_architecture", "label": "驳回到架构", "target_stage": "architecture"},
+    {"action": "reject_to_specs", "label": "驳回到实现计划", "target_stage": "specs"}
+  ]
+}

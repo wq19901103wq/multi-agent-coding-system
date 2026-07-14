@@ -26,15 +26,16 @@ class WorktreeManager:
         task_id: str,
         agent_type: str,
         stage: str | None = None,
+        workspace_path: str | Path | None = None,
     ) -> Path:
-        workspace = self._workspace(project_id)
+        workspace = self._workspace(project_id, workspace_path)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         name_parts = [agent_type]
         if stage:
             name_parts.append(stage)
         name_parts.extend([task_id, timestamp])
         worktree_name = "_".join(name_parts)
-        worktree_path = (workspace / "worktrees" / worktree_name).resolve()
+        worktree_path = (self._worktrees_dir(project_id, workspace) / worktree_name).resolve()
 
         branch_name = f"mac/{project_id}/{agent_type}/{task_id}"
 
@@ -61,8 +62,9 @@ class WorktreeManager:
         worktree: Path,
         state_doc: dict[str, Any],
         task_input: dict[str, Any],
+        workspace_path: str | Path | None = None,
     ) -> None:
-        workspace = self._workspace(project_id)
+        workspace = self._workspace(project_id, workspace_path)
         mac_files = [
             "STATE.json",
             "REQUIREMENTS.json",
@@ -74,7 +76,7 @@ class WorktreeManager:
         ]
 
         for filename in mac_files:
-            src = workspace / ".mac" / filename
+            src = self._project_mac_dir(project_id, workspace) / filename
             dst = worktree / ".mac" / filename
             if src.exists():
                 shutil.copy2(src, dst)
@@ -123,8 +125,9 @@ class WorktreeManager:
         task_id: str,
         agent_type: str,
         worktree: Path | None = None,
+        workspace_path: str | Path | None = None,
     ) -> None:
-        workspace = self._workspace(project_id)
+        workspace = self._workspace(project_id, workspace_path)
         branch_name = f"mac/{project_id}/{agent_type}/{task_id}"
 
         if worktree is not None:
@@ -173,13 +176,14 @@ class WorktreeManager:
         task_id: str,
         agent_type: str,
         worktree: Path,
+        workspace_path: str | Path | None = None,
     ) -> None:
-        workspace = self._workspace(project_id)
+        workspace = self._workspace(project_id, workspace_path)
         branch_name = f"mac/{project_id}/{agent_type}/{task_id}"
 
         # Remove worktree
         subprocess.run(
-            ["git", "worktree", "remove", str(worktree)],
+            ["git", "worktree", "remove", "--force", str(worktree)],
             cwd=workspace,
             check=True,
             capture_output=True,
@@ -195,17 +199,19 @@ class WorktreeManager:
             text=True,
         )
 
-    def remove_all_worktrees(self, project_id: str) -> None:
+    def remove_all_worktrees(
+        self, project_id: str, workspace_path: str | Path | None = None
+    ) -> None:
         """Remove every worktree and matching branch for a project.
 
         Used when a project is cancelled/restarted so that orphan worktrees do
         not accumulate.
         """
-        workspace = self._workspace(project_id)
+        workspace = self._workspace(project_id, workspace_path)
         if not workspace.exists():
             return
 
-        for wt in self.list_worktrees(project_id):
+        for wt in self.list_worktrees(project_id, workspace_path):
             try:
                 subprocess.run(
                     ["git", "worktree", "remove", "-f", str(wt)],
@@ -230,12 +236,31 @@ class WorktreeManager:
         except Exception:
             pass
 
-    def list_worktrees(self, project_id: str) -> list[Path]:
-        workspace = self._workspace(project_id)
-        worktrees_dir = workspace / "worktrees"
+    def list_worktrees(
+        self, project_id: str, workspace_path: str | Path | None = None
+    ) -> list[Path]:
+        workspace = self._workspace(project_id, workspace_path)
+        worktrees_dir = self._worktrees_dir(project_id, workspace)
         if not worktrees_dir.exists():
             return []
         return [d for d in worktrees_dir.iterdir() if d.is_dir()]
 
-    def _workspace(self, project_id: str) -> Path:
+    def _workspace(
+        self, project_id: str, workspace_path: str | Path | None = None
+    ) -> Path:
+        if workspace_path is not None:
+            return Path(workspace_path).resolve()
         return self.projects_dir / project_id
+
+    def _is_bound_workspace(self, project_id: str, workspace: Path) -> bool:
+        return workspace.resolve() != (self.projects_dir / project_id).resolve()
+
+    def _worktrees_dir(self, project_id: str, workspace: Path) -> Path:
+        if self._is_bound_workspace(project_id, workspace):
+            return workspace / ".mac" / "worktrees" / project_id
+        return workspace / "worktrees"
+
+    def _project_mac_dir(self, project_id: str, workspace: Path) -> Path:
+        if self._is_bound_workspace(project_id, workspace):
+            return workspace / ".mac" / "projects" / project_id
+        return workspace / ".mac"

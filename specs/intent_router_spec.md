@@ -128,7 +128,7 @@ bug, fix, 修复, 报错, 异常, 崩溃, 不工作, 回归
 
 ## 错误处理
 
-- 若 `task_type` 对应的 `state_machines/{task_type}.json` 不存在，视为未覆盖，返回 `task_type=None`。
+- 若 `task_type` 对应的 `workflow_profiles/{task_type}.json` 不存在，视为未覆盖，返回 `task_type=None`。所有已覆盖类型均复用 `state_machines/delivery.json`。
 - 分类器本身不应抛异常；任何异常都应被捕获并返回低置信度的 `RouteDecision`。
 
 ## 测试要求

@@ -69,7 +69,7 @@ def build_confirmation_card(
 
     # Expose the approval id so users can respond via slash commands too.
     elements.append(
-        {"tag": "div", "text": _lark_md(f"审批ID：`{approval_id}`\n可用 `/confirm {approval_id}` 或 `/reject {approval_id} [反馈]`")}
+        {"tag": "div", "text": _lark_md(f"审批ID：{approval_id}\n可用 **/confirm {approval_id}** 或 **/reject {approval_id} [反馈]**")}
     )
 
     if show_actions:
@@ -111,30 +111,57 @@ def build_input_card(
     state: str,
     chat_id: str | None = None,
     chat_type: str = "p2p",
+    kind: str = "blocking",
+    question_id: str | None = None,
+    interaction_id: str | None = None,
+    answered: bool = False,
+    answer_text: str | None = None,
+    skipped: bool = False,
 ) -> dict[str, Any]:
-    """Build a Feishu interactive input/clarification card."""
+    """Build a Feishu interactive input/clarification card for a free-text question.
+
+    When ``answered`` or ``skipped`` is True, render a read-only receipt state
+    showing the answer (or a skipped notice) and no action buttons. Otherwise
+    show a "跳过" button only for non_blocking questions; blocking/decision
+    questions must be answered by replying.
+    """
     elements: list[dict[str, Any]] = [
         {"tag": "div", "text": _lark_md(f"**问题**：{question}")},
     ]
     if context:
         elements.append({"tag": "div", "text": _lark_md(f"**上下文**：{context}")})
-    elements.append({"tag": "div", "text": _lark_md(f"审批ID：`{approval_id}`")})
-    elements.append({"tag": "div", "text": _lark_md("请直接回复你的答案，或用 `/input <approval_id> <回答>`。")})
-    elements.append({
-        "tag": "action",
-        "actions": [{
-            "tag": "button",
-            "text": _plain_text("我已回复"),
-            "type": "primary",
-            "value": {
+    elements.append({"tag": "div", "text": _lark_md(f"审批ID：{approval_id}")})
+
+    if answered:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "text": _lark_md(f"**你的回答**：{answer_text or ''}")})
+        elements.append({"tag": "div", "text": _lark_md("✅ 已回答")})
+    elif skipped:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "text": _lark_md("⏭️ 已跳过")})
+    else:
+        elements.append({"tag": "div", "text": _lark_md("请直接回复此消息作答。")})
+        if kind == "non_blocking":
+            skip_value = {
                 "approval_id": approval_id,
-                "action": "answered",
+                "action": "skip_free_text",
                 "state": state,
                 "chat_id": chat_id,
                 "chat_type": chat_type,
-            },
-        }],
-    })
+            }
+            if question_id is not None:
+                skip_value["question_id"] = question_id
+            if interaction_id is not None:
+                skip_value["interaction_id"] = interaction_id
+            elements.append({
+                "tag": "action",
+                "actions": [{
+                    "tag": "button",
+                    "text": _plain_text("跳过"),
+                    "type": "default",
+                    "value": skip_value,
+                }],
+            })
 
     return {
         "config": {"wide_screen_mode": True},
@@ -148,7 +175,7 @@ def build_input_card(
 _TRANSITION_DISPLAY_NAMES: dict[str, str] = {
     "PLANNING_REQUIREMENTS": "需求分析",
     "PLANNING_ARCHITECTURE": "方案设计",
-    "PLANNING_SPECS": "Spec 拆分",
+    "PLANNING_IMPLEMENTATION_SPECS": "实现计划",
     "BUG_ANALYSIS": "Bug 分析",
     "DOC_OUTLINE": "文档大纲",
     "CODING": "编码",
@@ -157,7 +184,7 @@ _TRANSITION_DISPLAY_NAMES: dict[str, str] = {
     "MERGING": "提交代码",
     "REQUIREMENT_CONFIRM_PENDING": "需求确认",
     "ARCHITECTURE_CONFIRM_PENDING": "方案确认",
-    "SPEC_CONFIRM_PENDING": "Spec 确认",
+    "IMPLEMENTATION_SPEC_CONFIRM_PENDING": "实现计划确认",
     "BUG_FIX_CONFIRM_PENDING": "修复方案确认",
     "OUTLINE_CONFIRM_PENDING": "文档大纲确认",
     "ACCEPTANCE_PENDING": "验收确认",
@@ -222,7 +249,7 @@ def build_transition_card(
 
     return {
         "config": {"wide_screen_mode": True},
-        "header": _header("状态流转", "blue"),
+        "header": _header(f"[{project_name}] 状态流转", "blue"),
         "elements": elements,
     }
 
@@ -241,7 +268,7 @@ def build_feedback_card(
         content += f"\n\n{note}"
     return {
         "config": {"wide_screen_mode": True},
-        "header": _header(f"操作确认 — {project_name}", "green"),
+        "header": _header(f"[{project_name}] 操作确认", "green"),
         "elements": [
             {"tag": "div", "text": _lark_md(content)},
         ],
@@ -255,7 +282,7 @@ def build_rejection_summary_card(
     round_number: int,
 ) -> dict[str, Any]:
     """Build a card summarizing the user's rejection feedback before re-planning."""
-    title = f"第{round_number}轮 {state_display} 修改意见"
+    title = f"[{project_name}] 第{round_number}轮 {state_display} 修改意见"
     return {
         "config": {"wide_screen_mode": True},
         "header": _header(title, "orange"),
@@ -288,3 +315,114 @@ def build_status_card(
         "header": _header(title, "green"),
         "elements": elements,
     }
+
+
+def build_question_batch_card(
+    approval_id, interaction_id, questions, agent, stage, impact=None,
+    state="", project_name="", chat_id=None, chat_type="p2p",
+    selected_options=None, submitted_answers=None,
+):
+    """Build a Feishu card that presents a batch of choice questions as buttons.
+
+    Individual option clicks only change the selection state on the card. The
+    user must click the "提交答案" button to submit all selected answers.
+
+    When ``submitted_answers`` is provided, render a read-only "已提交" receipt
+    state: option buttons are disabled, final answers are highlighted, action
+    buttons are hidden, and a status line is appended.
+    """
+    selected_options = selected_options or {}
+    submitted_answers = submitted_answers or {}
+    is_submitted = bool(submitted_answers)
+    elements: list[dict[str, Any]] = []
+    if impact:
+        elements.append({"tag": "div", "text": _lark_md(f"**影响说明**：{impact}")})
+    if not is_submitted:
+        elements.append({"tag": "div", "text": _lark_md(
+            f"共 {len(questions)} 个选择题，点击选项即可选择，最后点 **提交答案** 确认。"
+        )})
+    for q in questions:
+        qid = q.get("question_id") or q.get("db_id") or ""
+        question_text = q.get("question", "")
+        kind = q.get("kind", "blocking")
+        reason = q.get("reason", "")
+        options = q.get("options") or []
+        recommended = q.get("recommended_option")
+        selected = selected_options.get(qid)
+        final_answer = submitted_answers.get(qid)
+        kind_badge = {"blocking": "阻塞", "decision": "决策", "non_blocking": "可选"}.get(kind, kind)
+        header_line = f"**{question_text}** （{kind_badge}）"
+        if reason:
+            header_line += f"\n原因：{reason}"
+        if is_submitted:
+            if final_answer:
+                final_label = next((opt.get("label", opt.get("key", "")) for opt in options if opt.get("key") == final_answer), final_answer)
+                header_line += f"\n已提交：{final_label}"
+        else:
+            if recommended:
+                rec_label = next((opt.get("label", opt.get("key", "")) for opt in options if opt.get("key") == recommended), recommended)
+                header_line += f"\n推荐：{rec_label}"
+            if selected:
+                sel_label = next((opt.get("label", opt.get("key", "")) for opt in options if opt.get("key") == selected), selected)
+                header_line += f"\n已选：{sel_label}"
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "text": _lark_md(header_line)})
+        # Feishu allows up to 4 buttons per action row.
+        option_buttons: list[dict[str, Any]] = []
+        for opt in options:
+            label = opt.get("label", opt.get("key", ""))
+            key = opt.get("key", label)
+            is_selected = key == selected
+            is_final = key == final_answer
+            is_recommended = key == recommended
+            if is_submitted:
+                btn_type = "primary" if is_final else "default"
+            else:
+                btn_type = "primary" if is_selected else ("primary" if is_recommended and selected is None else "default")
+            button: dict[str, Any] = {
+                "tag": "button",
+                "text": _plain_text(label),
+                "type": btn_type,
+                "value": {
+                    "approval_id": approval_id,
+                    "interaction_id": interaction_id,
+                    "action": "select_question_option",
+                    "question_id": qid,
+                    "option_key": key,
+                    "state": state,
+                    "chat_id": chat_id,
+                    "chat_type": chat_type,
+                },
+            }
+            if is_submitted:
+                button["disabled"] = True
+            option_buttons.append(button)
+        for i in range(0, len(option_buttons), 4):
+            elements.append({"tag": "action", "actions": option_buttons[i:i + 4]})
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "div", "text": _lark_md(f"审批ID：{approval_id}")})
+    if is_submitted:
+        elements.append({"tag": "div", "text": _lark_md("✅ 已提交，Agent 继续执行")})
+    else:
+        has_non_blocking = any(q.get("kind") == "non_blocking" for q in questions)
+        actions = [
+            {"tag": "button", "text": _plain_text("提交答案"), "type": "primary",
+             "value": {"approval_id": approval_id, "interaction_id": interaction_id,
+                       "action": "submit_selected_options", "state": state,
+                       "chat_id": chat_id, "chat_type": chat_type}},
+        ]
+        if has_non_blocking:
+            actions.append(
+                {"tag": "button", "text": _plain_text("跳过未答"), "type": "default",
+                 "value": {"approval_id": approval_id, "interaction_id": interaction_id,
+                           "action": "skip_remaining", "state": state,
+                           "chat_id": chat_id, "chat_type": chat_type}},
+            )
+        elements.append({"tag": "action", "actions": actions})
+    stage_label = stage or agent
+    title = "已提交" if is_submitted else f"需要确认 {len(questions)} 个问题"
+    prefix = f"[{project_name}] " if project_name else ""
+    header_color = "green" if is_submitted else "orange"
+    return {"config": {"wide_screen_mode": True},
+            "header": _header(f"{prefix}[{stage_label}] {title}", header_color),
+            "elements": elements}

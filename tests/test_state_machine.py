@@ -5,6 +5,7 @@ from mac_system.state_machine import StateMachine
 
 def test_feature_state_machine_basic():
     sm = StateMachine("feature")
+    assert sm._config["machine_type"] == "delivery"
     assert sm.task_type == "feature"
     assert sm.initial_state == "PLANNING_REQUIREMENTS"
     assert sm.state_type("PLANNING_REQUIREMENTS") == "agent_execution"
@@ -18,10 +19,10 @@ def test_feature_transitions():
     assert sm.next_state("REQUIREMENT_CONFIRM_PENDING", "confirm") == "PLANNING_ARCHITECTURE"
     assert sm.next_state("REQUIREMENT_CONFIRM_PENDING", "reject") == "PLANNING_REQUIREMENTS"
     assert sm.next_state("PLANNING_ARCHITECTURE", "complete") == "ARCHITECTURE_CONFIRM_PENDING"
-    assert sm.next_state("ARCHITECTURE_CONFIRM_PENDING", "confirm") == "PLANNING_SPECS"
+    assert sm.next_state("ARCHITECTURE_CONFIRM_PENDING", "confirm") == "PLANNING_IMPLEMENTATION_SPECS"
     assert sm.next_state("ARCHITECTURE_CONFIRM_PENDING", "select_option") == "PLANNING_ARCHITECTURE"
-    assert sm.next_state("PLANNING_SPECS", "complete") == "SPEC_CONFIRM_PENDING"
-    assert sm.next_state("SPEC_CONFIRM_PENDING", "confirm") == "CODING"
+    assert sm.next_state("PLANNING_IMPLEMENTATION_SPECS", "complete") == "IMPLEMENTATION_SPEC_CONFIRM_PENDING"
+    assert sm.next_state("IMPLEMENTATION_SPEC_CONFIRM_PENDING", "confirm") == "CODING"
     assert sm.next_state("CODING", "complete") == "CODING_CONFIRM_PENDING"
     assert sm.next_state("CODING_CONFIRM_PENDING", "confirm") == "TESTING"
     assert sm.next_state("CODING_CONFIRM_PENDING", "reject") == "REWORK"
@@ -31,6 +32,34 @@ def test_feature_transitions():
     assert sm.next_state("REVIEW_CONFIRM_PENDING", "confirm") == "ACCEPTANCE_PENDING"
     assert sm.next_state("ACCEPTANCE_PENDING", "confirm") == "MERGING"
     assert sm.next_state("MERGING", "complete") == "COMPLETED"
+
+
+def test_agent_questions_resume_the_originating_stage():
+    sm = StateMachine("feature")
+    assert sm.next_state("TESTING", "ask_user") == "TESTING_INPUT_PENDING"
+    assert sm.next_state("TESTING_INPUT_PENDING", "answer") == "TESTING"
+    assert sm.next_state("REVIEW", "ask_user") == "REVIEW_INPUT_PENDING"
+    assert sm.next_state("REVIEW_INPUT_PENDING", "answer") == "REVIEW"
+
+
+def test_removed_product_spec_states_migrate_to_unified_requirements():
+    sm = StateMachine("feature")
+    assert sm.display_name("PLANNING_PRODUCT_SPEC") == sm.display_name("PLANNING_REQUIREMENTS")
+    assert sm.next_state("PRODUCT_SPEC_CONFIRM_PENDING", "confirm") == "PLANNING_ARCHITECTURE"
+
+
+def test_profiles_share_lifecycle_but_define_rework_targets():
+    feature = StateMachine("feature")
+    bug_fix = StateMachine("bug_fix")
+    documentation = StateMachine("documentation")
+
+    assert feature._template == bug_fix._template == documentation._template
+    assert feature.available_events("REWORK") == [
+        "to_requirements", "to_architecture",
+        "to_specs", "to_coding", "to_testing",
+    ]
+    assert bug_fix.available_events("REWORK") == ["to_analysis", "to_coding", "to_testing"]
+    assert documentation.available_events("REWORK") == ["to_outline", "to_coding"]
 
 
 def test_bug_fix_state_machine():

@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     database_url: str = Field(default="sqlite:///./mac_system.db", alias="DATABASE_URL")
     projects_dir: Path = Field(default=Path("./projects"), alias="PROJECTS_DIR")
     state_machines_dir: Path = Field(default=Path("./state_machines"), alias="STATE_MACHINES_DIR")
+    workflow_profiles_dir: Path = Field(default=Path("./workflow_profiles"), alias="WORKFLOW_PROFILES_DIR")
     agent_config_path: Path = Field(default=Path("./agent_config.json"), alias="AGENT_CONFIG_PATH")
 
     # Claude Code
@@ -81,9 +82,20 @@ def get_agent_config() -> dict[str, Any]:
         return json.load(f)
 
 
-def load_state_machine(task_type: str) -> dict[str, Any]:
-    path = get_settings().state_machines_dir / f"{task_type}.json"
+def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     if not path.exists():
-        raise FileNotFoundError(f"State machine for task_type={task_type} not found: {path}")
+        raise FileNotFoundError(f"{label} not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_state_machine() -> dict[str, Any]:
+    """Load the single delivery state-machine template."""
+    path = get_settings().state_machines_dir / "delivery.json"
+    return _load_json(path, label="Delivery state machine")
+
+
+def load_workflow_profile(task_type: str) -> dict[str, Any]:
+    """Load task-specific stages without duplicating lifecycle transitions."""
+    path = get_settings().workflow_profiles_dir / f"{task_type}.json"
+    return _load_json(path, label=f"Workflow profile for task_type={task_type}")

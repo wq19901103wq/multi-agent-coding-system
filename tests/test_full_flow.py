@@ -252,7 +252,7 @@ async def test_full_feature_flow_confirm_all(base_orchestrator):
 
     # SPEC_CONFIRM_PENDING
     project, _ = await _tick_until_pending(oc, service, project.id)
-    assert project.current_state == "SPEC_CONFIRM_PENDING"
+    assert project.current_state == "IMPLEMENTATION_SPEC_CONFIRM_PENDING"
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
 
@@ -348,7 +348,7 @@ async def test_full_feature_flow_rework_from_acceptance(base_orchestrator):
     for expected in (
         "REQUIREMENT_CONFIRM_PENDING",
         "ARCHITECTURE_CONFIRM_PENDING",
-        "SPEC_CONFIRM_PENDING",
+        "IMPLEMENTATION_SPEC_CONFIRM_PENDING",
         "CODING_CONFIRM_PENDING",
         "TESTING_CONFIRM_PENDING",
         "REVIEW_CONFIRM_PENDING",
@@ -513,7 +513,7 @@ async def test_full_feature_flow_reject_architecture(base_orchestrator):
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
     project, _ = await _tick_until_pending(oc, service, project.id)
-    assert project.current_state == "SPEC_CONFIRM_PENDING"
+    assert project.current_state == "IMPLEMENTATION_SPEC_CONFIRM_PENDING"
 
 
 @pytest.mark.asyncio
@@ -531,11 +531,11 @@ async def test_full_feature_flow_reject_specs(base_orchestrator):
         await _resolve_pending(service, project, "confirm")
         await oc.tick(project.id)
     project, _ = await _tick_until_pending(oc, service, project.id)
-    assert project.current_state == "SPEC_CONFIRM_PENDING"
+    assert project.current_state == "IMPLEMENTATION_SPEC_CONFIRM_PENDING"
     await _resolve_pending(service, project, "reject")
     await oc.tick(project.id)
     project, _ = await _tick_until_pending(oc, service, project.id)
-    assert project.current_state == "SPEC_CONFIRM_PENDING"
+    assert project.current_state == "IMPLEMENTATION_SPEC_CONFIRM_PENDING"
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
     project, _ = await _tick_until_pending(oc, service, project.id)
@@ -552,7 +552,7 @@ async def test_full_feature_flow_reject_coding_quality_gate(base_orchestrator):
         description="实现一个简单功能", approval_mode="normal",
     )
     for exp in ("REQUIREMENT_CONFIRM_PENDING", "ARCHITECTURE_CONFIRM_PENDING",
-                "SPEC_CONFIRM_PENDING"):
+                "IMPLEMENTATION_SPEC_CONFIRM_PENDING"):
         project, _ = await _tick_until_pending(oc, service, project.id)
         assert project.current_state == exp
         await _resolve_pending(service, project, "confirm")
@@ -578,7 +578,7 @@ async def test_full_feature_flow_reject_testing_quality_gate(base_orchestrator):
         description="实现一个简单功能", approval_mode="normal",
     )
     for exp in ("REQUIREMENT_CONFIRM_PENDING", "ARCHITECTURE_CONFIRM_PENDING",
-                "SPEC_CONFIRM_PENDING", "CODING_CONFIRM_PENDING"):
+                "IMPLEMENTATION_SPEC_CONFIRM_PENDING", "CODING_CONFIRM_PENDING"):
         project, _ = await _tick_until_pending(oc, service, project.id)
         assert project.current_state == exp
         await _resolve_pending(service, project, "confirm")
@@ -604,7 +604,7 @@ async def test_full_feature_flow_reject_review_quality_gate(base_orchestrator):
         description="实现一个简单功能", approval_mode="normal",
     )
     for exp in ("REQUIREMENT_CONFIRM_PENDING", "ARCHITECTURE_CONFIRM_PENDING",
-                "SPEC_CONFIRM_PENDING", "CODING_CONFIRM_PENDING",
+                "IMPLEMENTATION_SPEC_CONFIRM_PENDING", "CODING_CONFIRM_PENDING",
                 "TESTING_CONFIRM_PENDING"):
         project, _ = await _tick_until_pending(oc, service, project.id)
         assert project.current_state == exp
@@ -643,4 +643,4 @@ async def test_full_feature_flow_select_option_architecture(base_orchestrator):
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
     project, _ = await _tick_until_pending(oc, service, project.id)
-    assert project.current_state == "SPEC_CONFIRM_PENDING"
+    assert project.current_state == "IMPLEMENTATION_SPEC_CONFIRM_PENDING"

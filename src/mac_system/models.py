@@ -40,6 +40,7 @@ class Project(SQLModel, table=True):
     current_state: str
     previous_state: Optional[str] = None
     workspace_path: str
+    bound_directory: Optional[str] = SQLField(default=None, nullable=True, index=True)
     created_at: datetime = SQLField(default_factory=datetime.utcnow)
     updated_at: datetime = SQLField(default_factory=datetime.utcnow)
     context: dict = SQLField(default_factory=dict, sa_column=Column(JSON))
@@ -102,6 +103,91 @@ class PendingUserInput(SQLModel, table=True):
     status: str = SQLField(default="pending")  # pending, consumed
     created_at: datetime = SQLField(default_factory=datetime.utcnow)
     consumed_by_task_id: Optional[str] = SQLField(foreign_key="tasks.id", nullable=True)
+
+
+class QuestionInteraction(SQLModel, table=True):
+    """A batch of questions an agent asks the user mid-turn (unified ask_user)."""
+
+    __tablename__ = "question_interactions"
+
+    id: str = SQLField(primary_key=True)
+    project_id: str = SQLField(foreign_key="projects.id", index=True)
+    origin_task_id: Optional[str] = SQLField(foreign_key="tasks.id", nullable=True)
+    origin_round: int = SQLField(default=1)
+    resume_state: str
+    agent: str
+    stage: Optional[str] = None
+    batch_key: str
+    status: str = SQLField(default="pending")  # pending, answered, expired
+    approval_id: Optional[str] = SQLField(foreign_key="approvals.id", nullable=True)
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    answered_at: Optional[datetime] = None
+
+
+class Question(SQLModel, table=True):
+    """A single question inside a QuestionInteraction."""
+
+    __tablename__ = "questions"
+
+    id: str = SQLField(primary_key=True)
+    interaction_id: str = SQLField(foreign_key="question_interactions.id", index=True)
+    question_id: str
+    kind: str = SQLField(default="blocking")  # blocking / decision / non_blocking
+    question: str
+    reason: str = SQLField(default="")
+    allow_free_text: bool = SQLField(default=False)
+    options: list = SQLField(default_factory=list, sa_column=Column(JSON))
+    multiple: bool = SQLField(default=False)
+    default_assumption: Optional[str] = None
+    recommended_option: Optional[str] = None
+    affected_trace_ids: list = SQLField(default_factory=list, sa_column=Column(JSON))
+    status: str = SQLField(default="pending")  # pending, answered, skipped
+    order_index: int = SQLField(default=0)
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class QuestionAnswer(SQLModel, table=True):
+    """A user's answer to a single Question."""
+
+    __tablename__ = "question_answers"
+
+    id: str = SQLField(primary_key=True)
+    question_id: str = SQLField(foreign_key="questions.id", index=True)
+    answer: Optional[str] = None
+    answer_label: Optional[str] = None
+    skipped: bool = SQLField(default=False)
+    responded_by: Optional[str] = None
+    responded_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class DefaultAuthorization(SQLModel, table=True):
+    """Pre-authorized answers to specific question patterns."""
+
+    __tablename__ = "default_authorizations"
+
+    id: str = SQLField(primary_key=True)
+    project_id: str = SQLField(foreign_key="projects.id", index=True)
+    question_pattern: str
+    authorized_option: str
+    created_by: Optional[str] = None
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class ConversationInteraction(SQLModel, table=True):
+    """Conversation-scoped disambiguation when no project is determined."""
+
+    __tablename__ = "conversation_interactions"
+
+    id: str = SQLField(primary_key=True)
+    chat_id: str = SQLField(index=True)
+    open_id: str = SQLField(index=True)
+    source_message_id: Optional[str] = None
+    source_text: Optional[str] = None
+    candidates: list = SQLField(default_factory=list, sa_column=Column(JSON))
+    selected_project_id: Optional[str] = SQLField(default=None, nullable=True)
+    status: str = SQLField(default="pending")  # pending, resolved, expired
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
 
 
 class Approval(SQLModel, table=True):
@@ -168,6 +254,18 @@ class ChatUserContext(SQLModel, table=True):
     updated_at: datetime = SQLField(default_factory=datetime.utcnow)
 
 
+class ChatDirectoryBinding(SQLModel, table=True):
+    """One repository binding per chat, shared by all members of that chat."""
+
+    __tablename__ = "chat_directory_bindings"
+
+    chat_id: str = SQLField(primary_key=True)
+    directory: str = SQLField(index=True)
+    bound_by: str | None = None
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    updated_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
 class PendingIntent(SQLModel, table=True):
     __tablename__ = "pending_intents"
 
@@ -197,6 +295,7 @@ class ProjectCreate(BaseModel):
     creator_open_id: Optional[str] = None
     feishu_chat_id: Optional[str] = None
     feishu_chat_type: str = "p2p"
+    bound_directory: Optional[str] = None
 
 
 class ProjectOut(BaseModel):
@@ -208,6 +307,7 @@ class ProjectOut(BaseModel):
     current_state: str
     previous_state: Optional[str]
     workspace_path: str
+    bound_directory: Optional[str]
     total_cost_usd: Optional[float]
     created_at: datetime
     updated_at: datetime

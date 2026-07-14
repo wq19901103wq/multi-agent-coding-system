@@ -25,6 +25,7 @@ class ButtonAction:
     extras: dict[str, Any]
     chat_id: str | None = None
     chat_type: str = "p2p"
+    message_id: str | None = None
 
 
 @dataclass
@@ -35,6 +36,7 @@ class TextMessage:
     message_id: str
     text: str
     is_command: bool
+    parent_id: str | None = None
     chat_id: str | None = None
     chat_type: str = "p2p"
     sender_type: str = "user"

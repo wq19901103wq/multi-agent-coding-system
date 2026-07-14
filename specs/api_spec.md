@@ -1,6 +1,6 @@
 # Control API 规范
 
-> 版本：v1.0  
+> 版本：v1.1
 > 用途：定义 FastAPI 端点的请求/响应格式。
 
 ## 基础信息
@@ -31,7 +31,8 @@
   "name": "config-validator-cli",
   "task_type": "feature",
   "description": "实现一个 config-validator CLI 工具...",
-  "approval_mode": "normal"
+  "approval_mode": "normal",
+  "bound_directory": "/absolute/path/to/existing-repository"
 }
 ```
 
@@ -46,11 +47,14 @@
   "status": "active",
   "current_state": "PLANNING_REQUIREMENTS",
   "previous_state": null,
-  "workspace_path": "/Users/yihanwang/multi-agent-coding-system/projects/proj_20260707_120000_a3f7",
+  "workspace_path": "/absolute/path/to/existing-repository",
+  "bound_directory": "/absolute/path/to/existing-repository",
   "created_at": "2026-07-07T12:00:00Z",
   "updated_at": "2026-07-07T12:00:00Z"
 }
 ```
+
+`bound_directory` 可省略。传入时必须是绝对路径；系统会校验 Git 仓库根目录，并把项目元数据写入 `.mac/projects/{project_id}/`。不传时使用系统项目工作区。飞书聊天通过 `/bind-dir` 维护聊天级默认目录，该交互不等同于新增一套 Control API 会话状态。
 
 ### `GET /projects/{project_id}`
 

@@ -68,6 +68,7 @@ class PromptRenderer:
         rejection_note: str = "",
         open_feedback: list[dict] | None = None,
         round_number: int = 1,
+        qa_history: list[dict] | None = None,
     ) -> str:
         agent_cfg = self.get_agent_config(agent_type)
         stage_cfg = self.get_stage_config(agent_type, stage)
@@ -126,6 +127,17 @@ class PromptRenderer:
                 "\n请在输出中说明每条反馈是否已解决；"
                 "如已解决，请在 `verified_feedback_ids` 中填入对应 feedback_id。\n"
             )
+
+        # Inject Q&A history so the agent sees what was previously asked and
+        # answered, and does not re-ask the same questions.
+        if qa_history:
+            prompt += "\n\n## 历史问答记录\n\n"
+            for idx, entry in enumerate(qa_history, start=1):
+                q = entry.get("question", "?")
+                a = entry.get("answer_label") or entry.get("answer") or "(跳过)"
+                s = entry.get("state", "")
+                r = entry.get("round", 1)
+                prompt += f"{idx}. Q：{q}\n   A：{a}（阶段：{s}，第{r}轮）\n"
 
         return prompt
 

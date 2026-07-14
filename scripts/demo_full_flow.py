@@ -60,7 +60,7 @@ async def main():
         stages = [
             ("REQUIREMENT_CONFIRM_PENDING", "confirm"),
             ("ARCHITECTURE_CONFIRM_PENDING", "confirm"),
-            ("SPEC_CONFIRM_PENDING", "confirm"),
+            ("IMPLEMENTATION_SPEC_CONFIRM_PENDING", "confirm"),
         ]
         for target_state, action in stages:
             print(f"\nPhase: Waiting for {target_state}...")

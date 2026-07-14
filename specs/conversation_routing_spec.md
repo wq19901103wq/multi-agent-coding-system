@@ -1,6 +1,6 @@
 # 会话、用户与项目路由规范
 
-> 版本：v1.0  
+> 版本：v1.1
 > 用途：定义群聊、私聊、用户和项目之间的关系，以及消息如何被确定性地路由到项目状态机。
 
 ## 核心原则
@@ -85,6 +85,18 @@
 5. 若不存在唯一项目，返回项目选择卡片，不执行状态转换，不创建 pending input。
 
 每一步都必须验证 ProjectUser 权限和 ProjectChat 关系。项目不属于当前聊天时，用户可使用显式命令操作，但系统应提示消息将作用于其他会话来源的项目；敏感操作可要求先 `/use` 或私聊确认。
+
+对于 Agent 问题卡，步骤 3 必须采用确定性链路：`parent_id → Approval.payload.reply_message_ids → question_interaction_id → project_id`。它优先于 active project，且只能命中仍为 pending 的 approval/interaction。若卡片在原群聊中发送，群成员可按该群的 ProjectChat 关系获得隐式操作权限；私聊仍按 ProjectUser 校验。
+
+## 聊天目录与项目上下文
+
+聊天目录绑定和 active project 是两类独立上下文：
+
+- `ChatDirectoryBinding(chat_id)` 决定该聊天之后新建项目的默认代码仓库，群成员共享；
+- `ChatUserContext(chat_id, open_id)` 决定某个用户当前正在讨论哪个既有项目，群成员互不覆盖；
+- `/use` 不改变目录绑定，`/bind-dir` 也不改变已有项目或其他成员的 active project。
+
+一个聊天最多有一个默认目录，但可以关联多个项目；一个仓库也可承载多个项目。项目元数据必须按 `.mac/projects/{project_id}` 隔离，不能把“一个聊天”“一个项目”“一个仓库”视为同一实体。
 
 ## 群聊规则
 

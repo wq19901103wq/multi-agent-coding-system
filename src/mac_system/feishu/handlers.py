@@ -19,6 +19,8 @@ from mac_system.core.project_service import (
 from mac_system.feishu.bridge import FeishuBridge
 from mac_system.feishu.card import (
     build_feedback_card,
+    build_input_card,
+    build_question_batch_card,
     build_rejection_summary_card,
     build_status_card,
     build_transition_card,
@@ -31,7 +33,7 @@ from mac_system.feishu.menu import (
     build_restart_type_card,
 )
 from mac_system.feishu.models import ButtonAction, TextMessage
-from mac_system.models import Project, ProjectUser, RouteDecision
+from mac_system.models import Approval, Project, ProjectUser, RouteDecision
 from mac_system.state_machine import StateMachine
 
 logger = logging.getLogger(__name__)
@@ -60,7 +62,7 @@ def _confirmation_source_stage(confirmation_state: str) -> str:
     return {
         "REQUIREMENT_CONFIRM_PENDING": "PLANNING_REQUIREMENTS",
         "ARCHITECTURE_CONFIRM_PENDING": "PLANNING_ARCHITECTURE",
-        "SPEC_CONFIRM_PENDING": "PLANNING_SPECS",
+        "IMPLEMENTATION_SPEC_CONFIRM_PENDING": "PLANNING_IMPLEMENTATION_SPECS",
         "BUG_FIX_CONFIRM_PENDING": "BUG_ANALYSIS",
         "OUTLINE_CONFIRM_PENDING": "DOC_OUTLINE",
         "CODING_CONFIRM_PENDING": "CODING",
@@ -70,10 +72,42 @@ def _confirmation_source_stage(confirmation_state: str) -> str:
     }.get(confirmation_state, confirmation_state)
 
 
+def _is_authorized_for_project(
+    ctx: FeishuHandlerContext, open_id: str, project_id: str
+) -> bool:
+    """Allow direct project members or members of the bound group chat."""
+    from mac_system.models import ProjectChat
+
+    direct_binding = ctx.service.session.exec(
+        select(ProjectUser).where(
+            ProjectUser.project_id == project_id,
+            ProjectUser.open_id == open_id,
+        )
+    ).first()
+    if direct_binding is not None:
+        return True
+
+    if ctx.chat_type == "group" and ctx.chat_id:
+        chat_binding = ctx.service.session.exec(
+            select(ProjectChat).where(
+                ProjectChat.project_id == project_id,
+                ProjectChat.chat_id == ctx.chat_id,
+            )
+        ).first()
+        return chat_binding is not None
+
+    return False
+
+
 async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> None:
     """Dispatch a text message from Feishu."""
     text = msg.text
     open_id = msg.open_id
+
+    # A reply to an Agent question card is routed by the card message itself,
+    # not by whichever project is currently active in this chat.
+    if msg.parent_id and await _handle_question_card_reply(ctx, msg):
+        return
 
     # If the user is in the middle of creating a project, treat the reply as
     # the project description instead of a command.
@@ -107,6 +141,18 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
 
     if text == "/leave-project":
         await _leave_project(ctx, open_id)
+        return
+
+    if text.startswith("/bind-dir "):
+        await _bind_directory(ctx, open_id, text[len("/bind-dir "):].strip())
+        return
+
+    if text == "/unbind-dir":
+        await _unbind_directory(ctx, open_id)
+        return
+
+    if text == "/current-dir":
+        await _show_current_directory(ctx, open_id)
         return
 
     if text.startswith("/bind "):
@@ -223,8 +269,317 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         )
         return
 
+    # No active project: check whether the user has multiple candidate
+    # projects.  If so, create a ConversationInteraction and show a selection
+    # card (deterministic, no LLM guessing).
+    from mac_system.feishu.menu import build_project_list_card
+    user_projects = ctx.service.session.exec(
+        select(ProjectUser).where(ProjectUser.open_id == open_id)
+    ).all()
+    project_ids = {up.project_id for up in user_projects}
+    if project_ids:
+        candidates = ctx.service.session.exec(
+            select(Project)
+            .where(Project.id.in_(project_ids))
+            .where(Project.status == "active")
+            .order_by(Project.updated_at.desc())
+        ).all()
+        if len(candidates) > 1:
+            await ctx.service.create_conversation_interaction(
+                chat_id=ctx.chat_id or open_id,
+                open_id=open_id,
+                source_message_id=None,
+                source_text=text,
+                candidates=[
+                    {"id": p.id, "name": p.name, "current_state": p.current_state}
+                    for p in candidates
+                ],
+            )
+            receive_id, receive_id_type = _reply_target(ctx, open_id)
+            await ctx.bridge._send_interactive(
+                receive_id,
+                build_project_list_card(
+                    [
+                        {"id": p.id, "name": p.name, "current_state": p.current_state}
+                        for p in candidates
+                    ],
+                    mode="select",
+                    chat_id=ctx.chat_id,
+                    chat_type=ctx.chat_type,
+                ),
+                receive_id_type=receive_id_type,
+            )
+            return
+
     # Default: do not auto-create projects from free-form text. Show help instead.
     await _show_help(ctx, open_id)
+
+
+async def _handle_question_card_reply(
+    ctx: FeishuHandlerContext, msg: TextMessage
+) -> bool:
+    """Consume a free-text reply to a pending question-batch card."""
+    approvals = ctx.service.session.exec(
+        select(Approval).where(Approval.status == "pending")
+        .order_by(Approval.created_at.desc())
+    ).all()
+    approval = next(
+        (
+            item for item in approvals
+            if msg.parent_id in item.payload.get("reply_message_ids", [])
+        ),
+        None,
+    )
+    if approval is None:
+        return False
+
+    interaction_id = approval.payload.get("question_interaction_id")
+    interaction = (
+        ctx.service.get_question_interaction(interaction_id)
+        if interaction_id else None
+    )
+    project = ctx.service.get_project(approval.project_id)
+    if interaction is None or interaction.status != "pending" or project is None:
+        return False
+
+    bindings = ctx.service.session.exec(
+        select(ProjectUser).where(ProjectUser.project_id == project.id)
+    ).all()
+    if bindings and not _is_authorized_for_project(ctx, msg.open_id, project.id):
+        receive_id, receive_id_type = _reply_target(ctx, msg.open_id)
+        await ctx.bridge.send_text(
+            receive_id,
+            f"你没有权限回答项目 {project.id} 的问题。",
+            receive_id_type=receive_id_type,
+        )
+        return True
+
+    question_id = approval.payload.get("reply_message_to_question", {}).get(msg.parent_id)
+    if question_id:
+        question = next(
+            (
+                q for q in ctx.service.get_questions_for_interaction(interaction.id)
+                if q.question_id == question_id and q.status == "pending" and q.allow_free_text
+            ),
+            None,
+        )
+    else:
+        # Legacy fallback: reply to the batch card itself -> first pending free-text question.
+        question = next(
+            (
+                q for q in ctx.service.get_questions_for_interaction(interaction.id)
+                if q.status == "pending" and q.allow_free_text
+            ),
+            None,
+        )
+    if question is None:
+        return False
+
+    await ctx.service.submit_question_answer(
+        question.id,
+        msg.text,
+        msg.text,
+        False,
+        msg.open_id,
+        commit=False,
+    )
+    receive_id, receive_id_type = _reply_target(ctx, msg.open_id)
+
+    # Update the replied input card to a read-only "已回答" receipt state.
+    if msg.parent_id:
+        answered_card = build_input_card(
+            title=f"[{project.name or project.id}] [{interaction.stage or interaction.agent}] {question.question}",
+            question=question.question,
+            context=question.reason or "",
+            approval_id=approval.id,
+            state=approval.state,
+            chat_id=project.feishu_chat_id,
+            chat_type=project.feishu_chat_type,
+            kind=question.kind,
+            question_id=question.question_id,
+            interaction_id=interaction.id,
+            answered=True,
+            answer_text=msg.text,
+        )
+        try:
+            await ctx.bridge.update_card(msg.parent_id, answered_card)
+        except Exception:
+            logger.exception("Failed to update input card to answered state")
+
+    if ctx.service.interaction_is_resolvable(interaction.id):
+        await ctx.service.resolve_question_interaction(interaction.id, commit=False)
+        await ctx.service.respond_approval(
+            approval.id, "answer", msg.open_id, commit=False
+        )
+        ctx.service.session.commit()
+        await ctx.service.transition_state(
+            project.id,
+            "answer",
+            payload={"resume_state": interaction.resume_state},
+            triggered_by=msg.open_id,
+        )
+        await ctx.bridge.send_text(
+            receive_id,
+            "已收到你的回答，Agent 继续执行。",
+            receive_id_type=receive_id_type,
+        )
+        await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
+    else:
+        ctx.service.session.commit()
+        # Send the next pending free-text question card, if any.
+        sent_next = await _send_next_free_text_card(ctx, approval, interaction, project, receive_id, receive_id_type)
+        if not sent_next:
+            await ctx.bridge.send_text(
+                receive_id,
+                "已记录回答，还有其他阻塞问题待回答。",
+                receive_id_type=receive_id_type,
+            )
+            await ctx.orchestrator.tick(project.id)
+    return True
+
+
+async def _send_next_free_text_card(
+    ctx: FeishuHandlerContext, approval: Approval, interaction, project: Project,
+    receive_id: str, receive_id_type: str,
+) -> bool:
+    """Send the next pending free-text question card for an interaction.
+
+    Returns True if a card was sent, False if no pending free-text question
+    remains.
+    """
+    questions = ctx.service.get_questions_for_interaction(interaction.id)
+    next_q = next(
+        (
+            q for q in questions
+            if q.status == "pending" and q.allow_free_text and not q.options
+        ),
+        None,
+    )
+    if next_q is None:
+        return False
+
+    title = f"[{project.name or project.id}] [{interaction.stage or interaction.agent}] {next_q.question}"
+    card = build_input_card(
+        title=title,
+        question=next_q.question,
+        context=next_q.reason or "",
+        approval_id=approval.id,
+        state=approval.state,
+        chat_id=project.feishu_chat_id,
+        chat_type=project.feishu_chat_type,
+        kind=next_q.kind,
+        question_id=next_q.question_id,
+        interaction_id=interaction.id,
+    )
+    message_id = await ctx.bridge._send_interactive(
+        receive_id, card, receive_id_type=receive_id_type,
+    )
+    if message_id:
+        payload = dict(approval.payload)
+        reply_message_ids = list(payload.get("reply_message_ids", []))
+        reply_message_to_question = dict(payload.get("reply_message_to_question", {}))
+        reply_message_ids.append(message_id)
+        reply_message_to_question[message_id] = next_q.question_id
+        approval.payload = {
+            **payload,
+            "reply_message_ids": reply_message_ids[-20:],
+            "reply_message_to_question": reply_message_to_question,
+        }
+        ctx.service.session.commit()
+    return True
+
+
+async def _handle_skip_free_text(
+    ctx: FeishuHandlerContext, action: ButtonAction
+) -> dict[str, Any] | None:
+    """Skip a non_blocking free-text question and send the next one."""
+    open_id = action.open_id
+    approval_id = action.approval_id
+    interaction_id = action.extras.get("interaction_id") if action.extras else None
+    target_question_id = action.extras.get("question_id") if action.extras else None
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+
+    try:
+        approval = ctx.service.get_approval(approval_id)
+    except ApprovalNotFoundError:
+        await ctx.bridge.send_text(receive_id, "该审批已过期或不存在", receive_id_type=receive_id_type)
+        return None
+    if interaction_id is None:
+        interaction_id = approval.payload.get("question_interaction_id")
+    if not interaction_id or not target_question_id:
+        await ctx.bridge.send_text(receive_id, "未找到对应的问题交互", receive_id_type=receive_id_type)
+        return None
+    interaction = ctx.service.get_question_interaction(interaction_id)
+    if interaction is None or interaction.status != "pending":
+        await ctx.bridge.send_text(receive_id, "该问题交互已处理或不存在", receive_id_type=receive_id_type)
+        return None
+    project = ctx.service.get_project(interaction.project_id)
+    if project is None:
+        await ctx.bridge.send_text(receive_id, "关联项目不存在", receive_id_type=receive_id_type)
+        return None
+    if not _is_authorized_for_project(ctx, open_id, project.id):
+        await ctx.bridge.send_text(
+            receive_id,
+            f"你没有权限回答项目 {project.id} 的问题。",
+            receive_id_type=receive_id_type,
+        )
+        return None
+
+    questions = ctx.service.get_questions_for_interaction(interaction_id)
+    target = next((q for q in questions if q.question_id == target_question_id and q.allow_free_text), None)
+    if target is None:
+        await ctx.bridge.send_text(receive_id, "未找到对应问题", receive_id_type=receive_id_type)
+        return None
+    if target.kind != "non_blocking":
+        await ctx.bridge.send_text(receive_id, "该问题不能跳过", receive_id_type=receive_id_type)
+        return None
+
+    await ctx.service.submit_question_answer(target.id, None, None, True, open_id, commit=False)
+    ctx.service.session.commit()
+
+    # Update the skipped card to a read-only "已跳过" receipt state.
+    if action.message_id:
+        skipped_card = build_input_card(
+            title=f"[{project.name or project.id}] [{interaction.stage or interaction.agent}] {target.question}",
+            question=target.question,
+            context=target.reason or "",
+            approval_id=approval.id,
+            state=approval.state,
+            chat_id=project.feishu_chat_id,
+            chat_type=project.feishu_chat_type,
+            kind=target.kind,
+            question_id=target.question_id,
+            interaction_id=interaction.id,
+            skipped=True,
+        )
+        try:
+            await ctx.bridge.update_card(action.message_id, skipped_card)
+        except Exception:
+            logger.exception("Failed to update input card to skipped state")
+
+    if ctx.service.interaction_is_resolvable(interaction_id):
+        await ctx.service.resolve_question_interaction(interaction_id, commit=False)
+        await ctx.service.respond_approval(approval_id, "answer", open_id, commit=False)
+        ctx.service.session.commit()
+        await ctx.service.transition_state(
+            interaction.project_id, "answer",
+            payload={"resume_state": interaction.resume_state},
+            triggered_by=open_id,
+        )
+        await ctx.bridge.send_text(receive_id, "已收到你的回答，Agent 继续执行。", receive_id_type=receive_id_type)
+        project = ctx.service.get_project(interaction.project_id)
+        if project is not None:
+            await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
+    else:
+        sent_next = await _send_next_free_text_card(ctx, approval, interaction, project, receive_id, receive_id_type)
+        if not sent_next:
+            await ctx.bridge.send_text(
+                receive_id,
+                "已跳过，还有其他阻塞问题待回答。",
+                receive_id_type=receive_id_type,
+            )
+            await ctx.orchestrator.tick(project.id)
+    return None
 
 
 async def _prompt_for_create_description(
@@ -277,14 +632,7 @@ async def _cancel_project_command(
             return
         project_id = latest.id
 
-    # Authorization check: the user must be bound to the project.
-    binding = ctx.service.session.exec(
-        select(ProjectUser).where(
-            ProjectUser.project_id == project_id,
-            ProjectUser.open_id == open_id,
-        )
-    ).first()
-    if binding is None:
+    if not _is_authorized_for_project(ctx, open_id, project_id):
         await ctx.bridge.send_text(
             receive_id,
             f"你没有权限终止项目 {project_id}。",
@@ -342,6 +690,7 @@ async def _respond_to_approval(
     approval_id: str,
     chosen: str,
     feedback_text: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     """Shared logic for card actions and text commands responding to an approval."""
     receive_id, receive_id_type = _reply_target(ctx, open_id)
@@ -366,7 +715,7 @@ async def _respond_to_approval(
     bindings = ctx.service.session.exec(
         select(ProjectUser).where(ProjectUser.project_id == project.id)
     ).all()
-    if bindings and not any(b.open_id == open_id for b in bindings):
+    if bindings and not _is_authorized_for_project(ctx, open_id, project.id):
         await ctx.bridge.send_text(
             receive_id,
             f"你没有权限操作项目 {project.id} 的审批。",
@@ -400,10 +749,10 @@ async def _respond_to_approval(
     # Map the chosen action back to its human-readable label for feedback.
     selected_label = chosen
     for opt in approval.payload.get("options", []):
-        if opt.get("action") == chosen:
+        if extra and opt.get("option_key") == extra.get("option_key"):
             selected_label = opt.get("label", chosen)
             break
-        if opt.get("option_key") == chosen:
+        if opt.get("action") == chosen or opt.get("option_key") == chosen:
             selected_label = opt.get("label", chosen)
             break
 
@@ -439,8 +788,20 @@ async def _respond_to_approval(
             commit=False,
         )
 
+    transition_payload = None
+    if chosen == "select_option":
+        decision = {
+            key: (extra or {}).get(key)
+            for key in ("decision_id", "option_key")
+            if (extra or {}).get(key)
+        }
+        transition_payload = {"resolved_decisions": [decision]} if decision else None
+
     await ctx.service.resolve_approval(
-        approval.id, chosen, responded_by=open_id
+        approval.id,
+        chosen,
+        responded_by=open_id,
+        payload=transition_payload,
     )
 
     # Log the decision so we can trace "卡住" vs "agent 正在跑".
@@ -561,6 +922,9 @@ async def _show_help(ctx: FeishuHandlerContext, open_id: str) -> None:
         "/use <项目ID>    — 将某项目设为当前会话默认项目\n"
         "/current         — 查看当前会话默认项目\n"
         "/leave-project   — 清除当前会话默认项目\n"
+        "/bind-dir <绝对路径> — 将当前会话绑定到已有代码目录\n"
+        "/current-dir     — 查看当前会话绑定目录\n"
+        "/unbind-dir      — 解绑目录（不影响现有项目）\n"
         "/status <项目ID> — 查看项目状态\n"
         "/bind <项目ID>   — 绑定到项目\n"
         "/menu            — 打开菜单\n"
@@ -568,6 +932,67 @@ async def _show_help(ctx: FeishuHandlerContext, open_id: str) -> None:
         "直接发消息不会创建项目；如需创建请使用 /create。"
     )
     await ctx.bridge.send_text(receive_id, help_text, receive_id_type=receive_id_type)
+
+
+async def _bind_directory(
+    ctx: FeishuHandlerContext, open_id: str, directory: str
+) -> None:
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    if not ctx.chat_id:
+        await ctx.bridge.send_text(
+            receive_id, "当前消息缺少会话标识，无法绑定目录。",
+            receive_id_type=receive_id_type,
+        )
+        return
+    try:
+        binding = ctx.service.bind_directory_to_chat(
+            ctx.chat_id, directory, bound_by=open_id
+        )
+    except (ValueError, OSError) as exc:
+        await ctx.bridge.send_text(
+            receive_id, f"绑定目录失败：{exc}", receive_id_type=receive_id_type
+        )
+        return
+    await ctx.bridge.send_text(
+        receive_id,
+        f"已将当前会话绑定到 `{binding.directory}`。后续新项目会直接修改该仓库；已有项目不受影响。",
+        receive_id_type=receive_id_type,
+    )
+
+
+async def _unbind_directory(ctx: FeishuHandlerContext, open_id: str) -> None:
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    if not ctx.chat_id:
+        await ctx.bridge.send_text(
+            receive_id, "当前消息缺少会话标识，无法解绑目录。",
+            receive_id_type=receive_id_type,
+        )
+        return
+    removed = ctx.service.unbind_directory_from_chat(ctx.chat_id)
+    message = (
+        "已解绑当前会话目录；后续新项目将使用系统工作区，已有项目不受影响。"
+        if removed else "当前会话没有绑定目录。"
+    )
+    await ctx.bridge.send_text(
+        receive_id, message, receive_id_type=receive_id_type
+    )
+
+
+async def _show_current_directory(
+    ctx: FeishuHandlerContext, open_id: str
+) -> None:
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    binding = (
+        ctx.service.get_chat_directory_binding(ctx.chat_id)
+        if ctx.chat_id else None
+    )
+    message = (
+        f"当前会话绑定目录：`{binding.directory}`"
+        if binding else "当前会话没有绑定目录。"
+    )
+    await ctx.bridge.send_text(
+        receive_id, message, receive_id_type=receive_id_type
+    )
 
 
 async def _leave_project(
@@ -606,11 +1031,31 @@ async def _use_project(
         )
         return
     ctx.service.set_chat_user_context(ctx.chat_id, open_id, project_id)
+
+    # If there was a pending ConversationInteraction (the user was asked to
+    # pick a project), resolve it and re-dispatch the original message.
+    pending_ci = ctx.service.get_pending_conversation_interaction(ctx.chat_id, open_id)
+    redispatch_text: str | None = None
+    if pending_ci is not None:
+        await ctx.service.resolve_conversation_interaction(pending_ci.id, project_id)
+        redispatch_text = pending_ci.source_text
+
     await ctx.bridge.send_text(
         receive_id,
         f"已将项目 {project_id} 设为当前会话的默认项目。",
         receive_id_type=receive_id_type,
     )
+
+    # Re-dispatch the original free-text message that triggered the
+    # disambiguation, now that the active project is set.
+    if redispatch_text:
+        from mac_system.feishu.models import TextMessage
+        msg = TextMessage(
+            open_id=open_id, message_id="", text=redispatch_text,
+            is_command=redispatch_text.startswith("/"),
+            chat_id=ctx.chat_id, chat_type=ctx.chat_type,
+        )
+        await handle_text_message(ctx, msg)
 
 
 async def _show_current_project(
@@ -693,7 +1138,7 @@ def _find_rejected_project_for_feedback(
     # Find the most recently updated active project that is in a planning state
     # (meaning it was just rolled back from a confirmation rejection).
     planning_states = {
-        "PLANNING_REQUIREMENTS", "PLANNING_ARCHITECTURE", "PLANNING_SPECS",
+        "PLANNING_REQUIREMENTS", "PLANNING_ARCHITECTURE", "PLANNING_IMPLEMENTATION_SPECS",
         "BUG_ANALYSIS", "DOC_OUTLINE",
     }
     projects = ctx.service.session.exec(
@@ -874,7 +1319,7 @@ async def _show_status(
     await ctx.bridge.send_text(receive_id, summary, receive_id_type=receive_id_type)
 
     card = build_status_card(
-        title=f"项目状态：{project_id}",
+        title=f"[{project_id}] 项目状态",
         project_id=project_id,
         current_state=status["current_state"],
         display=status["display"],
@@ -1126,6 +1571,34 @@ async def _submit_input(
             )
             return
     else:
+        # QuestionInteraction: if the approval has a linked interaction, route
+        # the answer to the first pending question (free-text answer).
+        interaction_id = approval.payload.get("question_interaction_id")
+        if interaction_id:
+            interaction = ctx.service.get_question_interaction(interaction_id)
+            if interaction and interaction.status == "pending":
+                pending_qs = [
+                    q for q in ctx.service.get_questions_for_interaction(interaction_id)
+                    if q.status == "pending"
+                ]
+                if pending_qs:
+                    q = pending_qs[0]
+                    await ctx.service.submit_question_answer(q.id, answer, answer, False, open_id, commit=False)
+                    if ctx.service.interaction_is_resolvable(interaction_id):
+                        await ctx.service.resolve_question_interaction(interaction_id, commit=False)
+                        await ctx.service.respond_approval(approval.id, "answer", open_id, commit=False)
+                        ctx.service.session.commit()
+                        await ctx.service.transition_state(
+                            project.id, "answer",
+                            payload={"resume_state": interaction.resume_state},
+                            triggered_by=open_id,
+                        )
+                        await ctx.bridge.send_text(receive_id, "已收到你的回答，Agent 继续执行。", receive_id_type=receive_id_type)
+                        await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
+                        return
+                    ctx.service.session.commit()
+                    await ctx.bridge.send_text(receive_id, "已记录该问题的回答，还有其他问题待回答。", receive_id_type=receive_id_type)
+                    return
         event = "answer"
         payload = {"clarification_answer": answer}
 
@@ -1140,8 +1613,13 @@ async def _submit_input(
     )
 
 
-async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) -> None:
-    """Process an interactive card button click."""
+async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) -> dict[str, Any] | None:
+    """Process an interactive card button click.
+
+    Returns a card dict when the action should update the card in-place via the
+    Feishu response (e.g. selecting an option). Returns None for actions that
+    only need a toast or text reply.
+    """
     open_id = action.open_id
 
     # Card actions may carry the chat context of the chat where the card was
@@ -1156,12 +1634,236 @@ async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) ->
         await _handle_menu_action(ctx, action)
         return
 
+    # Question batch card actions (unified ask_user).
+    if action.action in (
+        "answer_all_recommended",
+        "answer_with_values",
+        "skip_remaining",
+        "answer_question_option",
+        "select_question_option",
+        "submit_selected_options",
+    ):
+        return await _handle_question_batch_action(ctx, action)
+
+    if action.action == "skip_free_text":
+        return await _handle_skip_free_text(ctx, action)
+
     # Otherwise treat as an approval/decision button.
+    if action.action == "select_option":
+        await _respond_to_approval(
+            ctx,
+            open_id,
+            action.approval_id,
+            "select_option",
+            extra={
+                "decision_id": action.decision_id,
+                "option_key": action.option_key,
+            },
+        )
+        return
+
     chosen = action.action
     if chosen not in ("confirm", "reject"):
         chosen = action.option_key or chosen
     await _respond_to_approval(ctx, open_id, action.approval_id, chosen)
 
+
+async def _handle_question_batch_action(
+    ctx: FeishuHandlerContext, action: ButtonAction
+) -> dict[str, Any] | None:
+    """Process answers from a question batch card.
+
+    Returns the updated card dict for ``select_question_option`` so the caller
+    can update the card via the Feishu response without a toast.
+    """
+    open_id = action.open_id
+    interaction_id = action.extras.get("interaction_id") if action.extras else None
+    approval_id = action.approval_id
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+
+    try:
+        approval = ctx.service.get_approval(approval_id)
+    except ApprovalNotFoundError:
+        await ctx.bridge.send_text(receive_id, "该审批已过期或不存在", receive_id_type=receive_id_type)
+        return
+    if interaction_id is None:
+        interaction_id = approval.payload.get("question_interaction_id")
+    if not interaction_id:
+        await ctx.bridge.send_text(receive_id, "未找到对应的问题交互", receive_id_type=receive_id_type)
+        return
+    interaction = ctx.service.get_question_interaction(interaction_id)
+    if interaction is None or interaction.status != "pending":
+        await ctx.bridge.send_text(receive_id, "该问题交互已处理或不存在", receive_id_type=receive_id_type)
+        return
+    project = ctx.service.get_project(interaction.project_id)
+    if project is None:
+        await ctx.bridge.send_text(receive_id, "关联项目不存在", receive_id_type=receive_id_type)
+        return
+    if not _is_authorized_for_project(ctx, open_id, project.id):
+        await ctx.bridge.send_text(
+            receive_id,
+            f"你没有权限回答项目 {project.id} 的问题。",
+            receive_id_type=receive_id_type,
+        )
+        return
+
+    questions = ctx.service.get_questions_for_interaction(interaction_id)
+    # The question batch card only contains choice questions. Free-text
+    # questions are sent as separate input cards and answered by replying
+    # to those cards, so they should not be touched here.
+    pending_questions = [q for q in questions if q.status == "pending" and q.options]
+    # Snapshot question data before any commit, because SQLAlchemy expires
+    # ORM objects after commit and model_dump() would return empty dicts.
+    pending_question_dicts = [q.model_dump() for q in pending_questions]
+
+    if action.action == "select_question_option":
+        target_question_id = action.extras.get("question_id") if action.extras else None
+        option_key = action.option_key
+        target = next((q for q in pending_question_dicts if q.get("question_id") == target_question_id), None)
+        if target is None or option_key is None:
+            ctx.service.session.commit()
+            await ctx.bridge.send_text(receive_id, "未找到对应问题或选项", receive_id_type=receive_id_type)
+            return
+        selected_options = dict(approval.payload.get("selected_options", {}))
+        selected_options[target_question_id] = option_key
+        approval.payload = {**approval.payload, "selected_options": selected_options}
+        ctx.service.session.commit()
+
+        # Re-render the card with the new selection so the user sees the change.
+        card = build_question_batch_card(
+            approval_id=approval.id,
+            interaction_id=interaction_id,
+            questions=pending_question_dicts,
+            agent=interaction.agent,
+            stage=interaction.stage,
+            state=approval.state,
+            project_name=project.name or project.id,
+            chat_id=project.feishu_chat_id,
+            chat_type=project.feishu_chat_type,
+            selected_options=selected_options,
+        )
+        # The caller (WebSocket) will return this card in the action response,
+        # which updates the card in-place without a separate API call.
+        return card
+
+    if action.action == "answer_question_option":
+        target_question_id = action.extras.get("question_id") if action.extras else None
+        option_key = action.option_key
+        target = next((q for q in pending_questions if q.question_id == target_question_id), None)
+        if target is None or option_key is None:
+            ctx.service.session.commit()
+            await ctx.bridge.send_text(receive_id, "未找到对应问题或选项", receive_id_type=receive_id_type)
+            return
+        answer_label = option_key
+        for opt in target.options:
+            if opt.get("key") == option_key:
+                answer_label = opt.get("label", option_key)
+                break
+        await ctx.service.submit_question_answer(target.id, option_key, answer_label, False, open_id, commit=False)
+    elif action.action == "submit_selected_options":
+        selected_options = dict(approval.payload.get("selected_options", {}))
+        for q in pending_questions:
+            answer = selected_options.get(q.question_id) or q.recommended_option
+            if answer is None:
+                continue
+            answer_label = answer
+            for opt in q.options:
+                if opt.get("key") == answer:
+                    answer_label = opt.get("label", answer)
+                    break
+            await ctx.service.submit_question_answer(q.id, answer, answer_label, False, open_id, commit=False)
+    elif action.action == "answer_all_recommended":
+        for q in pending_questions:
+            answer = q.recommended_option
+            answer_label = answer
+            for opt in q.options:
+                if opt.get("key") == answer:
+                    answer_label = opt.get("label", answer)
+                    break
+            await ctx.service.submit_question_answer(q.id, answer, answer_label, False, open_id, commit=False)
+    elif action.action == "answer_with_values":
+        for q in pending_questions:
+            field_name = f"q_{q.question_id}"
+            answer = (action.extras or {}).get(field_name) if action.extras else None
+            if answer is None:
+                answer = q.recommended_option
+            answer_label = answer
+            for opt in q.options:
+                if opt.get("key") == answer:
+                    answer_label = opt.get("label", answer)
+                    break
+            await ctx.service.submit_question_answer(q.id, answer, answer_label, False, open_id, commit=False)
+    elif action.action == "skip_remaining":
+        for q in pending_questions:
+            if q.kind in ("blocking", "decision"):
+                continue
+            await ctx.service.submit_question_answer(q.id, None, None, True, open_id, commit=False)
+
+    # Update the choice card to a read-only "已提交" receipt state showing the
+    # recorded answers. This runs for any finalize action regardless of whether
+    # the full interaction resolves, so the user sees their choices are locked.
+    if action.action in ("submit_selected_options", "skip_remaining", "answer_all_recommended"):
+        submitted_answers: dict[str, Any] = {}
+        for q in pending_questions:
+            answer_record = ctx.service.get_question_answer(q.id)
+            if answer_record and not answer_record.skipped and answer_record.answer:
+                submitted_answers[q.question_id] = answer_record.answer
+        receipt_card = build_question_batch_card(
+            approval_id=approval_id,
+            interaction_id=interaction_id,
+            questions=pending_question_dicts,
+            agent=interaction.agent,
+            stage=interaction.stage,
+            state=approval.state,
+            project_name=project.name or project.id,
+            chat_id=project.feishu_chat_id,
+            chat_type=project.feishu_chat_type,
+            submitted_answers=submitted_answers,
+        )
+        batch_message_id = action.message_id or approval.payload.get("question_batch_message_id")
+        if batch_message_id:
+            try:
+                await ctx.bridge.update_card(batch_message_id, receipt_card)
+            except Exception:
+                logger.exception("Failed to update question batch card to submitted state")
+
+    # Determine what's still pending after recording answers.
+    all_questions = ctx.service.get_questions_for_interaction(interaction_id)
+    pending_choice_qs = [q for q in all_questions if q.status == "pending" and q.options]
+    pending_free_text_qs = [q for q in all_questions if q.status == "pending" and not q.options]
+
+    if pending_choice_qs:
+        # Still have choice questions to answer; don't move on yet.
+        ctx.service.session.commit()
+        if action.action == "answer_question_option":
+            await ctx.bridge.send_text(receive_id, "已记录选择，请继续回答其他问题。", receive_id_type=receive_id_type)
+        else:
+            await ctx.bridge.send_text(receive_id, "还有未回答的阻塞问题，请继续回答。", receive_id_type=receive_id_type)
+    elif pending_free_text_qs:
+        # All choices answered but free-text questions remain. Send the first
+        # free-text card; the interaction resolves after the user answers or
+        # skips all of them.
+        ctx.service.session.commit()
+        sent_next = await _send_next_free_text_card(ctx, approval, interaction, project, receive_id, receive_id_type)
+        if not sent_next:
+            await ctx.bridge.send_text(receive_id, "还有未回答的阻塞问题，请继续回答。", receive_id_type=receive_id_type)
+    elif ctx.service.interaction_is_resolvable(interaction_id):
+        await ctx.service.resolve_question_interaction(interaction_id, commit=False)
+        resume_state = interaction.resume_state
+        await ctx.service.respond_approval(approval_id, "answer", open_id, commit=False)
+        ctx.service.session.commit()
+        await ctx.service.transition_state(
+            interaction.project_id, "answer",
+            payload={"resume_state": resume_state},
+            triggered_by=open_id,
+        )
+        await ctx.bridge.send_text(receive_id, "已收到你的回答，Agent 继续执行。", receive_id_type=receive_id_type)
+        project = ctx.service.get_project(interaction.project_id)
+        if project is not None:
+            await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
+    else:
+        ctx.service.session.commit()
+        await ctx.bridge.send_text(receive_id, "还有未回答的阻塞问题，请继续回答。", receive_id_type=receive_id_type)
 
 
 async def _handle_menu_action(

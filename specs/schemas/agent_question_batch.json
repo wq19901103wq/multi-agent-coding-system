@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/agent_question_batch.json",
+  "title": "Agent Question Batch",
+  "type": "object",
+  "required": ["batch_key", "questions"],
+  "additionalProperties": false,
+  "properties": {
+    "batch_key": {"type": "string", "minLength": 1},
+    "questions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["question_id", "kind", "question", "reason", "allow_free_text", "options", "affected_trace_ids"],
+        "additionalProperties": false,
+        "properties": {
+          "question_id": {"type": "string", "minLength": 1},
+          "parent_question_id": {"type": ["string", "null"]},
+          "kind": {"enum": ["blocking", "decision", "non_blocking"]},
+          "question": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1},
+          "allow_free_text": {"type": "boolean"},
+          "options": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "required": ["key", "label", "impact", "recommended"],
+              "additionalProperties": false,
+              "properties": {
+                "key": {"type": "string", "minLength": 1},
+                "label": {"type": "string", "minLength": 1},
+                "impact": {"type": "string"},
+                "recommended": {"type": "boolean"}
+              }
+            }
+          },
+          "multiple": {"type": "boolean", "default": false},
+          "default_assumption": {"type": ["string", "null"]},
+          "affected_trace_ids": {"type": "array", "items": {"type": "string"}}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"kind": {"enum": ["blocking", "decision"]}}},
+            "then": {"anyOf": [{"properties": {"options": {"minItems": 1}}}, {"properties": {"allow_free_text": {"const": true}}}]}
+          }
+        ]
+      }
+    }
+  }
+}

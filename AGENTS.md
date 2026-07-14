@@ -4,8 +4,8 @@
 
 ### 已完成
 
-- **状态机重构（v1.1）**：在 `feature` / `bug_fix` / `documentation` 三条状态机中增加：
-  - 规划阶段输入态：`REQUIREMENT_INPUT_PENDING` / `ARCHITECTURE_INPUT_PENDING` / `SPEC_INPUT_PENDING`（及 bug_fix / documentation 对应输入态）
+- **状态机重构（v2.0）**：`feature` / `bug_fix` / `documentation` 共用 `state_machines/delivery.json`，差异放在 `workflow_profiles/`；编译后的流程继续支持：
+  - 规划阶段输入态：`REQUIREMENT_INPUT_PENDING` / `ARCHITECTURE_INPUT_PENDING` / `IMPLEMENTATION_SPEC_INPUT_PENDING`（及 bug_fix / documentation 对应输入态）
   - 质量确认关：`CODING_CONFIRM_PENDING` / `TESTING_CONFIRM_PENDING` / `REVIEW_CONFIRM_PENDING`
   - 统一的 `REWORK` 状态，支持回退到任意上游阶段（含 `to_testing`）
   - 质量失败统一走 `fail` -> `REWORK`，只有明确 `pass` 才进入确认关
@@ -20,7 +20,7 @@
   - 每轮任务记录 `round_number`，旧 approval 在状态重新进入时标记 `expired`
 - **单元测试基线**：`48 passed`（新增 4 个针对 FeedbackPacket / PendingUserInput / round_number 的用例）。
 - **真实飞书端到端**：`full_feature_flow` 已干净跑通到 `COMPLETED`：
-  - 经历了 `REQUIREMENT_CONFIRM_PENDING` → `ARCHITECTURE_CONFIRM_PENDING` → `SPEC_CONFIRM_PENDING` → `CODING_CONFIRM_PENDING` → `TESTING_CONFIRM_PENDING` → `REVIEW_CONFIRM_PENDING` → `ACCEPTANCE_PENDING` → `COMPLETED`。
+  - 经历了 `REQUIREMENT_CONFIRM_PENDING` → `ARCHITECTURE_CONFIRM_PENDING` → `IMPLEMENTATION_SPEC_CONFIRM_PENDING` → `CODING_CONFIRM_PENDING` → `TESTING_CONFIRM_PENDING` → `REVIEW_CONFIRM_PENDING` → `ACCEPTANCE_PENDING` → `COMPLETED`。
   - `uvicorn.log` 中无 `Failed to handle Feishu text message`、`Failed to send summary content card` 或 `NoneType.*int` 错误。
   - 注意：**同一聊天窗口不要并发跑多个 e2e scenario**，否则 simulator 会把不同项目的 approval 卡片串扰。
 

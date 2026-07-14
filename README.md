@@ -4,13 +4,13 @@
 
 ## 核心特性
 
-- **完整流程**：需求分析 → 技术规划 → Spec 拆分 → 代码实现 → 测试 → Review → 验收 → 自动 Git 合并
-- **多轮人类闭环**：需求、方案、Spec 和质量门均可多轮澄清/修订，明确失败不会被自动放行
+- **完整流程**：Specify（需求 + 产品行为 + 验收标准）→ Design（技术方案）→ Plan（实现计划与任务拆分）→ 代码实现 → 测试 → Review → 验收 → 自动 Git 合并
+- **多轮人类闭环**：Specify、Design、Plan 和质量门均可多轮澄清/修订，明确失败不会被自动放行
 - **移动端审核**：通过飞书机器人接收确认卡片、追问、查看状态
-- **反馈闭环**：测试与 Review 生成结构化反馈，按根因回退到需求、方案、Spec、编码或测试
+- **反馈闭环**：测试与 Review 生成结构化反馈，按根因回退到 Specify、Design、Plan、编码或测试
 - **中途控制**：Agent 运行期间的命令立即生效，自由文本持久化排队并在状态推进前消费
 - **多会话路由**：群聊和私聊均可关联多个项目，当前项目按“用户 × 聊天”隔离，避免跨项目串话
-- **全 Agent 主动澄清**：需求、架构、Spec、编码、测试、Review、验收和项目管理 Agent 均可通过选项或自由文本进行多轮 grill-me，回答后恢复原 Agent
+- **全业务 Agent 主动澄清（建设中）**：目标是 Specify、架构、实现 Spec、编码、测试、Review 和验收 Agent 均可多轮 grill-me；当前仅部分阶段已有专用输入路径
 
 ## 快速开始
 
@@ -32,6 +32,8 @@ python -m mac_system
 
 详见 [DESIGN.md](DESIGN.md)。
 
+新 Agent 开始工作前请先阅读 [Agent 入职与工作交接](docs/agent_onboarding_handoff.md)。
+
 ## 项目结构
 
 ```
@@ -45,7 +47,8 @@ multi-agent-coding-system/
 │   ├── models.py         # SQLModel 数据模型
 │   └── state_machine.py  # 状态机加载与转换
 ├── specs/                # 可执行规范、JSON Schema 与审批模式
-├── state_machines/       # feature / bug_fix / documentation 状态机
+├── state_machines/       # 唯一的通用交付状态机模板
+├── workflow_profiles/    # feature / bug_fix / documentation 阶段配置
 ├── tests/                # 测试
 ├── projects/             # Agent 生成的项目工作区（每个子目录是独立 Git 仓库）
 └── DESIGN.md             # 架构设计文档

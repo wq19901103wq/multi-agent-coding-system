@@ -279,13 +279,13 @@ handler 返回前执行 stuck invariant：active 非终态项目必须具有 run
 
 ### 10. 质量确认关
 
-`feature.json` 状态机包含 8 个人工确认节点：
+通用交付状态机按 `feature` profile 生成 8 个人工确认节点：
 
 | 节点 | 类型 | reject 目标 |
 |---|---|---|
 | `REQUIREMENT_CONFIRM_PENDING` | 规划确认 | → `PLANNING_REQUIREMENTS` |
 | `ARCHITECTURE_CONFIRM_PENDING` | 规划确认 | → `PLANNING_ARCHITECTURE` |
-| `SPEC_CONFIRM_PENDING` | 规划确认 | → `PLANNING_SPECS` |
+| `IMPLEMENTATION_SPEC_CONFIRM_PENDING` | 规划确认 | → `PLANNING_IMPLEMENTATION_SPECS` |
 | `CODING_CONFIRM_PENDING` | 质量确认关 | → `REWORK` |
 | `TESTING_CONFIRM_PENDING` | 质量确认关 | → `REWORK` |
 | `REVIEW_CONFIRM_PENDING` | 质量确认关 | → `REWORK` |

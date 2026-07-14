@@ -1,7 +1,15 @@
 # 状态机事件语义
 
-> 版本：v1.0  
-> 用途：补充 `state_machines/*.json` 中事件名的具体含义、触发条件、副作用和边界行为。
+> 版本：v2.0
+> 用途：补充通用 `state_machines/delivery.json` 与 `workflow_profiles/*.json` 的事件含义、触发条件、副作用和边界行为。
+
+## 配置模型：一个状态机，多个流程 Profile
+
+系统只有一个交付生命周期状态机。`delivery.json` 定义 INIT、阶段执行、等待输入、人工确认、REWORK、验收、合并和终态的统一事件语义；`workflow_profiles/{task_type}.json` 只声明该任务类型有哪些阶段、由哪个 Agent 执行、产物确认名以及允许回退到哪些阶段。
+
+Profile 不得复制完整 `states` 或自行重定义 `complete / fail / ask_user / confirm / reject` 语义。新增 `refactor`、`migration` 等任务类型时，应优先新增 profile；只有所有任务都需要改变的生命周期规则才允许修改 `delivery.json`。
+
+运行时将模板和 profile 编译为现有的具体状态名，因此 API、飞书卡片、审计日志仍展示 `PLANNING_REQUIREMENTS`、`TESTING_CONFIRM_PENDING` 等可读状态。可观测性必须同时记录 `task_type + current_state`，不能只显示抽象的“执行中”。
 
 ## 通用约定
 
@@ -45,7 +53,9 @@
 |---|---|---|---|
 | `PLANNING_REQUIREMENTS` | `REQUIREMENT_INPUT_PENDING` | `REQUIREMENT_CONFIRM_PENDING` | `PLANNING_REQUIREMENTS` |
 | `PLANNING_ARCHITECTURE` | `ARCHITECTURE_INPUT_PENDING` | `ARCHITECTURE_CONFIRM_PENDING` | `PLANNING_ARCHITECTURE` |
-| `PLANNING_SPECS` | `SPEC_INPUT_PENDING` | `SPEC_CONFIRM_PENDING` | `PLANNING_SPECS` |
+| `PLANNING_IMPLEMENTATION_SPECS` | `IMPLEMENTATION_SPEC_INPUT_PENDING` | `IMPLEMENTATION_SPEC_CONFIRM_PENDING` | `PLANNING_IMPLEMENTATION_SPECS` |
+| `TESTING` | `TESTING_INPUT_PENDING` | `TESTING_CONFIRM_PENDING` | `TESTING` |
+| `REVIEW` | `REVIEW_INPUT_PENDING` | `REVIEW_CONFIRM_PENDING` | `REVIEW` |
 
 `confirm` 才进入下一阶段。输入回答和修订意见必须作为结构化 feedback packet 注入新一轮 Agent，而不是只保留一段 `latest_*` 文本。
 
@@ -128,7 +138,7 @@ Agent 完成后，Orchestrator 在合并产物和推进状态前必须重新读�
 
 通用轮转为：`S(agent_execution) → ask_user → AGENT_INPUT_PENDING(resume_state=S) → answer → S(new round)`。原 Task 以 `waiting_for_user` 或等价终态结束，回答后必须创建新轮次，不能让已退出的进程原地继续。用户回答若改变上游产物，则按影响分析跳转到 Requirements/Architecture/Specs/REWORK，而不是机械返回 `resume_state`。
 
-Planner 现有的 `REQUIREMENT_INPUT_PENDING`、`ARCHITECTURE_INPUT_PENDING`、`SPEC_INPUT_PENDING` 以及 Coder 的 `CLARIFICATION_PENDING` 是兼容别名；Tester、Reviewer、Acceptance Evaluator 和 Project Manager 必须复用同一协议。实现完成前，不得把文档中的通用能力宣称为已交付能力。
+Planner、Tester、Reviewer 的阶段输入态以及 Coder 的 `CLARIFICATION_PENDING` 都由同一 profile 编译规则生成，并复用 QuestionInteraction 协议。Acceptance Evaluator 和 Project Manager 仍需完成同等闭环；实现完成前，不得把这两者宣称为已交付能力。
 
 并发约束：每个 `(project_id, origin_task_id, question_id)` 至多一个 pending interaction；服务重启和多会话投递均复用同一记录。收到回答时先以 CAS/事务完成 pending→answered，再恢复一次，防止两个聊天窗口重复触发。
 
@@ -202,7 +212,7 @@ reject 必须按确认节点类型分流，不能用同一条“先消费 approv
 
 ### `ARCHITECTURE_CONFIRM_PENDING`
 
-- **`confirm`**：进入 `PLANNING_SPECS`
+- **`confirm`**：进入 `PLANNING_IMPLEMENTATION_SPECS`
 - **`reject`**：回到 `PLANNING_ARCHITECTURE`。交互流程见上方「Reject 交互流程」。
 - **`select_option`**：
   - 用户选择了 Architect 给出的某个决策选项
@@ -212,16 +222,16 @@ reject 必须按确认节点类型分流，不能用同一条“先消费 approv
 
 > 说明：`select_option` 事件的结构为：事件名 `select_option`，payload 中 `{decision_id, option_key}`。状态机 JSON 中统一用 `select_option` 作为事件名。
 
-### `PLANNING_SPECS` → `SPEC_CONFIRM_PENDING`
+### `PLANNING_IMPLEMENTATION_SPECS` → `IMPLEMENTATION_SPEC_CONFIRM_PENDING`
 
 - **事件**：`complete`
 - **触发**：planner stage=specs 成功输出 `SPECS.json`。
 - **副作用**：合并 `SPECS.json`。
 
-### `SPEC_CONFIRM_PENDING`
+### `IMPLEMENTATION_SPEC_CONFIRM_PENDING`
 
 - **`confirm`**：进入 `CODING`
-- **`reject`**：回到 `PLANNING_SPECS`。交互流程见上方「Reject 交互流程」。
+- **`reject`**：回到 `PLANNING_IMPLEMENTATION_SPECS`。交互流程见上方「Reject 交互流程」。
 
 ### `CODING`
 
@@ -246,7 +256,7 @@ Agent：`coder`
 ### `CLARIFICATION_PENDING`
 
 - **`answer`**：用户回答了问题，回到 `CODING`，回答内容写入 `STATE.json` 的 `context.clarification_answer`
-- **`needs_spec_change`**：用户回答导致需要改 Spec，回到 `PLANNING_SPECS`
+- **`needs_spec_change`**：用户回答导致需要改 Spec，回到 `PLANNING_IMPLEMENTATION_SPECS`
 - **`needs_architecture_change`**：用户回答导致需要改方案，回到 `PLANNING_ARCHITECTURE`
 - **`needs_bug_analysis_change`**（bug_fix 任务）：回到 `BUG_ANALYSIS`
 - **`needs_outline_change`**（documentation 任务）：回到 `DOC_OUTLINE`
@@ -254,7 +264,7 @@ Agent：`coder`
 ### `CONFLICT_PENDING`
 
 - **`resolve`**：用户裁决后继续，回到 `CODING`，裁决内容写入 `context.conflict_resolution`
-- **`needs_spec_change`**：回到 `PLANNING_SPECS`
+- **`needs_spec_change`**：回到 `PLANNING_IMPLEMENTATION_SPECS`
 - **`needs_architecture_change`**：回到 `PLANNING_ARCHITECTURE`
 - **`needs_bug_analysis_change`**（bug_fix 任务）：回到 `BUG_ANALYSIS`
 - **`needs_outline_change`**（documentation 任务）：回到 `DOC_OUTLINE`
@@ -289,7 +299,7 @@ Agent：`reviewer`
 - **`feature`**：
   - `reject_to_requirements`：回到 `PLANNING_REQUIREMENTS`
   - `reject_to_architecture`：回到 `PLANNING_ARCHITECTURE`
-  - `reject_to_specs`：回到 `PLANNING_SPECS`
+  - `reject_to_specs`：回到 `PLANNING_IMPLEMENTATION_SPECS`
 - **`bug_fix`**：
   - `reject_to_analysis`：回到 `BUG_ANALYSIS`
 - **`documentation`**：

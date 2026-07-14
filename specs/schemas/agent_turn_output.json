@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/agent_turn_output.json",
+  "title": "Common Agent Turn Output",
+  "type": "object",
+  "required": ["success", "next_state_event"],
+  "properties": {
+    "success": {"type": "boolean"},
+    "next_state_event": {
+      "enum": [
+        "complete", "fail", "ask_user", "clarify", "conflict",
+        "new_requirement", "architecture_question", "spec_question",
+        "bug_analysis_question", "outline_question"
+      ]
+    },
+    "question_batch": {"$ref": "agent_question_batch.json"},
+    "completion_reason": {"enum": ["stage_result", "question_requested", "technical_failure"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"next_state_event": {"const": "ask_user"}}},
+      "then": {
+        "required": ["question_batch"],
+        "properties": {
+          "success": {"const": true},
+          "completion_reason": {"const": "question_requested"}
+        }
+      },
+      "else": {"not": {"required": ["question_batch"]}}
+    }
+  ]
+}

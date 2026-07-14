@@ -102,6 +102,7 @@
         "fail": "FAILED",
         "clarify": "CLARIFICATION_PENDING",
         "conflict": "CONFLICT_PENDING",
+        "ask_user": "CLARIFICATION_PENDING",
         "new_requirement": "PLANNING_REQUIREMENTS",
         "architecture_question": "PLANNING_ARCHITECTURE",
         "spec_question": "PLANNING_SPECS"
@@ -142,7 +143,8 @@
       "next_states": {
         "complete": "TESTING_CONFIRM_PENDING",
         "fail": "REWORK",
-        "fail_max_retries": "FAILED"
+        "fail_max_retries": "FAILED",
+        "ask_user": "CLARIFICATION_PENDING"
       }
     },
     "TESTING_CONFIRM_PENDING": {
@@ -160,7 +162,8 @@
       "next_states": {
         "complete": "REVIEW_CONFIRM_PENDING",
         "fail": "REWORK",
-        "fail_max_retries": "FAILED"
+        "fail_max_retries": "FAILED",
+        "ask_user": "CLARIFICATION_PENDING"
       }
     },
     "REVIEW_CONFIRM_PENDING": {

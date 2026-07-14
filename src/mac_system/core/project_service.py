@@ -1,5 +1,6 @@
 import json
 import secrets
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,10 @@ from mac_system.config import get_agent_config, get_settings
 from mac_system.database import session_scope
 from mac_system.models import (
     Approval,
+    ChatDirectoryBinding,
     ChatUserContext,
+    ConversationInteraction,
+    DefaultAuthorization,
     EventLog,
     FeedbackPacket,
     PendingIntent,
@@ -19,9 +23,13 @@ from mac_system.models import (
     Project,
     ProjectChat,
     ProjectUser,
+    Question,
+    QuestionAnswer,
+    QuestionInteraction,
     Task,
 )
 from mac_system.state_machine import StateMachine
+from mac_system.core.project_paths import project_mac_dir
 from mac_system.core.worktree_manager import WorktreeManager
 
 
@@ -64,64 +72,52 @@ class ProjectService:
         creator_open_id: str | None = None,
         feishu_chat_id: str | None = None,
         feishu_chat_type: str = "p2p",
+        bound_directory: str | None = None,
     ) -> Project:
         project_id = generate_id("proj")
-        workspace_path = (self.settings.projects_dir / project_id).resolve()
-        workspace_path.mkdir(parents=True, exist_ok=False)
+        if bound_directory is None and feishu_chat_id:
+            binding = self.get_chat_directory_binding(feishu_chat_id)
+            bound_directory = binding.directory if binding else None
 
-        # Create subdirectories
-        (workspace_path / ".mac").mkdir()
-        (workspace_path / "src").mkdir()
-        (workspace_path / "tests").mkdir()
-        (workspace_path / "worktrees").mkdir()
-
-        # Ignore generated directories so they are not committed as embedded repos
-        (workspace_path / ".gitignore").write_text(
-            "worktrees/\n.mac/\n__pycache__/\n*.pyc\n*.pyo\n*.egg-info/\n.coverage\n",
-            encoding="utf-8",
-        )
-
-        # Minimal Python project config so pytest can discover src/ packages
-        (workspace_path / "pyproject.toml").write_text(
-            '[build-system]\n'
-            'requires = ["hatchling"]\n'
-            'build-backend = "hatchling.build"\n\n'
-            '[project]\n'
-            'name = "generated-project"\n'
-            'version = "0.1.0"\n'
-            'requires-python = ">=3.10"\n\n'
-            '[tool.pytest.ini_options]\n'
-            'pythonpath = ["src"]\n'
-            'testpaths = ["tests"]\n',
-            encoding="utf-8",
-        )
-
-        # Git init
-        import subprocess
-
-        subprocess.run(["git", "init", "-q"], cwd=workspace_path, check=True)
-        subprocess.run(
-            ["git", "config", "user.name", self.settings.git_user_name],
-            cwd=workspace_path,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.email", self.settings.git_user_email],
-            cwd=workspace_path,
-            check=True,
-        )
-        # Stage project skeleton and create an initial commit so worktrees
-        # have a valid HEAD to branch from and merge back into.
-        subprocess.run(
-            ["git", "add", ".gitignore", "pyproject.toml", "src", "tests"],
-            cwd=workspace_path,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "Initial commit"],
-            cwd=workspace_path,
-            check=True,
-        )
+        if bound_directory:
+            workspace_path = self._prepare_bound_directory(bound_directory)
+            (workspace_path / ".mac" / "projects" / project_id).mkdir(
+                parents=True, exist_ok=True
+            )
+            (workspace_path / ".mac" / "worktrees" / project_id).mkdir(
+                parents=True, exist_ok=True
+            )
+            exclude_path = workspace_path / ".git" / "info" / "exclude"
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            exclude_text = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+            if ".mac/worktrees/" not in exclude_text.splitlines():
+                exclude_path.write_text(
+                    exclude_text.rstrip() + "\n.mac/worktrees/\n",
+                    encoding="utf-8",
+                )
+        else:
+            workspace_path = (self.settings.projects_dir / project_id).resolve()
+            workspace_path.mkdir(parents=True, exist_ok=False)
+            (workspace_path / ".mac").mkdir()
+            (workspace_path / "src").mkdir()
+            (workspace_path / "tests").mkdir()
+            (workspace_path / "worktrees").mkdir()
+            (workspace_path / ".gitignore").write_text(
+                "worktrees/\n.mac/\n__pycache__/\n*.pyc\n*.pyo\n*.egg-info/\n.coverage\n",
+                encoding="utf-8",
+            )
+            (workspace_path / "pyproject.toml").write_text(
+                '[build-system]\nrequires = ["hatchling"]\n'
+                'build-backend = "hatchling.build"\n\n'
+                '[project]\nname = "generated-project"\nversion = "0.1.0"\n'
+                'requires-python = ">=3.10"\n\n'
+                '[tool.pytest.ini_options]\npythonpath = ["src"]\n'
+                'testpaths = ["tests"]\n',
+                encoding="utf-8",
+            )
+            self._initialize_repository(workspace_path, initial_paths=[
+                ".gitignore", "pyproject.toml", "src", "tests"
+            ])
 
         approval_config = self._resolve_approval_config(approval_mode)
 
@@ -134,6 +130,7 @@ class ProjectService:
             current_state="INIT",
             previous_state=None,
             workspace_path=str(workspace_path),
+            bound_directory=str(workspace_path) if bound_directory else None,
             context={
                 "task_type": task_type,
                 "description": description,
@@ -204,6 +201,90 @@ class ProjectService:
         self.session.commit()
         return project
 
+    def _initialize_repository(
+        self, path: Path, initial_paths: list[str] | None = None
+    ) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+        subprocess.run(
+            ["git", "config", "user.name", self.settings.git_user_name],
+            cwd=path, check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", self.settings.git_user_email],
+            cwd=path, check=True,
+        )
+        subprocess.run(
+            ["git", "add", *(initial_paths or ["-A"])], cwd=path, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-q", "--allow-empty", "-m", "Initial commit"],
+            cwd=path, check=True,
+        )
+
+    def _prepare_bound_directory(self, directory: str) -> Path:
+        path = Path(directory).expanduser()
+        if not path.is_absolute():
+            raise ValueError("绑定目录必须是绝对路径")
+        path = path.resolve()
+        if path.exists() and not path.is_dir():
+            raise ValueError(f"绑定路径不是目录: {path}")
+        path.mkdir(parents=True, exist_ok=True)
+
+        probe = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=path, capture_output=True, text=True,
+        )
+        if probe.returncode == 0:
+            repository_root = Path(probe.stdout.strip()).resolve()
+            if repository_root != path:
+                raise ValueError(
+                    f"绑定目录必须是 Git 仓库根目录；当前仓库根目录为 {repository_root}"
+                )
+            head = subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"], cwd=path,
+                capture_output=True,
+            )
+            if head.returncode != 0:
+                self._initialize_repository(path)
+        else:
+            self._initialize_repository(path)
+        return path
+
+    def bind_directory_to_chat(
+        self, chat_id: str, directory: str, bound_by: str | None = None
+    ) -> ChatDirectoryBinding:
+        path = self._prepare_bound_directory(directory)
+        binding = self.session.get(ChatDirectoryBinding, chat_id)
+        now = _now()
+        if binding is None:
+            binding = ChatDirectoryBinding(
+                chat_id=chat_id,
+                directory=str(path),
+                bound_by=bound_by,
+                created_at=now,
+                updated_at=now,
+            )
+            self.session.add(binding)
+        else:
+            binding.directory = str(path)
+            binding.bound_by = bound_by
+            binding.updated_at = now
+        self.session.commit()
+        return binding
+
+    def get_chat_directory_binding(
+        self, chat_id: str
+    ) -> ChatDirectoryBinding | None:
+        return self.session.get(ChatDirectoryBinding, chat_id)
+
+    def unbind_directory_from_chat(self, chat_id: str) -> bool:
+        binding = self.session.get(ChatDirectoryBinding, chat_id)
+        if binding is None:
+            return False
+        self.session.delete(binding)
+        self.session.commit()
+        return True
+
     async def cancel_project(
         self,
         project_id: str,
@@ -232,7 +313,9 @@ class ProjectService:
 
         # Remove any lingering worktrees for the project.
         try:
-            WorktreeManager(self.settings.projects_dir).remove_all_worktrees(project_id)
+            WorktreeManager(self.settings.projects_dir).remove_all_worktrees(
+                project_id, workspace_path=project.workspace_path
+            )
         except Exception:
             pass
 
@@ -280,6 +363,7 @@ class ProjectService:
             creator_open_id=creator_open_id,
             feishu_chat_id=project.feishu_chat_id,
             feishu_chat_type=project.feishu_chat_type,
+            bound_directory=project.bound_directory,
         )
 
         await self.log_event(
@@ -291,13 +375,99 @@ class ProjectService:
         return new_project
 
     def get_project(self, project_id: str) -> Project | None:
-        return self.session.get(Project, project_id)
+        project = self.session.get(Project, project_id)
+        if project is not None:
+            self._migrate_legacy_state_names(project)
+        return project
+
+    def _migrate_legacy_state_names(self, project: Project) -> None:
+        """Lazily migrate old state names in the DB to their new names.
+
+        ``PLANNING_SPECS`` -> ``PLANNING_IMPLEMENTATION_SPECS`` etc.  Done
+        on read so existing projects keep working without a batch migration
+        script.  Also migrates ``previous_state``.
+        """
+        from mac_system.state_machine import _STATE_ALIASES
+        changed = False
+        if project.current_state in _STATE_ALIASES:
+            project.current_state = _STATE_ALIASES[project.current_state]
+            changed = True
+        if project.previous_state and project.previous_state in _STATE_ALIASES:
+            project.previous_state = _STATE_ALIASES[project.previous_state]
+            changed = True
+        if changed:
+            self.session.commit()
 
     def require_project(self, project_id: str) -> Project:
         project = self.get_project(project_id)
         if project is None:
             raise ProjectNotFoundError(project_id)
         return project
+
+    # ------------------------------------------------------------------
+    # Artifact version management
+    # ------------------------------------------------------------------
+
+    DOWNSTREAM_ARTIFACTS: dict[str, tuple[str, ...]] = {
+        "requirements": ("architecture", "specs"),
+        "architecture": ("specs",),
+        "specs": (),
+    }
+
+    def get_artifact_version(
+        self, project_id: str, artifact_id: str
+    ) -> dict[str, Any] | None:
+        project = self.require_project(project_id)
+        value = project.context.get("artifact_versions", {}).get(artifact_id)
+        return dict(value) if value else None
+
+    def update_artifact_version(
+        self,
+        project_id: str,
+        artifact_id: str,
+        version: int,
+        round_number: int | None,
+        status: str,
+        *,
+        commit: bool = True,
+    ) -> None:
+        project = self.require_project(project_id)
+        versions = dict(project.context.get("artifact_versions", {}))
+        versions[artifact_id] = {
+            "version": version,
+            "round": round_number,
+            "status": status,
+        }
+        project.context = {**project.context, "artifact_versions": versions}
+        if commit:
+            self.session.commit()
+
+    def mark_downstream_artifacts_stale(
+        self, project_id: str, changed_artifact_id: str, *, commit: bool = True
+    ) -> None:
+        project = self.require_project(project_id)
+        versions = dict(project.context.get("artifact_versions", {}))
+        changed = False
+        for artifact_id in self.DOWNSTREAM_ARTIFACTS.get(changed_artifact_id, ()):
+            current = versions.get(artifact_id)
+            if current and current.get("status") != "stale":
+                versions[artifact_id] = {**current, "status": "stale"}
+                changed = True
+        if changed:
+            project.context = {**project.context, "artifact_versions": versions}
+            if commit:
+                self.session.commit()
+
+    # Backward-compatible name used by the original main-branch feature.
+    mark_downstream_stale = mark_downstream_artifacts_stale
+
+    def get_stale_artifacts(self, project_id: str) -> list[dict[str, Any]]:
+        project = self.require_project(project_id)
+        return [
+            {"artifact_id": artifact_id, **info}
+            for artifact_id, info in project.context.get("artifact_versions", {}).items()
+            if info.get("status") == "stale"
+        ]
 
     # ------------------------------------------------------------------
     # Chat / user context routing
@@ -615,6 +785,20 @@ class ProjectService:
             retry_counts[previous_state] = 0
             project.context = {**project.context, "retry_counts": retry_counts}
 
+        if event == "confirm":
+            confirmed_artifact = {
+                "REQUIREMENT_CONFIRM_PENDING": "requirements",
+                "ARCHITECTURE_CONFIRM_PENDING": "architecture",
+                "IMPLEMENTATION_SPEC_CONFIRM_PENDING": "specs",
+            }.get(previous_state)
+            if confirmed_artifact:
+                versions = dict(project.context.get("artifact_versions", {}))
+                current = versions.get(confirmed_artifact)
+                if current:
+                    versions[confirmed_artifact] = {**current, "status": "confirmed"}
+                    project.context = {**project.context, "artifact_versions": versions}
+            self._resolve_human_rejection_feedback(project_id)
+
         self._write_state_json(project)
 
         await self.log_event(
@@ -843,6 +1027,19 @@ class ProjectService:
             self.session.commit()
         return packet
 
+    def _resolve_human_rejection_feedback(self, project_id: str) -> None:
+        """Close rejection feedback after the revised artifact is confirmed."""
+        packets = self.session.exec(
+            select(FeedbackPacket).where(
+                FeedbackPacket.project_id == project_id,
+                FeedbackPacket.kind == "human_rejection",
+                FeedbackPacket.status.in_(["open", "disputed"]),
+            )
+        ).all()
+        for packet in packets:
+            packet.status = "resolved"
+            packet.updated_at = _now()
+
     def get_open_feedback_packets(self, project_id: str) -> list[FeedbackPacket]:
         return list(
             self.session.exec(
@@ -1013,6 +1210,217 @@ class ProjectService:
         self.session.commit()
 
     # ------------------------------------------------------------------
+    # Question interactions (unified ask_user / AGENT_INPUT_PENDING)
+    # ------------------------------------------------------------------
+
+    async def create_question_interaction(
+        self, project_id, origin_task_id, origin_round, resume_state,
+        agent, stage, batch_key, questions, approval_id=None, commit=True,
+    ) -> QuestionInteraction:
+        interaction_id = generate_id("qi")
+        interaction = QuestionInteraction(
+            id=interaction_id, project_id=project_id, origin_task_id=origin_task_id,
+            origin_round=origin_round, resume_state=resume_state, agent=agent,
+            stage=stage, batch_key=batch_key, status="pending", approval_id=approval_id,
+        )
+        self.session.add(interaction)
+        for idx, q in enumerate(questions):
+            qid = q.get("question_id") or generate_id("q")
+            options = q.get("options") or []
+            recommended = q.get("recommended_option")
+            if recommended is None:
+                for opt in options:
+                    if opt.get("recommended"):
+                        recommended = opt.get("key")
+                        break
+            question = Question(
+                id=generate_id("q"), interaction_id=interaction_id, question_id=qid,
+                kind=q.get("kind", "blocking"), question=q.get("question", ""),
+                reason=q.get("reason", ""), allow_free_text=q.get("allow_free_text", False),
+                options=options, multiple=q.get("multiple", False),
+                default_assumption=q.get("default_assumption"), recommended_option=recommended,
+                affected_trace_ids=q.get("affected_trace_ids", []), status="pending",
+                order_index=idx,
+            )
+            self.session.add(question)
+        await self.log_event(
+            project_id=project_id, level="INFO",
+            message=f"QuestionInteraction created: {interaction_id} ({len(questions)} questions)",
+            meta={"interaction_id": interaction_id, "agent": agent, "stage": stage},
+        )
+        if commit:
+            self.session.commit()
+        return interaction
+
+    def get_question_interaction(self, interaction_id) -> QuestionInteraction | None:
+        return self.session.get(QuestionInteraction, interaction_id)
+
+    def get_open_question_interaction(self, project_id) -> QuestionInteraction | None:
+        return self.session.exec(
+            select(QuestionInteraction).where(
+                QuestionInteraction.project_id == project_id,
+                QuestionInteraction.status == "pending",
+            ).order_by(QuestionInteraction.created_at.desc())
+        ).first()
+
+    def get_questions_for_interaction(self, interaction_id) -> list[Question]:
+        return list(self.session.exec(
+            select(Question).where(Question.interaction_id == interaction_id)
+            .order_by(Question.order_index)
+        ).all())
+
+    def get_question_answer(self, question_db_id) -> QuestionAnswer | None:
+        return self.session.exec(
+            select(QuestionAnswer).where(QuestionAnswer.question_id == question_db_id)
+            .order_by(QuestionAnswer.responded_at.desc())
+        ).first()
+
+    async def submit_question_answer(
+        self, question_db_id, answer, answer_label, skipped, responded_by, commit=True,
+    ) -> QuestionAnswer:
+        qa = QuestionAnswer(
+            id=generate_id("qa"), question_id=question_db_id, answer=answer,
+            answer_label=answer_label, skipped=skipped, responded_by=responded_by,
+        )
+        self.session.add(qa)
+        question = self.session.get(Question, question_db_id)
+        if question is not None:
+            question.status = "skipped" if skipped else "answered"
+        if commit:
+            self.session.commit()
+        return qa
+
+    def interaction_is_resolvable(self, interaction_id) -> bool:
+        questions = self.get_questions_for_interaction(interaction_id)
+        if not questions:
+            return True
+        for q in questions:
+            if q.kind in ("blocking", "decision") and q.status == "pending":
+                return False
+        return True
+
+    async def resolve_question_interaction(self, interaction_id, commit=True) -> QuestionInteraction | None:
+        interaction = self.session.get(QuestionInteraction, interaction_id)
+        if interaction is None:
+            return None
+        interaction.status = "answered"
+        interaction.answered_at = _now()
+        if commit:
+            self.session.commit()
+        return interaction
+
+    def expire_open_question_interactions(self, project_id) -> int:
+        interactions = self.session.exec(
+            select(QuestionInteraction).where(
+                QuestionInteraction.project_id == project_id,
+                QuestionInteraction.status == "pending",
+            )
+        ).all()
+        for it in interactions:
+            it.status = "expired"
+        self.session.commit()
+        return len(interactions)
+
+    def get_default_authorization(self, project_id, question_id) -> DefaultAuthorization | None:
+        auths = self.session.exec(
+            select(DefaultAuthorization).where(DefaultAuthorization.project_id == project_id)
+        ).all()
+        for auth in auths:
+            if question_id.startswith(auth.question_pattern):
+                return auth
+        return None
+
+    async def create_default_authorization(
+        self, project_id, question_pattern, authorized_option, created_by=None, commit=True,
+    ) -> DefaultAuthorization:
+        auth = DefaultAuthorization(
+            id=generate_id("dauth"), project_id=project_id,
+            question_pattern=question_pattern, authorized_option=authorized_option,
+            created_by=created_by,
+        )
+        self.session.add(auth)
+        if commit:
+            self.session.commit()
+        return auth
+
+    def serialize_question_interaction(self, interaction_id) -> dict[str, Any] | None:
+        interaction = self.session.get(QuestionInteraction, interaction_id)
+        if interaction is None:
+            return None
+        questions = self.get_questions_for_interaction(interaction_id)
+        result_questions = []
+        for q in questions:
+            qa = self.get_question_answer(q.id)
+            result_questions.append({
+                "db_id": q.id, "question_id": q.question_id, "kind": q.kind,
+                "question": q.question, "reason": q.reason,
+                "allow_free_text": q.allow_free_text, "options": q.options,
+                "multiple": q.multiple, "default_assumption": q.default_assumption,
+                "recommended_option": q.recommended_option,
+                "affected_trace_ids": q.affected_trace_ids, "status": q.status,
+                "answer": qa.answer if qa else None,
+                "answer_label": qa.answer_label if qa else None,
+                "skipped": qa.skipped if qa else False,
+            })
+        return {
+            "interaction_id": interaction.id, "project_id": interaction.project_id,
+            "origin_task_id": interaction.origin_task_id, "origin_round": interaction.origin_round,
+            "resume_state": interaction.resume_state, "agent": interaction.agent,
+            "stage": interaction.stage, "batch_key": interaction.batch_key,
+            "status": interaction.status, "approval_id": interaction.approval_id,
+            "questions": result_questions,
+            "is_resolvable": self.interaction_is_resolvable(interaction_id),
+        }
+
+    # ------------------------------------------------------------------
+    # Conversation interactions (project-not-determined disambiguation)
+    # ------------------------------------------------------------------
+
+    async def create_conversation_interaction(
+        self, chat_id, open_id, source_message_id, source_text, candidates, commit=True,
+    ) -> ConversationInteraction:
+        existing = self.session.exec(
+            select(ConversationInteraction).where(
+                ConversationInteraction.chat_id == chat_id,
+                ConversationInteraction.open_id == open_id,
+                ConversationInteraction.status == "pending",
+            )
+        ).all()
+        for it in existing:
+            it.status = "expired"
+        interaction = ConversationInteraction(
+            id=generate_id("ci"), chat_id=chat_id, open_id=open_id,
+            source_message_id=source_message_id, source_text=source_text,
+            candidates=candidates,
+        )
+        self.session.add(interaction)
+        if commit:
+            self.session.commit()
+        return interaction
+
+    def get_pending_conversation_interaction(self, chat_id, open_id) -> ConversationInteraction | None:
+        return self.session.exec(
+            select(ConversationInteraction).where(
+                ConversationInteraction.chat_id == chat_id,
+                ConversationInteraction.open_id == open_id,
+                ConversationInteraction.status == "pending",
+            ).order_by(ConversationInteraction.created_at.desc())
+        ).first()
+
+    async def resolve_conversation_interaction(
+        self, interaction_id, selected_project_id, commit=True,
+    ) -> ConversationInteraction | None:
+        interaction = self.session.get(ConversationInteraction, interaction_id)
+        if interaction is None:
+            return None
+        interaction.selected_project_id = selected_project_id
+        interaction.status = "resolved"
+        interaction.resolved_at = _now()
+        if commit:
+            self.session.commit()
+        return interaction
+
+    # ------------------------------------------------------------------
 
     async def log_event(
         self,
@@ -1030,8 +1438,8 @@ class ProjectService:
         self.session.add(event)
 
     def _write_state_json(self, project: Project) -> None:
-        workspace = Path(project.workspace_path)
-        state_path = workspace / ".mac" / "STATE.json"
+        state_path = project_mac_dir(project) / "STATE.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
         pending = self._build_pending_approval(project)
 
         # Build read-only summaries for agents.

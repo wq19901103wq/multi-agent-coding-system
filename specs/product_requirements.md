@@ -1,6 +1,6 @@
 # MAC System 产品需求
 
-> 版本：v1.0  
+> 版本：v1.1
 > 用途：为跨状态机、会话路由和多 Agent 协作能力提供稳定 REQ/AC，详细实现约束由各专项 spec 定义。
 
 ## 多 Agent 主动澄清与 Grill-Me
@@ -31,9 +31,9 @@ Planner、Coder、Tester、Reviewer、Acceptance Evaluator 和 Project Manager �
 
 | Agent | 必须考虑 ask_user 的场景 | 典型选项/输入 | 回答后恢复 |
 |---|---|---|---|
-| Planner / Requirements | 目标、范围、角色、约束、非功能指标或验收标准不明确 | 范围、优先级、默认假设、自由描述 | PLANNING_REQUIREMENTS |
+| Planner / Specify | 目标、范围、角色、用户流程、业务规则、功能/异常行为、约束、非功能指标或验收标准不明确 | 范围、优先级、产品行为、默认假设、自由描述 | PLANNING_REQUIREMENTS |
 | Planner / Architecture | 多个方案均合理；成本/性能/安全取舍需业务决定；外部系统能力未知 | 方案 A/B/C、推荐方案、约束补充 | PLANNING_ARCHITECTURE |
-| Planner / Specs | 拆分粒度、兼容/迁移策略、接口契约或边界行为不明确 | 拆分方案、错误语义、兼容范围 | PLANNING_SPECS |
+| Planner / Specs | 拆分粒度、兼容/迁移策略、接口契约或边界行为不明确 | 拆分方案、错误语义、兼容范围 | PLANNING_IMPLEMENTATION_SPECS |
 | Coder | Spec 与代码现状冲突；破坏性迁移；公共 API 变化；安全敏感实现；必须扩大范围 | 保守/完整实现、迁移方式、是否允许依赖或接口变化 | CODING |
 | Tester | 环境不可用；预期矛盾；破坏性测试；凭证/数据缺失；flaky 结果需判定 | mock/真实环境、期望结果、隔离/跳过 | TESTING |
 | Reviewer | blocking issue 的产品意图不清；修复会改变范围；风险接受需 owner 决策 | 修复/接受风险/回退上游/补测试 | REVIEW 或 REWORK 目标 |
@@ -41,6 +41,29 @@ Planner、Coder、Tester、Reviewer、Acceptance Evaluator 和 Project Manager �
 | Project Manager | 消息无法唯一路由；多个项目/approval 候选；命令或跨 Agent 意见冲突 | 选择项目、approval、冲突处置 | 原控制/路由位置 |
 
 Agent 不应为低价值信息重复打断用户。能够由已确认产物、代码、测试或既有回答唯一推导的问题应自行解决；只有会实质改变范围、契约、风险、成本或验收结果的问题才设为 blocking。
+
+## 统一交付状态机
+
+### REQ-FLOW-001：所有任务类型共用一个生命周期
+
+Feature、Bug Fix、Documentation 以及未来的 Refactor/Migration 必须复用同一个交付生命周期：阶段执行、用户澄清、产物确认、质量失败回退、最终验收、合并和终态。不得为每个 task type 复制一份完整状态机。
+
+Feature 的规划阶段固定为 `Specify → Design → Plan`。Specify 在同一个 `REQUIREMENTS.json` 和同一次人工确认中覆盖需求、产品行为与验收标准；不得再插入独立的“需求 Spec / Product Spec”状态。Plan 指面向实现的 Spec/任务拆分，不是第二份产品需求。
+
+### REQ-FLOW-002：任务差异由 Profile 表达
+
+Workflow Profile 只描述阶段顺序、Agent/Prompt stage、展示名称、可用回退目标和任务类型特有的阶段路由。`complete / fail / ask_user / confirm / reject` 的含义由通用状态机统一定义，Profile 不得覆盖这些核心语义。
+
+### REQ-FLOW-003：保留业务可观测性
+
+内部复用不能把界面退化为只有“执行中/等待中”。状态、日志、卡片和 API 必须同时呈现 task type 与具体业务阶段；Tester/Reviewer 提问后必须恢复到原 Agent 阶段，不能因为共享输入态而错误回到 Coder 或 Planner。
+
+### AC-FLOW
+
+- **AC-FLOW-001**：代码库只有一份生命周期模板；三类现有任务均由该模板与各自 Profile 成功生成。
+- **AC-FLOW-002**：修改质量失败或人工确认的通用语义时，只需修改一处，三类任务测试同时生效。
+- **AC-FLOW-003**：新增仅由现有阶段类型组成的任务类型时，只新增 Profile 和对应 Agent 配置，不修改 Orchestrator 的 task-type 分支。
+- **AC-FLOW-004**：Feature/Bug Fix/Documentation 的正常、reject、REWORK、ask_user 和验收路径均保持可执行。
 
 ### 提问优先级与打断策略
 
@@ -90,11 +113,24 @@ Agent 不应为低价值信息重复打断用户。能够由已确认产物、�
 - **AC-CONV-004**：未授权群成员不能确认、取消或回答项目问题；只读可见性按项目策略控制。
 - **AC-CONV-005**：Agent 运行中收到文本时，系统先完成 project/interaction 路由再持久化；无法唯一路由的文本停留在待选择区，不进入任何 Agent 上下文。
 
+### REQ-CONV-005：聊天可绑定已有代码目录
+
+一个聊天可绑定一个本地 Git 仓库；后续新项目自动继承该目录。同一仓库允许存在多个 MAC 项目，但状态、需求、方案和实现计划必须按 `project_id` 隔离。解绑或切换目录只影响后续项目。
+
+### AC-DIRECTORY
+
+- **AC-DIR-001**：`/bind-dir`、`/current-dir`、`/unbind-dir` 可完成绑定、查询和解绑。
+- **AC-DIR-002**：同一聊天创建的两个项目继承同一代码仓库，但使用不同的 `.mac/projects/{project_id}`。
+- **AC-DIR-003**：不同聊天的目录绑定和 active project 独立。
+- **AC-DIR-004**：回复 Agent 问题卡片按 `parent_id → approval → interaction → project` 路由，不受 `/use` 切换影响。
+
 ## 专项规范
 
 - 状态循环：`state_machine_semantics.md`
 - 调度恢复：`orchestrator_spec.md`
 - 飞书交互：`feishu_bridge_spec.md`
+- 会话目录绑定：`session_binding_spec.md`
+- 多问题与回复卡片：`multi_question_ask_user_spec.md`
 - 多聊天路由：`conversation_routing_spec.md`
 - 输入持久化：`project_service_spec.md`
 - 追踪关系：`artifact_traceability_spec.md`

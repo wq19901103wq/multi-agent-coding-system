@@ -121,3 +121,46 @@ def test_remove_all_worktrees(manager, tmp_project):
     assert not wt1.exists()
     assert not wt2.exists()
     assert manager.list_worktrees("proj_test") == []
+
+
+def test_bound_repository_uses_namespaced_metadata_and_worktrees(tmp_path):
+    import subprocess
+
+    repo = tmp_path / "existing"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    (repo / "README.md").write_text("# Existing\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    project_id = "proj_bound"
+    mac_dir = repo / ".mac" / "projects" / project_id
+    mac_dir.mkdir(parents=True)
+    (repo / ".mac" / "worktrees" / project_id).mkdir(parents=True)
+    (repo / ".git" / "info" / "exclude").write_text(".mac/worktrees/\n")
+    (mac_dir / "STATE.json").write_text(json.dumps({"current_state": "CODING"}))
+
+    manager = WorktreeManager(tmp_path / "system-projects")
+    worktree = manager.create_worktree(
+        project_id, "task_bound", "coder", workspace_path=repo
+    )
+    assert worktree.parent == repo / ".mac" / "worktrees" / project_id
+    manager.sync_mac_files(
+        project_id,
+        worktree,
+        {"current_state": "CODING"},
+        {"task_id": "task_bound", "agent_type": "coder", "state": "CODING"},
+        workspace_path=repo,
+    )
+    assert json.loads((worktree / ".mac" / "STATE.json").read_text())["current_state"] == "CODING"
+
+    (worktree / "feature.txt").write_text("implemented\n")
+    manager.merge_worktree(
+        project_id, "task_bound", "coder", worktree, workspace_path=repo
+    )
+    assert (repo / "feature.txt").read_text() == "implemented\n"
+    manager.remove_worktree(
+        project_id, "task_bound", "coder", worktree, workspace_path=repo
+    )

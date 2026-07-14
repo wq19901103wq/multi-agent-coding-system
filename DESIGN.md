@@ -316,16 +316,29 @@ workspace/
 
 ## 4. 状态机
 
+系统采用“一个通用状态机 + 多个 Workflow Profile”。`state_machines/delivery.json` 是唯一生命周期真相源，定义各类阶段共享的执行、澄清、确认、失败、REWORK、验收和终态语义；`workflow_profiles/*.json` 只声明不同 task type 的阶段组成和允许回退目标。运行时将两者编译成具体、可读的业务状态名，现有 API 和飞书卡片无需迁移为抽象状态名。
+
+```text
+delivery.json                       workflow_profiles/feature.json
+  stage policies        +             specify(requirements + behavior)
+  REWORK / acceptance                 → architecture → specs
+  merge / terminal                    → coding → testing → review
+                       ↓ compile
+  PLANNING_REQUIREMENTS → ... → REVIEW_CONFIRM_PENDING
+```
+
+禁止在 Profile 中复制完整 `states`，也禁止在 Orchestrator 中按 task type 重新硬编码 REWORK/验收路由。新增任务类型优先新增 Profile；只有所有任务的生命周期都要改变时才修改 `delivery.json`。
+
 ### 4.1 状态定义
 
 ```
 INIT                           # 任务创建
-PLANNING_REQUIREMENTS          # 需求分析中（planner stage=requirements）
-REQUIREMENT_CONFIRM_PENDING    # 等待用户确认需求
+PLANNING_REQUIREMENTS          # Specify：需求、产品行为和验收标准
+REQUIREMENT_CONFIRM_PENDING    # 等待用户确认统一需求规格
 PLANNING_ARCHITECTURE          # 技术方案设计中（planner stage=architecture）
 ARCHITECTURE_CONFIRM_PENDING   # 等待用户确认方案
-PLANNING_SPECS                 # Spec 拆分中（planner stage=specs）
-SPEC_CONFIRM_PENDING           # 等待用户确认 Spec
+PLANNING_IMPLEMENTATION_SPECS                 # Spec 拆分中（planner stage=specs）
+IMPLEMENTATION_SPEC_CONFIRM_PENDING           # 等待用户确认 Spec
 CLARIFICATION_PENDING          # Agent 请求澄清，等待用户
 CONFLICT_PENDING               # 设计冲突，等待用户裁决
 CODING                         # 编码中
@@ -347,25 +360,25 @@ PLANNING_REQUIREMENTS → REQUIREMENT_CONFIRM_PENDING
 REQUIREMENT_CONFIRM_PENDING → PLANNING_ARCHITECTURE (用户确认)
 REQUIREMENT_CONFIRM_PENDING → PLANNING_REQUIREMENTS (用户驳回)
 PLANNING_ARCHITECTURE → ARCHITECTURE_CONFIRM_PENDING
-ARCHITECTURE_CONFIRM_PENDING → PLANNING_SPECS (用户确认)
+ARCHITECTURE_CONFIRM_PENDING → PLANNING_IMPLEMENTATION_SPECS (用户确认)
 ARCHITECTURE_CONFIRM_PENDING → PLANNING_ARCHITECTURE (用户驳回)
-PLANNING_SPECS → SPEC_CONFIRM_PENDING
-SPEC_CONFIRM_PENDING → CODING (用户确认)
-SPEC_CONFIRM_PENDING → PLANNING_SPECS (用户驳回)
+PLANNING_IMPLEMENTATION_SPECS → IMPLEMENTATION_SPEC_CONFIRM_PENDING
+IMPLEMENTATION_SPEC_CONFIRM_PENDING → CODING (用户确认)
+IMPLEMENTATION_SPEC_CONFIRM_PENDING → PLANNING_IMPLEMENTATION_SPECS (用户驳回)
 CODING → CLARIFICATION_PENDING (Agent 请求澄清)
 CLARIFICATION_PENDING → CODING (用户回答后继续)
-CLARIFICATION_PENDING → PLANNING_SPECS (需要改 Spec)
+CLARIFICATION_PENDING → PLANNING_IMPLEMENTATION_SPECS (需要改 Spec)
 CLARIFICATION_PENDING → PLANNING_ARCHITECTURE (需要改方案)
 CODING → CONFLICT_PENDING (设计冲突)
 CONFLICT_PENDING → CODING (用户裁决后继续)
 CONFLICT_PENDING → PLANNING_ARCHITECTURE (回退到方案层)
-CODING → TESTING
-TESTING → CODING (测试失败，修复)
-TESTING → REVIEW
-REVIEW → CODING (Review 不通过)
-REVIEW → ACCEPTANCE_PENDING
+CODING → CODING_CONFIRM_PENDING → TESTING
+TESTING → TESTING_CONFIRM_PENDING → REVIEW
+TESTING → REWORK (测试失败)
+REVIEW → REVIEW_CONFIRM_PENDING → ACCEPTANCE_PENDING
+REVIEW → REWORK (blocking issue)
 ACCEPTANCE_PENDING → MERGING (用户验收通过)
-ACCEPTANCE_PENDING → PLANNING_REQUIREMENTS / PLANNING_ARCHITECTURE / PLANNING_SPECS / CODING (用户驳回，根据根因选择回退阶段)
+ACCEPTANCE_PENDING → PLANNING_REQUIREMENTS / PLANNING_ARCHITECTURE / PLANNING_IMPLEMENTATION_SPECS / CODING (用户驳回，根据根因选择回退阶段)
 MERGING → COMPLETED
 MERGING → FAILED
 ```
@@ -394,7 +407,7 @@ MERGING → FAILED
 
 | 方法 | 路径 | 用途 | 关键字段 |
 |------|------|------|---------|
-| `POST` | `/projects` | 创建新项目 | `name?`, `task_type`, `description`, `approval_mode?` |
+| `POST` | `/projects` | 创建新项目 | `name?`, `task_type`, `description`, `approval_mode?`, `bound_directory?` |
 | `GET` | `/projects/{project_id}` | 查询项目状态和产物 | - |
 | `GET` | `/projects/{project_id}/status` | 查询当前状态 | - |
 | `POST` | `/projects/{project_id}/decisions` | 提交人工决策 | `state`, `decision`, `comment?`, `selected_option?` |
@@ -413,7 +426,8 @@ POST /projects
   "name": "config-validator-cli",
   "task_type": "feature",
   "description": "实现一个 config-validator CLI 工具，读取 config.json 和 schema.json，校验必填字段、类型、数值范围，输出 text 或 json 格式。",
-  "approval_mode": "normal"
+  "approval_mode": "normal",
+  "bound_directory": "/absolute/path/to/existing-repository"
 }
 ```
 
@@ -422,7 +436,8 @@ POST /projects
 {
   "project_id": "proj_20260707_001",
   "status": "INIT",
-  "workspace_path": "/Users/yihanwang/multi-agent-coding-system/projects/proj_20260707_001",
+  "workspace_path": "/absolute/path/to/existing-repository",
+  "bound_directory": "/absolute/path/to/existing-repository",
   "created_at": "2026-07-07T12:00:00Z"
 }
 ```
@@ -498,6 +513,7 @@ CREATE TABLE projects (
     current_state TEXT NOT NULL,
     previous_state TEXT,
     workspace_path TEXT NOT NULL,
+    bound_directory TEXT,       -- 创建时继承的已有仓库快照
     context TEXT,              -- JSON：需求、方案、Spec 等产物
     approval_config TEXT,      -- JSON：审批模式配置
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -553,6 +569,29 @@ CREATE TABLE project_users (
     open_id TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (project_id, open_id)
+);
+
+-- 聊天默认代码仓库；与每个用户的 active project 分离
+CREATE TABLE chat_directory_bindings (
+    chat_id TEXT PRIMARY KEY,
+    directory TEXT NOT NULL,
+    bound_by TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 一轮 Agent 主动提问；具体 Question/QuestionAnswer 另表持久化
+CREATE TABLE question_interactions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT REFERENCES projects(id),
+    origin_task_id TEXT REFERENCES tasks(id),
+    origin_round INTEGER NOT NULL,
+    resume_state TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    batch_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    approval_id TEXT REFERENCES approvals(id)
 );
 ```
 
@@ -711,7 +750,7 @@ CREATE TABLE project_users (
 系统：Project Manager 收到追问，重新分析后回复...
 系统：回复消息（解释原因）
 用户：同意
-系统：状态推进到 PLANNING_SPECS
+系统：状态推进到 PLANNING_IMPLEMENTATION_SPECS
 ```
 
 ### 7.3 卡片更新策略
@@ -913,7 +952,7 @@ CREATE TABLE project_users (
 - 直接原因：测试用例 test_range_validation 未通过
 - 深层原因：Spec 中「范围校验」定义模糊，只写了支持 int，未说明是否支持 float
 - 决策链：需求确认时用户未明确说明 float 场景（decision_id: xxx）
-- 建议：回到 PLANNING_SPECS 阶段，补充 float 范围校验规则
+- 建议：回到 PLANNING_IMPLEMENTATION_SPECS 阶段，补充 float 范围校验规则
 ```
 
 ---
@@ -1027,10 +1066,10 @@ config-validator/
 
 ### Phase 3：补全任务类型与端到端验证（2-3 天）
 
-目标：补 `bug_fix`、`documentation` 状态机，跑通 3 个 MVP 任务。
+目标：补 `bug_fix`、`documentation` Workflow Profile，跑通 3 个 MVP 任务。
 
 任务：
-1. 编写 `bug_fix.json` 和 `documentation.json` 状态机。
+1. 编写 `workflow_profiles/bug_fix.json` 和 `workflow_profiles/documentation.json`，复用 `delivery.json`。
 2. 为 `bug_fix` 准备 planner stage=bug_analysis 的 prompt/schema。
 3. 为 `documentation` 准备 planner stage=doc_outline 的 prompt/schema。
 4. 跑通 Task 2（port 范围 0-65535）和 Task 3（`AGENTS.md`）。
@@ -1155,7 +1194,7 @@ config-validator/
 *创建时间：2026-07-07*  
 *修订说明：
 - 统一 Agent 角色为 planner / coder / tester / reviewer / acceptance_evaluator / project_manager
-- 统一状态机状态名为 PLANNING_REQUIREMENTS / PLANNING_ARCHITECTURE / PLANNING_SPECS / CODING / TESTING / REVIEW 等
+- 统一状态机状态名为 PLANNING_REQUIREMENTS / PLANNING_ARCHITECTURE / PLANNING_IMPLEMENTATION_SPECS / CODING / TESTING / REVIEW 等
 - 删除所有 MockRuntime / mock-claude 内容，MVP 全程使用真实 Claude Code
 - API/DB schema 与代码实现对齐
 - 增加 `--add-dir` / `readonly_dirs` 沙箱外只读机制

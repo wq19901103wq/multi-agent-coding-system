@@ -188,4 +188,10 @@ pending approval=none
 - `specs/orchestrator_spec.md`
 - `specs/feishu_bridge_spec.md`
 
-当前缺口不是“没有设计”，而是产品需求层还缺少统一的稳定 REQ/AC 编号和完整验收矩阵。现有内容分散在 README、DESIGN 和多个 spec 中；后续应建立系统级 product requirements，将多聊天、多项目、中途命令/文本分别定义为可追踪需求，并让 E2E scenario 关联对应 AC。
+系统级需求现已集中到 `specs/product_requirements.md`，多聊天、多项目、中途命令/文本和目录绑定都有稳定 REQ/AC。后续 E2E 仍需把每个 scenario 与对应 AC 显式关联，避免只验证状态名而漏掉路由和权限语义。
+
+## 10. 状态机 E2E 的示例需求必须保持最小
+
+`full_feature_flow` 的目标是验证确认、reject、select_option、REWORK 和完整重放，不是评估 Agent 能否一次实现大型应用。使用含糊的“实现 Todo List CLI”会被 Requirements/Architecture 扩展为编辑、删除、搜索、统计、持久化、颜色、并发写等完整产品，导致单轮 Coder 接近场景超时，后续每次回退都重复承担无关成本。
+
+状态机 E2E 应明确最小范围和排除项，例如只保留 `add/list`、进程内存储，并禁止编辑、删除、权限、持久化和网络功能。各轮 reject 反馈也只修正同一范围内的边界行为，不能在 Acceptance 阶段突然加入权限或数据持久化。复杂应用能力应放在独立的质量/负载 scenario 中。

@@ -47,6 +47,7 @@
         "fail": "FAILED",
         "clarify": "CLARIFICATION_PENDING",
         "conflict": "CONFLICT_PENDING",
+        "ask_user": "CLARIFICATION_PENDING",
         "bug_analysis_question": "BUG_ANALYSIS"
       }
     },
@@ -83,7 +84,8 @@
       "next_states": {
         "complete": "TESTING_CONFIRM_PENDING",
         "fail": "REWORK",
-        "fail_max_retries": "FAILED"
+        "fail_max_retries": "FAILED",
+        "ask_user": "CLARIFICATION_PENDING"
       }
     },
     "TESTING_CONFIRM_PENDING": {
@@ -101,7 +103,8 @@
       "next_states": {
         "complete": "REVIEW_CONFIRM_PENDING",
         "fail": "REWORK",
-        "fail_max_retries": "FAILED"
+        "fail_max_retries": "FAILED",
+        "ask_user": "CLARIFICATION_PENDING"
       }
     },
     "REVIEW_CONFIRM_PENDING": {

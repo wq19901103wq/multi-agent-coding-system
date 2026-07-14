@@ -53,6 +53,39 @@ async def test_create_project_with_creator(service):
     assert users[0].open_id == "ou_123"
 
 
+async def test_chat_directory_binding_is_inherited_and_project_metadata_is_isolated(
+    service, tmp_path
+):
+    repo = tmp_path / "existing-repo"
+    binding = service.bind_directory_to_chat("oc_bound", str(repo), "ou_owner")
+    assert binding.directory == str(repo.resolve())
+
+    first = await service.create_project(
+        name="first",
+        task_type="feature",
+        description="one",
+        creator_open_id="ou_owner",
+        feishu_chat_id="oc_bound",
+        feishu_chat_type="group",
+    )
+    second = await service.create_project(
+        name="second",
+        task_type="feature",
+        description="two",
+        creator_open_id="ou_owner",
+        feishu_chat_id="oc_bound",
+        feishu_chat_type="group",
+    )
+    assert first.workspace_path == second.workspace_path == str(repo.resolve())
+    assert first.bound_directory == str(repo.resolve())
+    assert (repo / ".mac" / "projects" / first.id / "STATE.json").exists()
+    assert (repo / ".mac" / "projects" / second.id / "STATE.json").exists()
+
+    service.unbind_directory_from_chat("oc_bound")
+    assert service.get_chat_directory_binding("oc_bound") is None
+    assert first.bound_directory == str(repo.resolve())
+
+
 async def test_get_project(service):
     project = await service.create_project(
         name="test",
@@ -89,6 +122,29 @@ async def test_invalid_transition(service):
     )
     with pytest.raises(InvalidStateTransitionError):
         await service.transition_state(project.id, "confirm")
+
+
+async def test_artifact_versions_propagate_staleness_and_confirm(service):
+    project = await service.create_project(
+        name="versions", task_type="feature", description="Test"
+    )
+    service.update_artifact_version(project.id, "requirements", 1, 1, "confirmed")
+    service.update_artifact_version(project.id, "architecture", 1, 1, "confirmed")
+    service.update_artifact_version(project.id, "specs", 1, 1, "confirmed")
+
+    service.mark_downstream_artifacts_stale(project.id, "requirements")
+    assert service.get_artifact_version(project.id, "architecture")["status"] == "stale"
+    assert service.get_artifact_version(project.id, "specs")["status"] == "stale"
+    assert {item["artifact_id"] for item in service.get_stale_artifacts(project.id)} == {
+        "architecture", "specs"
+    }
+
+    project.current_state = "REQUIREMENT_CONFIRM_PENDING"
+    service.update_artifact_version(
+        project.id, "requirements", 2, 2, "pending_confirmation"
+    )
+    await service.transition_state(project.id, "confirm")
+    assert service.get_artifact_version(project.id, "requirements")["status"] == "confirmed"
 
 
 async def test_create_and_complete_task(service):
@@ -491,3 +547,171 @@ async def test_feedback_packet_commit_param(service):
     assert service.session.get(FeedbackPacket, packet.id) is packet
     service.session.commit()
     assert service.session.get(FeedbackPacket, packet.id) is not None
+
+
+# ---------------------------------------------------------------------------
+# QuestionInteraction / Question / QuestionAnswer
+# ---------------------------------------------------------------------------
+
+
+async def test_create_question_interaction_with_questions(service):
+    project = await service.create_project(name="qi-test", task_type="feature", description="Test")
+    interaction = await service.create_question_interaction(
+        project_id=project.id, origin_task_id=None, origin_round=1,
+        resume_state="PLANNING_REQUIREMENTS", agent="planner", stage="requirements",
+        batch_key="req_batch_1",
+        questions=[
+            {"question_id": "q_scope", "kind": "blocking", "question": "范围？",
+             "reason": "不明确", "allow_free_text": False,
+             "options": [{"key": "a", "label": "A", "impact": "", "recommended": True},
+                         {"key": "b", "label": "B", "impact": "", "recommended": False}],
+             "affected_trace_ids": ["REQ-001"]},
+            {"question_id": "q_extra", "kind": "non_blocking", "question": "补充？",
+             "reason": "", "allow_free_text": True, "options": [], "affected_trace_ids": []},
+        ],
+    )
+    assert interaction.id.startswith("qi_")
+    assert interaction.status == "pending"
+    questions = service.get_questions_for_interaction(interaction.id)
+    assert len(questions) == 2
+    assert questions[0].question_id == "q_scope"
+    assert questions[0].recommended_option == "a"
+    assert questions[1].allow_free_text is True
+
+
+async def test_submit_answer_and_resolvable(service):
+    project = await service.create_project(name="qi-r", task_type="feature", description="Test")
+    interaction = await service.create_question_interaction(
+        project_id=project.id, origin_task_id=None, origin_round=1,
+        resume_state="PLANNING_REQUIREMENTS", agent="planner", stage="requirements",
+        batch_key="b1",
+        questions=[
+            {"question_id": "q1", "kind": "blocking", "question": "Q1",
+             "options": [{"key": "a", "label": "A", "impact": "", "recommended": True}],
+             "allow_free_text": False, "affected_trace_ids": []},
+            {"question_id": "q2", "kind": "non_blocking", "question": "Q2",
+             "options": [], "allow_free_text": True, "affected_trace_ids": []},
+        ],
+    )
+    assert service.interaction_is_resolvable(interaction.id) is False
+    questions = service.get_questions_for_interaction(interaction.id)
+    await service.submit_question_answer(questions[0].id, "a", "A", False, "ou_user")
+    assert service.interaction_is_resolvable(interaction.id) is True
+    resolved = await service.resolve_question_interaction(interaction.id)
+    assert resolved.status == "answered"
+
+
+async def test_skip_blocking_is_resolvable(service):
+    project = await service.create_project(name="qi-s", task_type="feature", description="Test")
+    interaction = await service.create_question_interaction(
+        project_id=project.id, origin_task_id=None, origin_round=1,
+        resume_state="CODING", agent="coder", stage=None, batch_key="b1",
+        questions=[{"question_id": "q1", "kind": "blocking", "question": "Q1",
+                    "options": [{"key": "a", "label": "A", "impact": "", "recommended": True}],
+                    "allow_free_text": False, "affected_trace_ids": []}],
+    )
+    questions = service.get_questions_for_interaction(interaction.id)
+    await service.submit_question_answer(questions[0].id, None, None, True, "ou_user")
+    assert service.interaction_is_resolvable(interaction.id) is True
+
+
+async def test_get_open_question_interaction(service):
+    project = await service.create_project(name="qi-o", task_type="feature", description="Test")
+    assert service.get_open_question_interaction(project.id) is None
+    await service.create_question_interaction(
+        project_id=project.id, origin_task_id=None, origin_round=1,
+        resume_state="PLANNING_REQUIREMENTS", agent="planner", stage="requirements",
+        batch_key="b1",
+        questions=[{"question_id": "q1", "kind": "blocking", "question": "Q1",
+                    "options": [{"key": "a", "label": "A", "impact": "", "recommended": True}],
+                    "allow_free_text": False, "affected_trace_ids": []}],
+    )
+    open_it = service.get_open_question_interaction(project.id)
+    assert open_it is not None
+
+
+async def test_expire_open_question_interactions(service):
+    project = await service.create_project(name="qi-e", task_type="feature", description="Test")
+    await service.create_question_interaction(
+        project_id=project.id, origin_task_id=None, origin_round=1,
+        resume_state="PLANNING_REQUIREMENTS", agent="planner", stage="requirements",
+        batch_key="b1",
+        questions=[{"question_id": "q1", "kind": "blocking", "question": "Q1",
+                    "options": [{"key": "a", "label": "A", "impact": "", "recommended": True}],
+                    "allow_free_text": False, "affected_trace_ids": []}],
+    )
+    assert service.expire_open_question_interactions(project.id) == 1
+    assert service.get_open_question_interaction(project.id) is None
+
+
+async def test_serialize_question_interaction(service):
+    project = await service.create_project(name="qi-ser", task_type="feature", description="Test")
+    interaction = await service.create_question_interaction(
+        project_id=project.id, origin_task_id=None, origin_round=1,
+        resume_state="PLANNING_REQUIREMENTS", agent="planner", stage="requirements",
+        batch_key="b1",
+        questions=[
+            {"question_id": "q1", "kind": "blocking", "question": "Q1",
+             "options": [{"key": "a", "label": "A", "impact": "", "recommended": True}],
+             "allow_free_text": False, "affected_trace_ids": ["REQ-001"]},
+            {"question_id": "q2", "kind": "decision", "question": "Q2",
+             "options": [{"key": "x", "label": "X", "impact": "", "recommended": False},
+                         {"key": "y", "label": "Y", "impact": "", "recommended": True}],
+             "allow_free_text": False, "affected_trace_ids": []},
+        ],
+    )
+    data = service.serialize_question_interaction(interaction.id)
+    assert data is not None
+    assert len(data["questions"]) == 2
+    assert data["questions"][0]["recommended_option"] == "a"
+    assert data["questions"][1]["recommended_option"] == "y"
+    assert data["is_resolvable"] is False
+
+
+async def test_default_authorization_prefix_match(service):
+    project = await service.create_project(name="dauth", task_type="feature", description="Test")
+    assert service.get_default_authorization(project.id, "q_agent_scope") is None
+    await service.create_default_authorization(project.id, "q_agent", "chat_kb")
+    auth = service.get_default_authorization(project.id, "q_agent_scope")
+    assert auth is not None
+    assert auth.authorized_option == "chat_kb"
+    assert service.get_default_authorization(project.id, "q_blog") is None
+
+
+# ---------------------------------------------------------------------------
+# ConversationInteraction
+# ---------------------------------------------------------------------------
+
+
+async def test_conversation_interaction_create_and_resolve(service):
+    ci = await service.create_conversation_interaction(
+        chat_id="oc_c", open_id="ou_u", source_message_id="om_1",
+        source_text="帮我加博客",
+        candidates=[{"id": "proj_a", "name": "A"}, {"id": "proj_b", "name": "B"}],
+    )
+    assert ci.id.startswith("ci_")
+    assert ci.status == "pending"
+    assert len(ci.candidates) == 2
+    pending = service.get_pending_conversation_interaction("oc_c", "ou_u")
+    assert pending is not None
+    resolved = await service.resolve_conversation_interaction(ci.id, "proj_a")
+    assert resolved.status == "resolved"
+    assert resolved.selected_project_id == "proj_a"
+    assert service.get_pending_conversation_interaction("oc_c", "ou_u") is None
+
+
+async def test_conversation_interaction_expires_previous(service):
+    await service.create_conversation_interaction(
+        chat_id="oc_c2", open_id="ou_u2", source_message_id="om_1",
+        source_text="x", candidates=[],
+    )
+    await service.create_conversation_interaction(
+        chat_id="oc_c2", open_id="ou_u2", source_message_id="om_2",
+        source_text="y", candidates=[],
+    )
+    from mac_system.models import ConversationInteraction
+    pending = service.session.exec(
+        select(ConversationInteraction).where(ConversationInteraction.chat_id == "oc_c2")
+        .where(ConversationInteraction.status == "pending")
+    ).all()
+    assert len(pending) == 1

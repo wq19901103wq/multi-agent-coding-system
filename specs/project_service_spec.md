@@ -1,6 +1,6 @@
 # ProjectService 接口规范
 
-> 版本：v1.0  
+> 版本：v1.1
 > 用途：定义项目生命周期管理的服务层接口，供 Control API 和 Orchestrator 调用。
 
 ## 职责
@@ -11,7 +11,8 @@
 2. 查询项目状态和产物
 3. 记录人工决策
 4. 更新状态机状态
-5. 管理 `Task` 和 `Approval` 记录
+5. 管理 `Task`、`Approval` 和 `QuestionInteraction` 记录
+6. 管理聊天默认目录，并为绑定到已有仓库的多个项目隔离元数据
 
 ## 接口
 
@@ -24,6 +25,9 @@ class ProjectService:
         description: str,
         approval_mode: str = "normal",
         creator_open_id: str | None = None,
+        feishu_chat_id: str | None = None,
+        feishu_chat_type: str = "p2p",
+        bound_directory: str | None = None,
     ) -> Project:
         """创建项目，初始化目录、git、STATE.json。"""
 
@@ -104,14 +108,26 @@ class ProjectService:
         meta: dict | None = None,
     ) -> None:
         """写入审计日志。"""
+
+    def bind_directory_to_chat(
+        self, chat_id: str, directory: str, bound_by: str | None = None,
+    ) -> ChatDirectoryBinding:
+        """校验/初始化仓库，并设置聊天级默认目录。"""
+
+    def get_chat_directory_binding(self, chat_id: str) -> ChatDirectoryBinding | None: ...
+    def unbind_directory_from_chat(self, chat_id: str) -> bool: ...
+
+    async def create_question_interaction(...) -> QuestionInteraction: ...
+    async def submit_question_answer(...) -> QuestionAnswer: ...
+    async def resolve_question_interaction(...) -> QuestionInteraction: ...
 ```
 
 ## 项目创建流程
 
 1. 生成 `project_id`：`proj_{timestamp}_{random_suffix}`
-2. 创建目录：`projects/{project_id}/`
-3. 创建子目录：`.mac/`、`src/`、`tests/`、`worktrees/`
-4. 执行 `git init`
+2. 若有 `bound_directory`（显式传入或继承聊天绑定），使用现有仓库根目录，并创建 `.mac/projects/{project_id}/` 与 `.mac/worktrees/{project_id}/`。
+3. 否则创建系统目录 `projects/{project_id}/` 及 `.mac/`、`src/`、`tests/`、`worktrees/`。
+4. 非 Git 目录执行 `git init` 并创建基线提交；已在其他仓库内部但不是仓库根目录时拒绝绑定。
 5. 配置 git user：`git config user.name`、`git config user.email`
 6. 写入初始 `STATE.json`：
    - `current_state = "INIT"`
@@ -159,9 +175,18 @@ bind_project_chat(project_id, chat_id, chat_type, relation, notification_level)
 set_active_project(chat_id, open_id, project_id | None)
 resolve_message_project(chat_id, open_id, explicit_project_id=None) -> Project | Ambiguous
 list_projects_for_context(chat_id, open_id) -> list[Project]
+bind_directory_to_chat(chat_id, absolute_directory, bound_by=None)
+get_chat_directory_binding(chat_id)
+unbind_directory_from_chat(chat_id)
 ```
 
 权限关系、聊天订阅和 active context 分开持久化。`resolve_message_project` 不得回退到“用户最近更新项目”；无唯一上下文时返回 Ambiguous，由交互层展示选择卡片。
+
+目录绑定是 `chat_id` 级默认值，不能写进按 `(chat_id, open_id)` 隔离的 active context。`Project.bound_directory` 是创建时快照；之后切换或解绑聊天目录不得迁移已有项目。
+
+## QuestionInteraction
+
+Agent 的 `ask_user` 统一持久化为 `QuestionInteraction → Question → QuestionAnswer`，并由一条 input Approval 提供等待边界。Interaction 保存 `origin_task_id`、`origin_round`、`agent`、`stage` 和 `resume_state`；问题全部满足后恢复原 Agent 的新轮次。飞书问题卡发送成功后，返回的消息 ID 记录在 `Approval.payload.reply_message_ids`，供回复消息按 `parent_id` 精确反查项目。
 
 ## ID 生成规则
 

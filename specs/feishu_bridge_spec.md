@@ -481,6 +481,9 @@ ButtonAction(
 | `/status <project_id>` | 查询项目状态 |
 | `/create [--type=<task_type>] <描述>` | 创建项目；省略 `--type` 时由 IntentRouter 自动分类 |
 | `/input <approval_id> <回答>` | 提交人工输入 |
+| `/bind-dir <绝对路径>` | 将当前聊天绑定到已有代码仓库 |
+| `/current-dir` | 查看当前聊天绑定目录 |
+| `/unbind-dir` | 解绑目录；不影响已有项目 |
 
 ---
 
@@ -497,6 +500,7 @@ ButtonAction(
 payload 必须携带 `question_id`、`approval_id`、`project_id`、`resume_state`、task_id 和 round。用户回答后若 Agent 仍不理解，可以生成下一张卡继续 grill-me；旧卡更新为已回答，新卡使用新 question_id，数据库中仍只有一个当前 pending approval。
 
 同一问题投递到多个聊天时，任一合法回答成功后其他卡片更新为已处理；回答必须按 question/approval 显式路由，不受后来 `/use` 切换影响。
+- 用户回复问题卡片时，文本事件的 `parent_id` 必须映射到发送卡片时记录的 `Approval.payload.reply_message_ids`；该路径优先于 active project。
 - 卡片按钮、slash command 和自动确认使用同一个原子 resolve approval 服务，保证权限、幂等和状态一致性。
 
 ## 11. 调试

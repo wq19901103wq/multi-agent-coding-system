@@ -279,8 +279,15 @@ class FeishuBridge:
         event = self._extract_event(payload)
         action = event.get("action", {})
         value = action.get("value", {})
+        form_value = action.get("form_value") or {}
         operator = event.get("operator", {})
         open_id = operator.get("operator_id", {}).get("open_id", "")
+        reserved = {
+            "approval_id", "action", "state", "decision_id", "option_key",
+            "chat_id", "chat_type",
+        }
+        extras = {k: v for k, v in value.items() if k not in reserved}
+        extras.update({k: v for k, v in form_value.items() if k not in extras})
         return ButtonAction(
             open_id=open_id,
             approval_id=value.get("approval_id", ""),
@@ -288,12 +295,10 @@ class FeishuBridge:
             state=value.get("state", ""),
             decision_id=value.get("decision_id"),
             option_key=value.get("option_key"),
-            extras={k: v for k, v in value.items() if k not in {
-                "approval_id", "action", "state", "decision_id", "option_key",
-                "chat_id", "chat_type",
-            }},
+            extras=extras,
             chat_id=value.get("chat_id"),
             chat_type=value.get("chat_type", "p2p") or "p2p",
+            message_id=event.get("context", {}).get("open_message_id"),
         )
 
     def parse_text_message(self, payload: dict[str, Any]) -> TextMessage:
@@ -314,6 +319,7 @@ class FeishuBridge:
             message_id=message_id,
             text=text,
             is_command=text.startswith("/"),
+            parent_id=message.get("parent_id") or message.get("root_id"),
             chat_id=chat_id,
             chat_type=chat_type,
             sender_type=sender.get("sender_type", "user") or "user",

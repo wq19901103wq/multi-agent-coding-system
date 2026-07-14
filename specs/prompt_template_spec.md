@@ -223,7 +223,7 @@ Agent 专属触发条件以 `product_requirements.md` 的矩阵为准。Coder/Te
 
 所有 Agent 输出 schema 必须复用同一 `question` 定义，而不是仅在 prompt 文本中约定。约束如下：
 
-- 当 `next_state_event=ask_user` 时，`questions` 必填且至少一项；当事件不是 `ask_user` 时不得携带 blocking question。
+- 当 `next_state_event=ask_user` 时，`question_batch.questions` 必填且至少一项；当事件不是 `ask_user` 时不得携带 `question_batch`。
 - `question_id` 在同一 task/round 内唯一；重试同一语义问题时沿用幂等键，真正的追问使用新 ID 并通过 `parent_question_id` 关联。
 - `blocking`、`reason`、`allow_free_text`、`options`、`default_assumption` 和 `affected_trace_ids` 由 schema 校验。
 - `success` 表示本轮 Agent 正常形成了“需要提问”的结论，不等同于阶段已完成；Orchestrator 不得因为 `success=true` 跳过 input pending。

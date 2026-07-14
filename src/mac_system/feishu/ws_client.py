@@ -8,6 +8,7 @@ card.action.trigger events without exposing a public HTTP endpoint.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -157,6 +158,19 @@ class FeishuWebSocketClient:
                 action.approval_id,
                 action.action,
             )
+            # Option selection should update the card in-place and not show a toast.
+            # Run synchronously so we can return the updated card in the response.
+            if action.action == "select_question_option":
+                coro = self._handle_card_action(action, event_id)
+                try:
+                    card = self._run_sync(coro)
+                except Exception:
+                    logger.exception("Failed to handle select_question_option")
+                    return P2CardActionTriggerResponse()
+                if card:
+                    return P2CardActionTriggerResponse({"card": {"type": "raw", "data": card}})
+                return P2CardActionTriggerResponse()
+
             _run_handler_in_thread(self._handle_card_action(action, event_id))
             return P2CardActionTriggerResponse(
                 {"toast": {"type": "success", "content": "已收到"}}
@@ -236,17 +250,38 @@ class FeishuWebSocketClient:
         except Exception:
             logger.exception("Failed to handle Feishu text message")
 
-    async def _handle_card_action(self, action: ButtonAction, event_id: str | None = None) -> None:
+    async def _handle_card_action(self, action: ButtonAction, event_id: str | None = None) -> dict[str, Any] | None:
         try:
             async with self._handler_context() as ctx:
                 if event_id and ctx.service.is_event_processed(event_id):
                     logger.info("[Feishu WS] skipping duplicate card event_id=%s", event_id)
-                    return
+                    return None
                 if event_id:
                     ctx.service.mark_event_processed(event_id, "card")
-                await handle_card_action(ctx, action)
+                return await handle_card_action(ctx, action)
         except Exception:
             logger.exception("Failed to handle Feishu card action")
+            return None
+
+    def _run_sync(self, coro: Any) -> Any:
+        """Run an async coroutine synchronously in a fresh event loop/thread.
+
+        Used for card actions that must return a response (e.g. card update).
+        """
+
+        def runner() -> Any:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(runner)
+            return future.result(timeout=10.0)
 
     def _handler_context(self, msg: TextMessage | None = None) -> Any:
         """Return an async context manager that builds handler dependencies."""
@@ -347,6 +382,7 @@ def _parse_text_message(event: Any) -> TextMessage:
         message_id=msg.message_id or "",
         text=text,
         is_command=text.startswith("/"),
+        parent_id=getattr(msg, "parent_id", None) or getattr(msg, "root_id", None),
         chat_id=chat_id,
         chat_type=chat_type,
         sender_type=sender_type,
@@ -360,6 +396,25 @@ def _parse_button_action(event: Any) -> ButtonAction:
     value = action.value or {}
     operator = event.event.operator
     open_id = operator.open_id if operator else ""
+    reserved = {
+        "approval_id",
+        "action",
+        "state",
+        "decision_id",
+        "option_key",
+        "chat_id",
+        "chat_type",
+    }
+    extras = {
+        k: v
+        for k, v in value.items()
+        if k not in reserved
+    }
+    form_value = getattr(action, "form_value", None) or {}
+    if hasattr(form_value, "items"):
+        extras.update({k: v for k, v in form_value.items() if k not in extras})
+    context = getattr(event.event, "context", None)
+    message_id = getattr(context, "open_message_id", None) if context else None
     return ButtonAction(
         open_id=open_id,
         approval_id=value.get("approval_id", ""),
@@ -367,20 +422,8 @@ def _parse_button_action(event: Any) -> ButtonAction:
         state=value.get("state", ""),
         decision_id=value.get("decision_id"),
         option_key=value.get("option_key"),
-        extras={
-            k: v
-            for k, v in value.items()
-            if k
-            not in {
-                "approval_id",
-                "action",
-                "state",
-                "decision_id",
-                "option_key",
-                "chat_id",
-                "chat_type",
-            }
-        },
+        extras=extras,
         chat_id=value.get("chat_id"),
         chat_type=value.get("chat_type", "p2p") or "p2p",
+        message_id=message_id,
     )

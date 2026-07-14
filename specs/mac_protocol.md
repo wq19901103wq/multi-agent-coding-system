@@ -317,7 +317,7 @@ planner stage=doc_outline 的输出（仅 documentation 任务）。
 
 ### 主动提问协议
 
-任一 Agent 可返回 `output.next_state_event = "ask_user"` 和 `output.questions`。Orchestrator 为每个问题分配/校验稳定 question_id，持久化 `resume_state`、agent_type、stage、task_id、round、artifact versions 和 trace IDs，并创建 input approval。
+任一 Agent 可返回 `output.next_state_event = "ask_user"` 和 `output.question_batch.questions`。Orchestrator 为每个问题分配/校验稳定 question_id，持久化 `resume_state`、agent_type、stage、task_id、round、artifact versions 和 trace IDs，并创建 input approval。
 
 回答记录只追加，至少包含 `question_id`、answer kind（option/free_text/accept_default）、selected keys、text、answered_by、source_chat_id 和 answered_at。新一轮 Agent 读取全部历史问答及仍未解决问题；blocking question 未解决时协议层拒绝 `complete`。
 

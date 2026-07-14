@@ -470,6 +470,7 @@ async def inject_action(
     approval_id: str,
     action: str,
     option_key: str | None = None,
+    decision_id: str | None = None,
     state: str = "",
 ) -> None:
     """Inject a card button click via the test endpoint."""
@@ -483,6 +484,7 @@ async def inject_action(
         approval_id=approval_id,
         action=action,
         option_key=option_key,
+        decision_id=decision_id,
         state=state,
         chat_id=chat_id,
         chat_type=chat_type,
@@ -658,7 +660,7 @@ async def scenario_intent_confirm_override(ctx: ScenarioContext) -> None:
 
 
 async def scenario_requirement_confirm(ctx: ScenarioContext) -> None:
-    """6. Confirm the requirement understanding and proceed to architecture."""
+    """6. Confirm the unified requirement spec and proceed to architecture."""
     eprint("Scenario 6: requirement_confirm")
     project = await ctx.mac.create_project(
         **_project_create_kwargs(
@@ -756,7 +758,7 @@ async def scenario_night_mode_bug_fix(ctx: ScenarioContext) -> None:
 
 
 async def scenario_clarification_input(ctx: ScenarioContext) -> None:
-    """9. Walk through requirement→architecture→specs confirm flow."""
+    """9. Walk through specify→architecture→implementation spec confirmation."""
     eprint("Scenario 9: clarification_input")
     project = await ctx.mac.create_project(
         **_project_create_kwargs(
@@ -770,7 +772,7 @@ async def scenario_clarification_input(ctx: ScenarioContext) -> None:
     project_id = project["id"]
     await ctx.mac.tick(project_id)
 
-    # Requirement → Architecture
+    # Unified requirement spec → Architecture
     status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
     if not status or not status.get("pending_approval"):
         status = await tick_until_pending(ctx, project_id)
@@ -799,7 +801,7 @@ async def scenario_clarification_input(ctx: ScenarioContext) -> None:
     )
 
     # Specs → Coding
-    status = await wait_for_state(ctx, project_id, "SPEC_CONFIRM_PENDING", timeout=500.0)
+    status = await wait_for_state(ctx, project_id, "IMPLEMENTATION_SPEC_CONFIRM_PENDING", timeout=500.0)
     if status is None:
         raise RuntimeError("Project did not reach SPEC_CONFIRM_PENDING")
     if not status.get("pending_approval"):
@@ -810,7 +812,7 @@ async def scenario_clarification_input(ctx: ScenarioContext) -> None:
         open_id=ctx.args.open_id,
         approval_id=approval_id,
         action="confirm",
-        state="SPEC_CONFIRM_PENDING",
+        state="IMPLEMENTATION_SPEC_CONFIRM_PENDING",
     )
 
     status = await wait_for_state(ctx, project_id, "CODING", timeout=300.0)
@@ -966,6 +968,30 @@ async def wait_for_next_approval(
     return approval_id, reply
 
 
+async def wait_for_approval_at_state(
+    ctx: ScenarioContext,
+    project_id: str,
+    expected_state: str,
+    *,
+    after_message_id: str,
+    timeout: float = 300.0,
+) -> tuple[str, Any]:
+    """Wait for the next card and fail fast if the scenario and state machine drift."""
+    approval_id, reply = await wait_for_next_approval(
+        ctx, after_message_id=after_message_id, timeout=timeout
+    )
+    status = await ctx.mac.get_status(project_id)
+    actual_state = status.get("current_state")
+    pending = status.get("pending_approval") or {}
+    if actual_state != expected_state or pending.get("approval_id") != approval_id:
+        raise RuntimeError(
+            "Approval/state mismatch: "
+            f"expected={expected_state}, actual={actual_state}, "
+            f"card_approval={approval_id}, pending_approval={pending.get('approval_id')}"
+        )
+    return approval_id, reply
+
+
 async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
     """14. Drive a feature project through all stages with full branch coverage.
 
@@ -980,7 +1006,9 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
     """
     eprint("Scenario 14: full_feature_flow (with full branch coverage)")
     msg_id = await send_feishu_text(
-        ctx, "/create --type=feature 实现一个 Todo List CLI"
+        ctx,
+        "/create --type=feature 实现最小 Todo CLI：只支持 add <文本> 和 list 两个命令；"
+        "进程内存储；不做编辑、删除、权限、持久化和网络功能",
     )
     if ctx.dry_run:
         return
@@ -996,103 +1024,171 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
     eprint(f"  created project {project_id}")
 
     # ── 1. Requirements: reject then confirm ──────────────────────────────
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=reply.message_id)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "REQUIREMENT_CONFIRM_PENDING", after_message_id=reply.message_id
+    )
     eprint(f"  requirement approval {approval_id} (will reject)")
     msg_id = await send_feishu_text(
-        ctx, f"/reject {approval_id} 需求描述过于笼统，需要补充具体的功能列表和非功能性要求"
+        ctx,
+        f"/reject {approval_id} 请补充空文本 add 的错误行为、空列表输出和基本启动时间验收标准",
     )
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "REQUIREMENT_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  requirement re-approval {approval_id} (now confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
-    # ── 2. Architecture: reject then confirm ──────────────────────────
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
-    eprint(f"  architecture approval {approval_id} (will reject)")
-    msg_id = await send_feishu_text(
-        ctx, f"/reject {approval_id} 技术方案缺少备选方案对比和选型理由"
+    # ── 2. Architecture: select another option then confirm ───────────
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
     )
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    eprint(f"  architecture approval {approval_id} (select_option)")
+    status = await ctx.mac.get_status(project_id)
+    architecture_options = [
+        option for option in (status.get("pending_approval") or {}).get("options", [])
+        if option.get("action") == "select_option"
+        and option.get("decision_id") and option.get("option_key")
+    ]
+    if not architecture_options:
+        raise RuntimeError("Architecture approval did not expose a concrete decision option")
+    selected = next(
+        (option for option in architecture_options if option.get("type") != "primary"),
+        architecture_options[0],
+    )
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        approval_id,
+        "select_option",
+        option_key=selected["option_key"],
+        decision_id=selected["decision_id"],
+        state="ARCHITECTURE_CONFIRM_PENDING",
+    )
+    msg_id = reply.message_id
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  architecture re-approval {approval_id} (now confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
-    # ── 3. Spec: reject then confirm ──────────────────────────────────────
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    # ── 3. Implementation Spec: reject then confirm ───────────────────
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "IMPLEMENTATION_SPEC_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  spec approval {approval_id} (will reject)")
     msg_id = await send_feishu_text(
         ctx, f"/reject {approval_id} Spec 未覆盖边界条件和异常场景"
     )
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "IMPLEMENTATION_SPEC_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  spec re-approval {approval_id} (now confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
-    # ── 4. Coding: confirm → reject → REWORK → to_coding → re-run ─────
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    # ── 4. Coding: reject → REWORK → to_coding → re-run ───────────────
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "CODING_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  coding approval {approval_id} (will reject)")
     msg_id = await send_feishu_text(
         ctx, f"/reject {approval_id} 代码缺少单元测试和错误处理"
     )
     # After reject → REWORK, wait for REWORK selection card
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "REWORK", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  coding rework approval {approval_id} (select to_coding)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} to_coding")
     # Coder re-runs, lands in CODING_CONFIRM_PENDING
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "CODING_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  coding re-approval {approval_id} (now confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
-    # ── 5. Testing: reject → REWORK → to_testing → re-run ──────────────
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    # ── 5. Testing: reject → REWORK → to_testing → re-run ─────────────
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "TESTING_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  testing approval {approval_id} (will reject)")
     msg_id = await send_feishu_text(
         ctx, f"/reject {approval_id} 测试用例未覆盖边界值和异常输入"
     )
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "REWORK", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  testing rework approval {approval_id} (select to_testing)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} to_testing")
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "TESTING_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  testing re-approval {approval_id} (now confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
-    # ── 6. Review: reject → REWORK → to_coding → re-run ────────────────
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    # ── 6. Review: reject → REWORK → to_coding → re-run ───────────────
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "REVIEW_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  review approval {approval_id} (will reject)")
     msg_id = await send_feishu_text(
-        ctx, f"/reject {approval_id} 存在硬编码配置项，需要抽取为配置参数"
+        ctx, f"/reject {approval_id} 错误信息存在重复硬编码，请集中定义并补回归测试"
     )
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "REWORK", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  review rework approval {approval_id} (select to_coding)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} to_coding")
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "CODING_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  post-review coding approval {approval_id} (confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "TESTING_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  post-review testing approval {approval_id} (confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "REVIEW_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  review re-approval {approval_id} (now confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
     # ── 7. Acceptance: reject → REWORK → to_requirements → full replay ──
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "ACCEPTANCE_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  acceptance approval {approval_id} (will reject to_requirements)")
     msg_id = await send_feishu_text(
-        ctx, f"/reject {approval_id} 需求分析不够全面，缺少用户权限和数据持久化的规划"
+        ctx, f"/reject {approval_id} 需求未明确空文本 add 的进程退出码，请补充为非零退出码"
     )
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "REWORK", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  acceptance rework approval {approval_id} (select to_requirements)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} to_requirements")
 
-    # Full replay: requirements → architecture → specs → coding → testing → review → acceptance
-    for stage_label in ("replay-requirement", "replay-architecture", "replay-spec",
-                        "replay-coding", "replay-testing", "replay-review"):
-        approval_id, reply = await wait_for_next_approval(
-            ctx, after_message_id=msg_id, timeout=600.0
+    # Full replay: unified requirement spec → architecture → implementation
+    # spec → coding → testing → review → acceptance.
+    replay_states = (
+        ("replay-requirement", "REQUIREMENT_CONFIRM_PENDING"),
+        ("replay-architecture", "ARCHITECTURE_CONFIRM_PENDING"),
+        ("replay-spec", "IMPLEMENTATION_SPEC_CONFIRM_PENDING"),
+        ("replay-coding", "CODING_CONFIRM_PENDING"),
+        ("replay-testing", "TESTING_CONFIRM_PENDING"),
+        ("replay-review", "REVIEW_CONFIRM_PENDING"),
+    )
+    for stage_label, expected_state in replay_states:
+        approval_id, reply = await wait_for_approval_at_state(
+            ctx, project_id, expected_state, after_message_id=msg_id, timeout=600.0
         )
         eprint(f"  {stage_label} approval {approval_id} (confirm)")
         msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
     # Final acceptance → COMPLETED
-    approval_id, reply = await wait_for_next_approval(ctx, after_message_id=msg_id, timeout=600.0)
+    approval_id, reply = await wait_for_approval_at_state(
+        ctx, project_id, "ACCEPTANCE_PENDING", after_message_id=msg_id, timeout=600.0
+    )
     eprint(f"  final acceptance approval {approval_id} (confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 

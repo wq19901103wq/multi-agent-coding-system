@@ -168,12 +168,12 @@ async def main() -> int:
 
         # Stage 4: confirm specs
         print("Waiting for SPEC_CONFIRM_PENDING...")
-        status = await wait_for_pending(project_id, http, "SPEC_CONFIRM_PENDING")
+        status = await wait_for_pending(project_id, http, "IMPLEMENTATION_SPEC_CONFIRM_PENDING")
         await inject_action(
             project_id,
             status["pending_approval"]["approval_id"],
             "confirm",
-            "SPEC_CONFIRM_PENDING",
+            "IMPLEMENTATION_SPEC_CONFIRM_PENDING",
             http,
         )
 

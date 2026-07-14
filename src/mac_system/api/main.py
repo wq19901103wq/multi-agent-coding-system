@@ -41,7 +41,7 @@ def _confirmation_source_stage(confirmation_state: str) -> str:
     return {
         "REQUIREMENT_CONFIRM_PENDING": "PLANNING_REQUIREMENTS",
         "ARCHITECTURE_CONFIRM_PENDING": "PLANNING_ARCHITECTURE",
-        "SPEC_CONFIRM_PENDING": "PLANNING_SPECS",
+        "IMPLEMENTATION_SPEC_CONFIRM_PENDING": "PLANNING_IMPLEMENTATION_SPECS",
         "BUG_FIX_CONFIRM_PENDING": "BUG_ANALYSIS",
         "OUTLINE_CONFIRM_PENDING": "DOC_OUTLINE",
         "CODING_CONFIRM_PENDING": "CODING",
@@ -149,6 +149,7 @@ async def create_project(
             creator_open_id=req.creator_open_id,
             feishu_chat_id=req.feishu_chat_id,
             feishu_chat_type=req.feishu_chat_type,
+            bound_directory=req.bound_directory,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
