@@ -1818,6 +1818,7 @@ async def _maybe_pause_for_bind_dir_recommendation(
         try:
             path = path.resolve()
         except Exception:
+            logger.warning("bind_dir candidate path resolve failed: %s", path_str)
             continue
         if not _path_within_allowed_roots(path, allowed_roots):
             logger.warning(
@@ -1825,6 +1826,7 @@ async def _maybe_pause_for_bind_dir_recommendation(
             )
             continue
         if not (path / ".git").exists():
+            logger.warning("bind_dir candidate missing .git: %s", path)
             continue
         valid.append({"path": str(path), "name": c.get("name") or path.name})
     if not valid:

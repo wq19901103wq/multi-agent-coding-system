@@ -533,13 +533,21 @@ async def ensure_ws_ready(ctx: ScenarioContext, timeout: float = 90.0) -> None:
 
 
 async def feishu_create_project(ctx: ScenarioContext, text: str) -> str:
-    """Create a project via Feishu message and return its project_id."""
+    """Create a project via Feishu message and return its project_id.
+
+    Handles three pre-creation interruptions:
+    1. Intent confirmation card (ambiguous task type) -> click confirm.
+    2. bind_dir recommendation card (MAC_ALLOWED_BIND_ROOTS set, no binding)
+       -> click "skip" to use system workspace.
+    """
     msg_id = await send_feishu_text(ctx, text)
     if ctx.dry_run:
         return "proj_dryrun_000"
     assert ctx.sim is not None
     reply = await ctx.sim.wait_for_reply(
-        pattern=r"已创建项目|确认任务类型", after_message_id=msg_id
+        pattern=r"已创建项目|确认任务类型|正在根据需求描述查找|选择要绑定的目录",
+        after_message_id=msg_id,
+        timeout=120.0,
     )
     if reply is None:
         raise RuntimeError("MAC bot did not reply with project creation")
@@ -556,10 +564,28 @@ async def feishu_create_project(ctx: ScenarioContext, text: str) -> str:
                 )
                 break
         reply = await ctx.sim.wait_for_reply(
-            pattern=r"已创建项目", after_message_id=reply.message_id
+            pattern=r"已创建项目|正在根据需求描述查找|选择要绑定的目录",
+            after_message_id=reply.message_id,
+            timeout=120.0,
         )
         if reply is None:
             raise RuntimeError("MAC bot did not reply after intent confirmation")
+    # bind_dir recommendation: skip to use system workspace.
+    if "选择要绑定的目录" in reply.text or "正在根据需求描述查找" in reply.text:
+        await inject_action(
+            ctx,
+            open_id=ctx.args.open_id,
+            approval_id="",
+            action="menu",
+            option_key="bind_dir_for_create_skip",
+        )
+        reply = await ctx.sim.wait_for_reply(
+            pattern=r"已创建项目",
+            after_message_id=reply.message_id,
+            timeout=120.0,
+        )
+        if reply is None:
+            raise RuntimeError("MAC bot did not create project after skipping bind_dir")
     project_id = extract_project_id(reply.text)
     if not project_id:
         raise RuntimeError(f"Could not extract project_id from reply: {reply.text!r}")
@@ -878,7 +904,11 @@ async def scenario_restart_with_type(ctx: ScenarioContext) -> None:
 
 
 async def scenario_bind_and_status(ctx: ScenarioContext) -> None:
-    """11. Bind a user to a project and query status via Feishu commands."""
+    """11. Switch to a project and query status via Feishu commands.
+
+    Originally tested /bind <project_id> to bind a user to a project; that
+    command was renamed to /switch <project_id>. /bind now binds a directory.
+    """
     eprint("Scenario 11: bind_and_status")
     project = await ctx.mac.create_project(
         **_project_create_kwargs(
@@ -890,9 +920,84 @@ async def scenario_bind_and_status(ctx: ScenarioContext) -> None:
         )
     )
     project_id = project["id"]
-    await send_feishu_text(ctx, f"/bind {project_id}")
+    await send_feishu_text(ctx, f"/switch {project_id}")
     await send_feishu_text(ctx, f"/status {project_id}")
-    eprint(f"  bind/status commands sent for {project_id}")
+    eprint(f"  switch/status commands sent for {project_id}")
+
+
+async def scenario_bind_dir_agent(ctx: ScenarioContext) -> None:
+    """16. Test /bind (no-args) and /create agent-recommended bind dir flow.
+
+    Requires MAC_ALLOWED_BIND_ROOTS to be configured. Verifies:
+    1. /bind (no-args) triggers project_manager agent and shows candidate card.
+    2. /create <description> triggers agent recommendation and shows pick card.
+    3. Clicking 'skip' on the pick card creates the project with system workspace.
+    """
+    eprint("Scenario 16: bind_dir_agent")
+    # 1. /bind (no-args) -> candidate card -> cancel
+    msg1 = await send_feishu_text(ctx, "/bind")
+    reply1 = await ctx.sim.wait_for_reply(
+        pattern=r"选择要绑定的目录|未配置|没有检测到",
+        after_message_id=msg1,
+        timeout=120.0,
+    )
+    if reply1 is None:
+        raise RuntimeError("MAC bot did not reply to /bind (no-args)")
+    if "未配置" in reply1.text or "没有检测到" in reply1.text:
+        eprint("  MAC_ALLOWED_BIND_ROOTS not configured or no repos found; skipping agent test")
+        return
+    eprint("  /bind candidate card received")
+    await inject_action(
+        ctx,
+        open_id=ctx.args.open_id,
+        approval_id="",
+        action="menu",
+        option_key="bind_dir_cancel",
+    )
+    eprint("  cancelled /bind candidate card")
+
+    # 2. /create <description> -> agent recommendation -> skip -> project created
+    msg2 = await send_feishu_text(ctx, "/create --type=feature 实现 config-validator CLI")
+    reply2 = await ctx.sim.wait_for_reply(
+        pattern=r"正在根据需求描述查找|选择要绑定的目录|已创建项目",
+        after_message_id=msg2,
+        timeout=120.0,
+    )
+    if reply2 is None:
+        raise RuntimeError("MAC bot did not reply to /create")
+    if "已创建项目" in reply2.text:
+        eprint("  /create skipped agent (binding exists or no allowed roots); project created directly")
+        return
+    # Agent returned candidates; wait for the pick card.
+    if "正在根据需求描述查找" in reply2.text:
+        reply2 = await ctx.sim.wait_for_reply(
+            pattern=r"选择目录|跳过|已创建项目",
+            after_message_id=reply2.message_id,
+            timeout=120.0,
+        )
+        if reply2 is None:
+            raise RuntimeError("MAC bot did not send pick card after agent scan")
+    if "选择目录" in reply2.text or "跳过" in reply2.text:
+        await inject_action(
+            ctx,
+            open_id=ctx.args.open_id,
+            approval_id="",
+            action="menu",
+            option_key="bind_dir_for_create_skip",
+        )
+        reply3 = await ctx.sim.wait_for_reply(
+            pattern=r"已创建项目",
+            after_message_id=reply2.message_id,
+            timeout=120.0,
+        )
+        if reply3 is None:
+            raise RuntimeError("MAC bot did not create project after skip")
+        project_id = extract_project_id(reply3.text)
+        if not project_id:
+            raise RuntimeError(f"Could not extract project_id from reply: {reply3.text!r}")
+        eprint(f"  project created after skip: {project_id}")
+    else:
+        raise RuntimeError(f"Unexpected reply from /create: {reply2.text!r}")
 
 
 async def scenario_group_status_at_mention(ctx: ScenarioContext) -> None:
@@ -1235,6 +1340,7 @@ SCENARIOS: dict[str, Any] = {
     "group_status_at_mention": scenario_group_status_at_mention,
     "api_message_and_decision": scenario_api_message_and_decision,
     "full_feature_flow": scenario_full_feature_flow,
+    "bind_dir_agent": scenario_bind_dir_agent,
 }
 
 
