@@ -1,7 +1,8 @@
 # MAC System Agent 入职与工作交接
 
-> 更新时间：2026-07-14（Asia/Shanghai）  
+> 更新时间：2026-07-15（Asia/Shanghai）  
 > 工作目录：`/Users/yihanwang/multi-agent-coding-system/.worktrees/feat-core`  
+> GitHub 仓库：https://github.com/wq19901103wq/multi-agent-coding-system（public）  
 > 用途：让后续 Agent 在不重做已完成调查、不误解当前能力、不覆盖其他 Agent 修改的前提下继续工作。
 
 ## 1. 先读结论
@@ -174,40 +175,37 @@ Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInt
 
 调试复盘：`docs/reviews/2026-07-13-real-feishu-e2e-debugging-lessons.md`。
 
-## 8. 当前验证状态（2026-07-14 更新，如实记录）
+## 8. 当前验证状态（2026-07-15 更新，如实记录）
 
 ### 代码层面
 
-- `pytest tests/ -q` 通过：**145 passed**。
-- 服务健康检查 HTTP 200，飞书 WebSocket 已连接，未使用 `--reload`。
-- 数据库无 `status=running` 遗留 Task。
+- `pytest tests/ -q` 通过：**210 passed**。
+- `main` 和 `feat/core` 均在 `1daf12f`（历史已 scrub，见 §9B）。
+- GitHub 仓库 https://github.com/wq19901103wq/multi-agent-coding-system 已公开，只 push 了 `main`。
+- 服务未在运行（上次会话结束时已停）；启动方式见 §11。
 
-### 已实现且代码存活的改动（相对 HEAD 42a91cb 的未提交改动）
+### Session Binding v2.2（已全部合并到 main）
 
-以下改动在 worktree 未提交区**确认存在**（`git diff HEAD` 可见）：
-
-1. **状态机收敛**：`state_machines/{feature,bug_fix,documentation}.json` 已删除，收敛为 `state_machines/delivery.json` + `workflow_profiles/`。**不要**再新增按 task_type 命名的状态机文件。
-2. **三段规划**：独立 Product Spec 节点已移除，角色、流程、业务规则和功能行为并入 `REQUIREMENTS.json`；规划只保留 Specify / Architecture / Implementation Spec 三个确认环节。
-3. **QuestionInteraction 统一 ask_user**：`models.py` 新增 `QuestionInteraction` / `Question` / `QuestionAnswer` / `DefaultAuthorization` 四张表；`ProjectService` 有完整 CRUD；orchestrator `_handle_agent_output` 解析 `question_batch` 并创建 interaction；`_handle_human_input` 渲染 `build_question_batch_card`；`_handle_question_batch_action` 处理卡片回调；`/input` 路由到 interaction；`_collect_qa_history` 注入 prompt 防重复问。
-4. **ConversationInteraction**：模型 + CRUD + `handle_text_message` 多候选时创建选择卡 + `_use_project` resolve 后重新投递原始消息。
-5. **状态命名迁移**：`PLANNING_SPECS` -> `PLANNING_IMPLEMENTATION_SPECS` 等；`StateMachine._STATE_ALIASES` + `ProjectService._migrate_legacy_state_names` 提供旧名兼容。
-6. **辅助任务一致性**：`_execute_auxiliary_agent` 加 try/except 安全网；`cancel_project` 遍历所有 running task（含辅助）标记 failed。
-7. **工具调用卡片**：工具进度已恢复为紫色内容卡，标题包含项目名和 Agent 名，不再发送难以归属的纯文本。
-8. **已有目录绑定**：聊天默认目录、项目目录快照、项目级 `.mac` 命名空间和绑定仓库 worktree 已实现。
-9. **问题卡回复路由**：发送卡片的 message_id 写入 approval；文本回复通过 parent_id 精确恢复原项目和原 Agent。
+1. **命令重命名**：`/bind-dir`->`/bind`、`/unbind-dir`->`/unbind`、`/current-dir` 合并进 `/current`。`/bind` 和 `/unbind` 在 chat 存在 active/paused 项目时拒绝切换，提示阻塞项目列表。
+2. **`/switch`（无参）项目选择卡**：同一聊天多项目时让用户选，不猜测。
+3. **`/bind`（无参）候选目录卡**：`project_manager` Agent + Bash + `bind_dir` 阶段扫描 `MAC_ALLOWED_BIND_ROOTS`，Handler 层 `_path_within_allowed_roots` + `.git` 存在性校验过滤，确定性 Python 扫描兜底。
+4. **`/create <描述>` 流程集成**：会话无目录绑定 + `MAC_ALLOWED_BIND_ROOTS` 非空 + 无活跃/暂停项目时，Agent 根据描述推理匹配仓库；用户可选候选、跳过用系统工作区、或手输。Agent 失败/空候选时不阻塞，直接创建项目。
+5. **Prompt 调优**：`prompts/project_manager_bind_dir.md` 支持 `/bind` 和 `/create` 两种场景，description 非空时按关键词排序，鼓励读 README/package.json 生成候选描述。
+6. **Spec**：`specs/session_binding_spec.md` §5A 描述 `/create` 流程 bind_dir 推荐语义。
 
 ### 真实飞书 E2E 验证
 
-- **旧四段规划 E2E 已作废**：曾跑到 Acceptance 回退后的 Product Spec，但该流程与最终对齐方案不一致，项目已取消，不得作为验收证据。
-- **新三段规划 `full_feature_flow` 完整到 COMPLETED**：**尚未完成**，需在服务重启到最新代码后重新验证。
-- **`agent_ask_user` E2E（S11 的 7 个场景）**：**尚未在真实飞书群验证**。单测已覆盖 ask_user -> QuestionInteraction -> answer -> 新 round 的完整链路。
+- **`bind_dir_agent` 场景**：覆盖 main 之前已在真实飞书跑通--Agent 返回 8 个候选、过滤后卡片正常渲染、点击回调正常。
+- **覆盖 main + 清理 .env 之后**：**尚未重新验证**。服务器已停，需要 `export FEISHU_TEST_MODE=1` 启动后重跑 `scripts/feishu_e2e.py --scenario bind_dir_agent`。
+- **`full_feature_flow`**：状态见 §9 P0，仍需在最新代码上重新验证。
 
 ### 已知问题（未修复）
 
 1. **ask_user 卡片在真实飞书未观测到**：代码已实现 `build_question_batch_card` 和 parent_id 回复路由，但尚未在真实飞书群验证下拉组件、按钮和自由文本回复的完整组合。
 2. **驳回后的两步回复卡尚未实现**：当前可用 `/reject <approval_id> <feedback>` 或点击驳回后发送反馈；目标交互是先发一张可回复的反馈卡，再决定回退。
 3. **目录绑定仍是可信控制面模型**：当前会校验绝对路径和 Git 根目录，并要求 `/bind`、`/unbind` 在没有活跃/暂停项目时才能切换；但还没有群管理员角色和 Control API 鉴权；部署到不受信任的多人群前必须补齐。
-4. **`/bind` 无参候选卡 Agent 路径未在真实飞书验证**：代码已实现 `project_manager` + Bash + `bind_dir` 阶段调用 `run_chat_scoped_agent`，确定性扫描作为兜底；但未在真实飞书群观测到 Agent 实际扫描行为和返回的候选卡。`run_chat_scoped_agent` 不创建 Task、不依赖 Project，使用临时 worktree；不留下审计轨迹。
+4. **`/bind <显式路径>` 不检查 allowed roots**：MVP 假设控制面可信；生产环境需要加管理员限制（spec §6 已记录）。
+5. **用户路径硬编码**：`src/mac_system/config.py` 的 `claude_bin` 默认值、`.env.example`、`AGENTS.md`、`scripts/test_rejection_feedback_applied.py` 中有 `/Users/yihanwang` 路径；公开仓库里不理想，但不是安全问题，可后续清理。
 
 ## 9. 下一步工作（按优先级）
 
@@ -267,6 +265,54 @@ Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInt
 - `progress_callback` 的工具事件已恢复为 `send_content_card`，标题包含项目名和 Agent 名。
 - main 分支及根工作区的相关未提交文档/实现已逐项比较；没有直接覆盖当前更完整的 QuestionInteraction 和状态机实现。
 - 仍需通过最终全量测试与真实飞书 E2E 验证整合结果，不能仅凭 diff 宣称无遗漏。
+
+## 9B. 失败复盘：FEISHU_TEST_MODE 污染 .env + .env.bak 泄露密钥 + main 覆盖（2026-07-15）
+
+### 事件 1：FEISHU_TEST_MODE=1 写进 .env 导致 2 个单测失败
+
+- **现象**：`test_inject_card_action_disabled_by_default` 和 `test_night_mode_outside_window_falls_back_to_normal` 失败。
+- **根因**：`.env` 里留了 `FEISHU_TEST_MODE=1`（之前跑 E2E 时加的，没删）。`Settings` 用 pydantic-settings 从 `.env` 加载，`get_settings()` 又 `@lru_cache` 了，导致单测里也拿到 `feishu_test_mode=True`。这会让 `/test/inject_card_action` 端点返回 200（而非 404），还会让 night mode 在窗口外不回退 normal。
+- **修复**：从 `.env` 删除 `FEISHU_TEST_MODE=1`，保留注释。E2E 时用 `export FEISHU_TEST_MODE=1` 临时设置。
+- **教训**：`.env` 是开发环境共享配置，不要把临时测试 flag 写进去。`.env` 的注释自己说了"intentionally NOT set here"，但实际被 set 了--**注释和代码不一致时，代码是真相**。
+
+### 事件 2：.env.bak.20260711_182329 被 git 跟踪，含真实 Feishu App Secret
+
+- **现象**：推 GitHub 前扫描，发现 `.env.bak.20260711_182329` 在 commit `42a91cb` 就被提交了，里面有 `FEISHU_APP_SECRET` 和 `FEISHU_SIMULATOR_APP_SECRET` 真实值。
+- **根因**：某个时间点执行了 `cp .env .env.bak.20260711_182329`，然后 `git add` 误加了这个备份文件。`.gitignore` 只忽略了 `.env` 和 `.env.local`，没忽略 `.env.bak.*`。
+- **修复**：
+  1. `git rm --cached .env.bak.20260711_182329` 从当前 tree 删除
+  2. `.gitignore` 加 `.env.bak` 和 `.env.bak.*`
+  3. `pip install git-filter-repo` 安装历史重写工具
+  4. `git filter-repo --path .env.bak.20260711_182329 --invert-paths --refs main` 从 main 历史抹掉该文件
+  5. 对 `feat/core` 做同样操作
+  6. 验证：`git log -p main | grep -c <secret>` 返回 0
+- **教训**：
+  1. **推任何远端前必须扫密钥**：`git ls-files | xargs grep -lE "<secret-pattern>"`。不要假设 `.gitignore` 能挡住所有东西--历史里的文件也得查。
+  2. **`.gitignore` 要覆盖所有 env 变体**：`.env`、`.env.local`、`.env.bak`、`.env.bak.*`、`.env.*.local`。
+  3. **`git filter-repo` 比 `git filter-branch` 好用**：更快、更安全、有 `--refs` 限定分支。`--invert-paths --path <file>` 删除指定文件，`--refs <branch>` 只重写指定分支。
+  4. **历史重写后 commit hash 全变**：备份分支（`main-backup-before-overwrite` 等）仍指向旧 commit，包含密钥；这些分支只能留本地，**绝对不能 push**。
+
+### 事件 3：feat/core 和 main 实现分歧太大，Rebase 失败，最终 force-overwrite main
+
+- **背景**：feat/core 有 6 个新提交（session binding v2.2），main 有 22 个提交（旧 ask_user 实现，无 `QuestionInteraction` 模型）。两分支对 ask_user 功能有完全不兼容的实现。
+- **尝试**：`git rebase main` 失败--13+ 文件冲突，且冲突不是简单格式差异，是模型层根本不兼容。
+- **决定**：用户选择直接用 feat/core 覆盖 main。
+- **执行**：
+  1. 创建备份分支 `main-backup-before-overwrite`（指向旧 main `924f8a0`）
+  2. 在主仓库 `git reset --hard feat/core`（main 指向 feat/core 的 HEAD）
+  3. 验证：210 测试通过，服务健康
+- **教训**：
+  1. **长时间分叉的分支合并前先评估分歧程度**：如果两分支对同一功能有完全不兼容的实现，rebase 几乎注定失败，应尽早和用户对齐"保留哪边"。
+  2. **force-overwrite main 前必须备份**：`git branch main-backup-before-overwrite` 只花一秒，但能在翻车时救命。
+  3. **`git reset --hard` 是破坏性操作**：只在用户明确授权时使用，且必须先备份。
+  4. **worktree 里的分支不能从外部 force-update**：`feat/core` 被 worktree 占用时，`git branch -f feat/core main` 会报错；需要在 worktree 内部操作。
+
+### 事件 4：mac_system.db-shm / mac_system.db-wal 被意外提交
+
+- **现象**：`git status` 显示这两个 SQLite WAL 文件被删除（之前某次 commit 加进去了）。
+- **根因**：`.gitignore` 有 `*.db` 但没有 `*.db-shm` / `*.db-wal`。SQLite WAL 模式会生成这两个 sidecar 文件，运行时不断变化。
+- **修复**：`git rm --cached` 取消跟踪，`.gitignore` 加 `*.db-shm` 和 `*.db-wal`。
+- **教训**：**SQLite WAL 模式的 sidecar 文件必须 gitignore**。`*.db` 不够，要加上 `*.db-shm` 和 `*.db-wal`。
 
 ## 10. 新 Agent 的安全工作流程
 

@@ -1,9 +1,22 @@
 # AGENTS.md — MAC System 开发纪律
 
-## 项目当前状态（2026-07-11）
+## 项目当前状态（2026-07-15）
+
+### 仓库
+
+- **GitHub**：https://github.com/wq19901103wq/multi-agent-coding-system（public）
+- **默认分支**：`main`（历史已 scrub，无密钥）
+- **开发分支**：`feat/core`（与 main 同步）
+- **本地备份分支**（含旧 secret，**禁止 push**）：`main-backup-before-overwrite`、`main-pre-scrub-backup`、`feat/core-backup-before-rebase`
 
 ### 已完成
 
+- **Session Binding v2.2（已合并到 main）**：
+  - 命令重命名：`/bind-dir`->`/bind`、`/unbind-dir`->`/unbind`、`/current-dir` 合并进 `/current`
+  - 活跃/暂停项目约束：`/bind` 和 `/unbind` 在 chat 有 active/paused 项目时拒绝
+  - `/switch`（无参）项目选择卡、`/bind`（无参）候选目录卡（`project_manager` Agent + `bind_dir` 阶段 + 确定性兜底）
+  - `/create <描述>` 流程集成 bind_dir agent 推荐：会话无绑定 + `MAC_ALLOWED_BIND_ROOTS` 非空时，Agent 根据描述推理匹配仓库
+  - 安全模型：Agent 只读扫描，Handler 层 `_path_within_allowed_roots` + `.git` 校验过滤，Agent 不写 DB、不执行 git init
 - **状态机重构（v2.0）**：`feature` / `bug_fix` / `documentation` 共用 `state_machines/delivery.json`，差异放在 `workflow_profiles/`；编译后的流程继续支持：
   - 规划阶段输入态：`REQUIREMENT_INPUT_PENDING` / `ARCHITECTURE_INPUT_PENDING` / `IMPLEMENTATION_SPEC_INPUT_PENDING`（及 bug_fix / documentation 对应输入态）
   - 质量确认关：`CODING_CONFIRM_PENDING` / `TESTING_CONFIRM_PENDING` / `REVIEW_CONFIRM_PENDING`
@@ -18,10 +31,8 @@
   - 质量关通过时按 `verified_feedback_ids` 关闭历史反馈
   - Agent 运行期间收到的自由文本/命令被消费为 `PendingUserInput`，scope_change/correction 会强制质量关进入 `REWORK`
   - 每轮任务记录 `round_number`，旧 approval 在状态重新进入时标记 `expired`
-- **单元测试基线**：`48 passed`（新增 4 个针对 FeedbackPacket / PendingUserInput / round_number 的用例）。
-- **真实飞书端到端**：`full_feature_flow` 已干净跑通到 `COMPLETED`：
-  - 经历了 `REQUIREMENT_CONFIRM_PENDING` → `ARCHITECTURE_CONFIRM_PENDING` → `IMPLEMENTATION_SPEC_CONFIRM_PENDING` → `CODING_CONFIRM_PENDING` → `TESTING_CONFIRM_PENDING` → `REVIEW_CONFIRM_PENDING` → `ACCEPTANCE_PENDING` → `COMPLETED`。
-  - `uvicorn.log` 中无 `Failed to handle Feishu text message`、`Failed to send summary content card` 或 `NoneType.*int` 错误。
+- **单元测试基线**：**210 passed**。
+- **真实飞书端到端**：`full_feature_flow` 已干净跑通到 `COMPLETED`（旧四段规划版本，新三段规划需重跑）；`bind_dir_agent` 场景已验证（覆盖 main 之前）。
   - 注意：**同一聊天窗口不要并发跑多个 e2e scenario**，否则 simulator 会把不同项目的 approval 卡片串扰。
 
 ### 已踩坑 & 必须规避
@@ -46,6 +57,25 @@
    - `planner_*.md` 原提示把 schema 路径写成 `{{workspace_path}}/specs/schemas/xxx.json`，但项目 workspace 下并没有这个目录，导致 Agent 找 schema 耗时甚至失败/重试。
    - 结论：prompt 中 schema 路径统一用渲染器注入的 `{{output_schema_path}}`，它指向仓库根目录的绝对路径。
 
+6. **FEISHU_TEST_MODE 不要写进 .env**
+   - `.env` 里留 `FEISHU_TEST_MODE=1` 会导致 `test_inject_card_action_disabled_by_default` 和 `test_night_mode_outside_window_falls_back_to_normal` 失败。
+   - 根因：`Settings` 从 `.env` 加载，`get_settings()` 用 `@lru_cache`，单测里也拿到 `feishu_test_mode=True`，导致 test 端点返回 200（而非 404）+ night mode 在窗口外不回退 normal。
+   - 结论：`.env` 不写 `FEISHU_TEST_MODE`；E2E 时用 `export FEISHU_TEST_MODE=1` 临时设置。
+
+7. **推远端前必须扫密钥 + 查历史**
+   - `.env.bak.20260711_182329` 曾被 git 跟踪，含真实 Feishu App Secret，在 commit `42a91cb` 就进去了。
+   - `.gitignore` 只忽略 `.env`/`.env.local`，没忽略 `.env.bak.*`；备份文件漏网。
+   - 结论：推远端前跑 `git ls-files | xargs grep -lE "<secret-pattern>"` 扫当前 tree，再跑 `git log -p --all | grep -c "<secret>"` 扫历史。`.gitignore` 要覆盖 `.env.bak`、`.env.bak.*`。历史里有密钥用 `git filter-repo --path <file> --invert-paths --refs <branch>` 抹掉。
+
+8. **SQLite WAL sidecar 文件必须 gitignore**
+   - `mac_system.db-shm` 和 `mac_system.db-wal` 曾被意外提交，运行时不断变化。
+   - `.gitignore` 有 `*.db` 但没有 `*.db-shm`/`*.db-wal`。
+   - 结论：`.gitignore` 必须加 `*.db-shm` 和 `*.db-wal`。
+
+9. **长时间分叉的分支不要硬 rebase**
+   - feat/core 和 main 对 ask_user 功能有完全不兼容的实现（main 无 `QuestionInteraction` 模型），rebase 时 13+ 文件冲突且不是格式差异。
+   - 结论：两分支对同一功能有不兼容实现时，rebase 几乎注定失败。尽早和用户对齐"保留哪边"，必要时 force-overwrite（先备份 `git branch <name>-backup`）。
+
 ---
 
 ## 每次修改后的验证流程
@@ -65,7 +95,7 @@
    pytest tests/ -q
    ```
 
-   当前基线：**133 passed**（含 full_flow 分支覆盖测试）。
+   当前基线：**210 passed**（含 full_flow 分支覆盖测试 + session binding + bind_dir agent）。
 
 2. **真实飞书端到端验证（必须）**
 
