@@ -36,6 +36,8 @@ env/
 # Environment variables
 .env
 .env.local
+.env.bak
+.env.bak.*
 
 # SQLite databases
 *.db
