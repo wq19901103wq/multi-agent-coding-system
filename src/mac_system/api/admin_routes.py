@@ -10,8 +10,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlmodel import Session
 
+from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.config import get_settings
 from mac_system.core.project_service import ProjectNotFoundError, ProjectService
 from mac_system.state_machine import StateMachine

@@ -1,5 +1,4 @@
 import json
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -28,7 +27,7 @@ class Settings(BaseSettings):
     # Claude Code
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
     anthropic_auth_token: str | None = Field(default=None, alias="ANTHROPIC_AUTH_TOKEN")
-    claude_bin: Path = Field(default=Path("/Users/yihanwang/.local/node/bin/claude"), alias="CLAUDE_BIN")
+    claude_bin: Path = Field(default=Path("claude"), alias="CLAUDE_BIN")
     claude_model: str | None = Field(default=None, validation_alias=AliasChoices("CLAUDE_MODEL", "ANTHROPIC_MODEL"))
     anthropic_base_url: str | None = Field(default=None, alias="ANTHROPIC_BASE_URL")
     anthropic_default_opus_model: str | None = Field(default=None, alias="ANTHROPIC_DEFAULT_OPUS_MODEL")
@@ -66,6 +65,7 @@ class Settings(BaseSettings):
 
     # Admin panel
     admin_token: str | None = Field(default=None, alias="ADMIN_TOKEN")
+    control_api_token: str | None = Field(default=None, alias="CONTROL_API_TOKEN")
 
     # Directory binding (chat-scoped /bind)
     # Comma-separated list of absolute paths the bot is allowed to scan and
@@ -122,3 +122,17 @@ def get_allowed_bind_roots() -> list[Path]:
             continue
         roots.append(path)
     return roots
+
+
+def path_within_allowed_bind_roots(path: str | Path) -> bool:
+    """Return whether ``path`` is inside a configured bind root.
+
+    An empty allowlist is fail-closed: explicit host-directory binding remains
+    disabled until an operator deliberately configures allowed roots.
+    """
+    resolved = Path(path).expanduser().resolve()
+    for root in get_allowed_bind_roots():
+        root_resolved = root.resolve()
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return True
+    return False

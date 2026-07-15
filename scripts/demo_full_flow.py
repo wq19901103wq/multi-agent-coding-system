@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Single clean end-to-end demo: one project through the full pipeline."""
-import asyncio, json, os, re, sys, time
+import asyncio
+import json
+import os
+import re
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -17,7 +21,9 @@ async def main():
     s = get_settings()
     sim = FeishuBridge(os.environ["FEISHU_SIMULATOR_APP_ID"], os.environ["FEISHU_SIMULATOR_APP_SECRET"])
     mac = FeishuBridge(s.feishu_app_id, s.feishu_app_secret)
-    http = httpx.AsyncClient(timeout=600.0)
+    control_token = os.getenv("CONTROL_API_TOKEN") or os.getenv("ADMIN_TOKEN")
+    headers = {"Authorization": f"Bearer {control_token}"} if control_token else {}
+    http = httpx.AsyncClient(timeout=600.0, headers=headers)
     chat_id = os.environ["FEISHU_SIMULATOR_CHAT_ID"]
     open_id = os.environ.get("FEISHU_SIMULATOR_OPEN_ID", "ou_simulator")
 
@@ -93,7 +99,7 @@ async def main():
                 print(f"\n  WARNING: Did not reach {target_state}")
 
         # ── Phase 3: Wait for ACCEPTANCE_PENDING ──
-        print(f"\nPhase: Waiting for ACCEPTANCE_PENDING (auto through coding/testing/review)...")
+        print("\nPhase: Waiting for ACCEPTANCE_PENDING (auto through coding/testing/review)...")
         for _ in range(600):
             await asyncio.sleep(3)
             resp = await http.get(f"{API_BASE}/projects/{project_id}/status")
@@ -104,13 +110,13 @@ async def main():
             pa = status.get("pending_approval")
             print(f"  state={cs} pending={'YES' if pa else 'no'}   ", end="\r")
             if cs == "ACCEPTANCE_PENDING" and pa:
-                print(f"\n  Reached ACCEPTANCE_PENDING!")
+                print("\n  Reached ACCEPTANCE_PENDING!")
                 break
         else:
-            print(f"\n  WARNING: Did not reach ACCEPTANCE_PENDING within timeout")
+            print("\n  WARNING: Did not reach ACCEPTANCE_PENDING within timeout")
 
         # ── Phase 4: Also demo a reject flow ──
-        print(f"\nPhase: Testing rejection flow...")
+        print("\nPhase: Testing rejection flow...")
         text2 = f'<at user_id="{mac_open_id}">@Code</at> 修复登录页面偶尔报 500 的问题'
         content2 = {"text": text2}
         r2 = await sim._request("POST", "/open-apis/im/v1/messages",

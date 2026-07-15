@@ -7,8 +7,11 @@ from typing import Any
 
 from sqlmodel import Session, select, update
 
-from mac_system.config import get_agent_config, get_settings
-from mac_system.database import session_scope
+from mac_system.config import (
+    get_agent_config,
+    get_settings,
+    path_within_allowed_bind_roots,
+)
 from mac_system.models import (
     Approval,
     ChatDirectoryBinding,
@@ -258,6 +261,10 @@ class ProjectService:
         if not path.is_absolute():
             raise ValueError("绑定目录必须是绝对路径")
         path = path.resolve()
+        if not path_within_allowed_bind_roots(path):
+            raise ValueError(
+                "绑定目录不在 MAC_ALLOWED_BIND_ROOTS 允许范围内；请先配置允许的根目录"
+            )
         if path.exists() and not path.is_dir():
             raise ValueError(f"绑定路径不是目录: {path}")
         path.mkdir(parents=True, exist_ok=True)
@@ -380,7 +387,7 @@ class ProjectService:
         await self.log_event(
             project_id=project_id,
             level="INFO",
-            message=f"Project cancelled",
+            message="Project cancelled",
             meta={"reason": reason, "triggered_by": triggered_by},
         )
         self.session.commit()
@@ -882,7 +889,7 @@ class ProjectService:
         input_data: dict,
         round_number: int = 1,
     ) -> Task:
-        project = self.require_project(project_id)
+        self.require_project(project_id)
         task_id = generate_id("task")
         task = Task(
             id=task_id,
@@ -957,6 +964,54 @@ class ProjectService:
         if tasks:
             self.session.commit()
         return list(tasks)
+
+    def reconcile_project_invariants(self) -> set[str]:
+        """Repair safe status invariants and return human states needing a tick.
+
+        This deliberately avoids restarting arbitrary historical agent states.
+        Interrupted running agents are handled by ``recover_stale_tasks``;
+        here we only repair terminal status flags and recreate missing human
+        interactions, both of which are deterministic and safe on startup.
+        """
+        projects = self.session.exec(select(Project)).all()
+        projects_needing_tick: set[str] = set()
+        changed = False
+        terminal_status = {
+            "COMPLETED": "completed",
+            "FAILED": "failed",
+            "CANCELLED": "cancelled",
+            "CANCELED": "cancelled",
+        }
+        for project in projects:
+            expected_status = terminal_status.get(project.current_state)
+            if expected_status and project.status != expected_status:
+                project.status = expected_status
+                project.updated_at = _now()
+                changed = True
+                continue
+            if project.status != "active":
+                continue
+            try:
+                state_machine = StateMachine(project.task_type)
+            except (ValueError, FileNotFoundError):
+                continue
+            if not (
+                state_machine.is_human_confirmation(project.current_state)
+                or state_machine.is_human_input(project.current_state)
+            ):
+                continue
+            pending = self.session.exec(
+                select(Approval).where(
+                    Approval.project_id == project.id,
+                    Approval.state == project.current_state,
+                    Approval.status == "pending",
+                )
+            ).first()
+            if pending is None:
+                projects_needing_tick.add(project.id)
+        if changed:
+            self.session.commit()
+        return projects_needing_tick
 
     async def create_approval(
         self,
@@ -1114,11 +1169,21 @@ class ProjectService:
         self,
         feedback_id: str,
         resolved_by_task_id: str,
+        project_id: str,
         status: str = "resolved",
     ) -> FeedbackPacket:
         packet = self.session.get(FeedbackPacket, feedback_id)
         if packet is None:
             raise ValueError(f"Feedback packet not found: {feedback_id}")
+        if packet.project_id != project_id:
+            raise ValueError(
+                f"Feedback packet {feedback_id} does not belong to project {project_id}"
+            )
+        resolving_task = self.session.get(Task, resolved_by_task_id)
+        if resolving_task is None or resolving_task.project_id != project_id:
+            raise ValueError(
+                f"Resolving task {resolved_by_task_id} does not belong to project {project_id}"
+            )
         packet.status = status
         packet.resolved_by_task_id = resolved_by_task_id
         packet.updated_at = _now()

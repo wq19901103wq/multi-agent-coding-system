@@ -136,14 +136,15 @@ class WorktreeManager:
             )
 
         repo = Repo(workspace)
-        stashed = False
+        stash_commit: str | None = None
+        merge_error: Exception | None = None
         try:
             # A dirty main workspace (uncommitted changes or untracked files) can
             # cause merge failures when the agent branch adds the same paths.
             # Stash workspace changes before merging; try to restore afterwards.
             if repo.is_dirty(untracked_files=True):
                 repo.git.stash("push", "-u", "-m", f"[mac] pre-merge cleanup for {branch_name}")
-                stashed = True
+                stash_commit = repo.git.rev_parse("refs/stash")
 
             # Merge the branch into the current branch (main/master)
             repo.git.merge(branch_name, no_ff=True, m=f"Merge {branch_name}")
@@ -153,22 +154,37 @@ class WorktreeManager:
                 repo.git.merge("--abort")
             except Exception:
                 pass
-            raise WorktreeManagerError(f"Merge failed for {branch_name}: {e}") from e
-        finally:
-            if stashed:
-                try:
-                    repo.git.stash("pop")
-                except Exception as exc:
-                    logger.warning(
-                        "Could not restore stashed workspace changes for %s: %s. "
-                        "Dropping stash to keep workspace consistent.",
-                        project_id,
-                        exc,
-                    )
-                    try:
-                        repo.git.stash("drop")
-                    except Exception:
-                        pass
+            merge_error = e
+
+        if stash_commit is not None:
+            try:
+                # Apply first and only drop the exact saved stash after a
+                # successful restore.  On conflict the stash is intentionally
+                # preserved so user changes always retain a recovery point.
+                repo.git.stash("apply", "--index", stash_commit)
+            except Exception as exc:
+                operation = "merge failed" if merge_error else "merge succeeded"
+                raise WorktreeManagerError(
+                    f"{operation}, but workspace changes could not be restored for "
+                    f"{branch_name}; stash preserved at {stash_commit}: {exc}"
+                ) from exc
+            else:
+                stash_entries = repo.git.stash("list", "--format=%H %gd").splitlines()
+                selector = next(
+                    (
+                        line.split(maxsplit=1)[1]
+                        for line in stash_entries
+                        if line.split(maxsplit=1)[0] == stash_commit
+                    ),
+                    None,
+                )
+                if selector:
+                    repo.git.stash("drop", selector)
+
+        if merge_error is not None:
+            raise WorktreeManagerError(
+                f"Merge failed for {branch_name}: {merge_error}"
+            ) from merge_error
 
     def remove_worktree(
         self,

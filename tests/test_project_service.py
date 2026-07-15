@@ -7,7 +7,7 @@ from mac_system.core.project_service import (
     ProjectNotFoundError,
     ProjectService,
 )
-from mac_system.models import FeedbackPacket, Project, Task
+from mac_system.models import FeedbackPacket, Task
 
 
 @pytest.fixture
@@ -19,7 +19,10 @@ def session():
 
 
 @pytest.fixture
-def service(session):
+def service(session, monkeypatch):
+    from mac_system.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "mac_allowed_bind_roots", "/")
     return ProjectService(session)
 
 
@@ -53,6 +56,24 @@ async def test_create_project_with_creator(service):
     assert users[0].open_id == "ou_123"
 
 
+async def test_reconcile_project_invariants_repairs_terminal_and_missing_approval(service):
+    completed = await service.create_project(
+        name="completed", task_type="feature", description="done"
+    )
+    completed.current_state = "COMPLETED"
+    completed.status = "active"
+    awaiting = await service.create_project(
+        name="awaiting", task_type="feature", description="confirm"
+    )
+    awaiting.current_state = "REQUIREMENT_CONFIRM_PENDING"
+    service.session.commit()
+
+    needing_tick = service.reconcile_project_invariants()
+
+    assert service.require_project(completed.id).status == "completed"
+    assert awaiting.id in needing_tick
+
+
 async def test_chat_directory_binding_is_inherited_and_project_metadata_is_isolated(
     service, tmp_path
 ):
@@ -84,6 +105,19 @@ async def test_chat_directory_binding_is_inherited_and_project_metadata_is_isola
     service.unbind_directory_from_chat("oc_bound")
     assert service.get_chat_directory_binding("oc_bound") is None
     assert first.bound_directory == str(repo.resolve())
+
+
+def test_directory_binding_rejects_path_outside_allowlist(service, tmp_path, monkeypatch):
+    from mac_system.config import get_settings
+
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    monkeypatch.setattr(get_settings(), "mac_allowed_bind_roots", str(allowed))
+
+    with pytest.raises(ValueError, match="MAC_ALLOWED_BIND_ROOTS"):
+        service.bind_directory_to_chat("oc_outside", str(outside), "ou_owner")
 
 
 async def test_get_project(service):

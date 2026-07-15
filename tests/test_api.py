@@ -13,6 +13,7 @@ from mac_system.api.main import app
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
+from mac_system.feishu import FeishuBridge
 
 
 def _create_test_engine():
@@ -49,10 +50,14 @@ def client():
             })
             yield AgentOrchestrator(service, wm, runtime, renderer)
 
+    settings = get_settings()
+    original_control_token = settings.control_api_token
+    settings.control_api_token = "test-control-token"
     app.dependency_overrides[get_project_service] = override_get_project_service
     app.dependency_overrides[get_orchestrator] = override_get_orchestrator
-    yield TestClient(app)
+    yield TestClient(app, headers={"Authorization": "Bearer test-control-token"})
     app.dependency_overrides.clear()
+    settings.control_api_token = original_control_token
     os.unlink(db_path)
 
 
@@ -60,6 +65,31 @@ def test_health(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_control_api_rejects_missing_token(client):
+    authorization = client.headers.pop("authorization")
+    try:
+        response = client.get("/projects/proj_unknown")
+    finally:
+        client.headers["authorization"] = authorization
+    assert response.status_code == 401
+    assert response.json()["detail"] == "INVALID_CONTROL_API_TOKEN"
+
+
+def test_control_api_fails_closed_when_token_unconfigured(client):
+    settings = get_settings()
+    original_control = settings.control_api_token
+    original_admin = settings.admin_token
+    settings.control_api_token = None
+    settings.admin_token = None
+    try:
+        response = client.get("/projects/proj_unknown")
+    finally:
+        settings.control_api_token = original_control
+        settings.admin_token = original_admin
+    assert response.status_code == 503
+    assert response.json()["detail"] == "CONTROL_API_TOKEN_NOT_CONFIGURED"
 
 
 def test_create_project(client):
@@ -190,6 +220,56 @@ def test_inject_card_action_confirm(client, monkeypatch):
 
     status_resp = client.get(f"/projects/{project_id}/status")
     assert status_resp.json()["current_state"] == "ARCHITECTURE_CONFIRM_PENDING"
+
+
+def test_decision_rejects_approval_from_another_project(client, monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "feishu_test_mode", True)
+
+    project_ids = []
+    approvals = []
+    for name in ("project-a", "project-b"):
+        created = client.post(
+            "/projects",
+            json={
+                "name": name,
+                "task_type": "feature",
+                "description": name,
+                "approval_mode": "normal",
+            },
+        ).json()
+        project_ids.append(created["id"])
+        client.post(f"/test/tick/{created['id']}")
+        client.post(f"/test/tick/{created['id']}")
+        approvals.append(
+            client.get(f"/projects/{created['id']}/status").json()["pending_approval"]
+        )
+
+    response = client.post(
+        f"/projects/{project_ids[0]}/decisions",
+        json={"approval_id": approvals[1]["approval_id"], "action": "confirm"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "APPROVAL_PROJECT_MISMATCH"
+
+
+def test_feishu_http_event_rejects_unsigned_payload(client):
+    from mac_system.api.feishu_routes import get_feishu_bridge
+
+    app.dependency_overrides[get_feishu_bridge] = lambda: FeishuBridge(
+        app_id="test", app_secret="secret", verification_token="verification"
+    )
+    try:
+        response = client.post(
+            "/feishu/events",
+            json={"header": {"event_type": "ignored"}},
+        )
+    finally:
+        app.dependency_overrides.pop(get_feishu_bridge, None)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "MISSING_SIGNATURE"
 
 
 def test_inject_card_action_with_group_chat_context(client, monkeypatch):

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import Depends
+import hmac
+
+from fastapi import Depends, Header, HTTPException
 from sqlmodel import Session
 
 from mac_system.agents.orchestrator import AgentOrchestrator
@@ -17,6 +19,22 @@ from mac_system.feishu import FeishuBridge
 
 def get_project_service(session: Session = Depends(get_session)) -> ProjectService:
     return ProjectService(session)
+
+
+def require_control_api_token(
+    authorization: str | None = Header(default=None),
+    x_control_api_token: str | None = Header(default=None),
+) -> None:
+    """Authenticate REST control-plane requests, failing closed if unconfigured."""
+    settings = get_settings()
+    expected = settings.control_api_token or settings.admin_token
+    if not expected:
+        raise HTTPException(status_code=503, detail="CONTROL_API_TOKEN_NOT_CONFIGURED")
+    supplied = x_control_api_token
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="INVALID_CONTROL_API_TOKEN")
 
 
 def _build_orchestrator(session: Session) -> AgentOrchestrator:

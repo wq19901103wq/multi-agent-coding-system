@@ -12,7 +12,7 @@ from mac_system.config import get_agent_config
 from mac_system.core.lock_manager import ProjectLockManager
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
-from mac_system.models import Approval, Task
+from mac_system.models import Approval, FeedbackPacket, Task
 
 
 @pytest.fixture
@@ -146,6 +146,35 @@ async def test_acceptance_coverage_violation_removes_confirm(orchestrator):
     assert approval is not None
     assert "confirm" not in {opt["action"] for opt in approval.payload["options"]}
     assert service.get_open_feedback_packets(project.id)[0].kind == "acceptance_rejection"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_failed_matrix_entry_is_not_counted_as_covered(orchestrator):
+    service, wm, renderer = orchestrator
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer)
+    project = await service.create_project(
+        name="coverage-fail", task_type="feature", description="Test"
+    )
+    mac_path = Path(project.workspace_path) / ".mac"
+    (mac_path / "REQUIREMENTS.json").write_text(
+        json.dumps({"acceptance_criteria": [{"id": "AC-001"}]}),
+        encoding="utf-8",
+    )
+
+    violation = oc._check_acceptance_coverage(
+        project,
+        {
+            "result": "pending_human_review",
+            "action": "confirm",
+            "blocking_conditions": [],
+            "acceptance_matrix": [
+                {"acceptance_criterion_id": "AC-001", "result": "fail"}
+            ],
+        },
+    )
+
+    assert violation is not None
+    assert violation["missing_ids"] == ["AC-001"]
 
 
 @pytest.mark.asyncio
@@ -480,7 +509,19 @@ async def test_night_mode_auto_confirms_bug_fix_confirmation(orchestrator, monke
             "root_cause": "missing range check",
             "fix_strategy": "add validation",
             "affected_files": ["src/validator.py"],
-        }
+        },
+        "coder": {"success": True, "next_state_event": "complete"},
+        "tester": {
+            "success": True,
+            "next_state_event": "complete",
+            "passed": True,
+        },
+        "reviewer": {
+            "success": True,
+            "next_state_event": "complete",
+            "result": "pass",
+            "issues": [],
+        },
     })
 
     oc = AgentOrchestrator(service, wm, runtime, renderer)
@@ -616,7 +657,19 @@ async def test_restart_with_type_at_acceptance(orchestrator, monkeypatch):
             "root_cause": "missing range check",
             "fix_strategy": "add validation",
             "affected_files": ["src/validator.py"],
-        }
+        },
+        "coder": {"success": True, "next_state_event": "complete"},
+        "tester": {
+            "success": True,
+            "next_state_event": "complete",
+            "passed": True,
+        },
+        "reviewer": {
+            "success": True,
+            "next_state_event": "complete",
+            "result": "pass",
+            "issues": [],
+        },
     })
 
     oc = AgentOrchestrator(service, wm, runtime, renderer)
@@ -761,6 +814,66 @@ async def test_reviewer_fail_creates_feedback_packet_and_goes_to_rework(orchestr
     feedback = service.get_open_feedback_packets(project.id)
     assert len(feedback) == 1
     assert feedback[0].source_stage == "REVIEW"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_explicit_fail_without_issues_forces_rework(orchestrator):
+    service, wm, renderer = orchestrator
+    runtime = FakeRuntime({
+        "reviewer": {
+            "success": True,
+            "next_state_event": "complete",
+            "result": "fail",
+            "issues": [],
+            "summary": "Reviewer explicitly failed the change",
+        }
+    })
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="review-fail", task_type="feature", description="Test", approval_mode="auto"
+    )
+    project.current_state = "REVIEW"
+    service.session.commit()
+
+    await oc.tick(project.id)
+
+    assert service.require_project(project.id).current_state == "REWORK"
+    feedback = service.get_open_feedback_packets(project.id)
+    assert any(item.source_stage == "REVIEW" for item in feedback)
+
+
+@pytest.mark.asyncio
+async def test_feedback_cannot_be_resolved_by_another_project(orchestrator):
+    service, _, _ = orchestrator
+    project_a = await service.create_project(
+        name="a", task_type="feature", description="A"
+    )
+    project_b = await service.create_project(
+        name="b", task_type="feature", description="B"
+    )
+    task_b = await service.create_task(
+        project_id=project_b.id,
+        agent_type="reviewer",
+        state="REVIEW",
+        input_data={},
+    )
+    packet = await service.create_feedback_packet(
+        project_id=project_a.id,
+        source_stage="REVIEW",
+        source_task_id=None,
+        source_round=1,
+        kind="quality_failure",
+        summary="A feedback",
+    )
+
+    with pytest.raises(ValueError, match="does not belong"):
+        await service.resolve_feedback_packet(
+            packet.id,
+            resolved_by_task_id=task_b.id,
+            project_id=project_b.id,
+        )
+
+    assert service.session.get(FeedbackPacket, packet.id).status == "open"
 
 
 @pytest.mark.asyncio

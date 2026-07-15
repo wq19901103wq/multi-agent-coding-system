@@ -277,7 +277,6 @@ class FeishuWebSocketClient:
             finally:
                 loop.close()
 
-        import concurrent.futures
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(runner)

@@ -36,8 +36,8 @@ import httpx
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 
-from mac_system.config import get_settings
-from mac_system.feishu.bridge import FeishuBridge
+from mac_system.config import get_settings  # noqa: E402
+from mac_system.feishu.bridge import FeishuBridge  # noqa: E402
 
 
 def eprint(msg: str) -> None:
@@ -157,7 +157,6 @@ class FeishuSimulator:
         items = data.get("data", {}).get("items") or []
         messages: list[FeishuMessage] = []
         for item in items:
-            sender = item.get("sender", {}).get("sender_id", {})
             body = item.get("body", {})
             content_text = ""
             try:
@@ -220,7 +219,11 @@ class MacApiClient:
         # Ticks can run the orchestrator for a while; allow up to 5 minutes.
         # Trust env is disabled so macOS system HTTP proxies do not intercept
         # localhost traffic and break status polling.
-        self._client = httpx.AsyncClient(timeout=300.0, trust_env=False)
+        control_token = os.getenv("CONTROL_API_TOKEN") or os.getenv("ADMIN_TOKEN")
+        headers = {"Authorization": f"Bearer {control_token}"} if control_token else {}
+        self._client = httpx.AsyncClient(
+            timeout=300.0, trust_env=False, headers=headers
+        )
 
     async def close(self) -> None:
         await self._client.aclose()

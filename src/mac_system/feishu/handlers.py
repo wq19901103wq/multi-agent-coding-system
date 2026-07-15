@@ -306,21 +306,54 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         if active_project.status == "cancelled" or active_project.current_state in dead_states:
             await _show_help(ctx, open_id)
             return
-        kind = _infer_input_kind(text)
-        await ctx.service.create_pending_user_input(
-            project_id=active_project.id,
-            sender_id=open_id,
-            observed_state=active_project.current_state,
-            content=text,
-            kind=kind,
-            source_chat_id=ctx.chat_id,
-        )
         receive_id, receive_id_type = _reply_target(ctx, open_id)
-        await ctx.bridge.send_text(
-            receive_id,
-            "已记录你的输入，当前 Agent 处理完毕后会自动消费。",
-            receive_id_type=receive_id_type,
-        )
+        state_machine = StateMachine(active_project.task_type)
+        running_state_tasks = [
+            task
+            for task in ctx.service._running_tasks(active_project.id)
+            if task.state == active_project.current_state
+        ]
+        if state_machine.is_agent_execution(active_project.current_state) and running_state_tasks:
+            kind = _infer_input_kind(text)
+            await ctx.service.create_pending_user_input(
+                project_id=active_project.id,
+                sender_id=open_id,
+                observed_state=active_project.current_state,
+                content=text,
+                kind=kind,
+                source_chat_id=ctx.chat_id,
+            )
+            await ctx.bridge.send_text(
+                receive_id,
+                "已记录你的输入，当前 Agent 处理完毕后会自动消费。",
+                receive_id_type=receive_id_type,
+            )
+            return
+
+        pending_approval = ctx.service.session.exec(
+            select(Approval)
+            .where(
+                Approval.project_id == active_project.id,
+                Approval.status == "pending",
+            )
+            .order_by(Approval.created_at.desc())
+        ).first()
+        if pending_approval and pending_approval.approval_type == "input":
+            await _submit_input(ctx, open_id, text)
+        elif pending_approval:
+            await ctx.bridge.send_text(
+                receive_id,
+                f"项目正在等待确认，请使用 `/confirm {pending_approval.id}` 或 "
+                f"`/reject {pending_approval.id} <修改意见>`。",
+                receive_id_type=receive_id_type,
+            )
+        else:
+            await ctx.bridge.send_text(
+                receive_id,
+                "当前项目没有正在运行的 Agent，也没有待处理输入；请使用 `/status "
+                f"{active_project.id}` 查看状态。",
+                receive_id_type=receive_id_type,
+            )
         return
 
     # No active project: check whether the user has multiple candidate
@@ -875,10 +908,10 @@ async def _respond_to_approval(
         ctx.service.session.commit()
 
         if feedback_text:
-            project.context = {
-                **project.context,
-                "latest_rejection_feedback": feedback_text,
-            }
+            updated_context = dict(project.context)
+            updated_context["latest_rejection_feedback"] = feedback_text
+            updated_context.pop("rejected_confirmation_state", None)
+            project.context = updated_context
             ctx.service.session.commit()
             sm = StateMachine(project.task_type)
             state_display = sm.display_name(from_state)
@@ -902,11 +935,9 @@ async def _respond_to_approval(
 
         # No feedback: tell the user we are waiting for their input.
         project = ctx.service.require_project(project.id)
-        sm = StateMachine(project.task_type)
-        to_display = sm.display_name(from_state)
         await ctx.bridge.send_text(
             receive_id,
-            f"已驳回，请直接回复修改意见。",
+            "已驳回，请直接回复修改意见。",
             receive_id_type=receive_id_type,
         )
         return
@@ -1365,6 +1396,11 @@ def _find_rejected_project_for_feedback(
         select(ProjectUser).where(ProjectUser.open_id == open_id)
     ).all()
     project_ids = {up.project_id for up in user_projects}
+    if ctx.chat_id:
+        chat_project_ids = {
+            project.id for project in ctx.service.list_projects_for_chat(ctx.chat_id)
+        }
+        project_ids &= chat_project_ids
     if not project_ids:
         return None
 
@@ -1383,9 +1419,9 @@ def _find_rejected_project_for_feedback(
     ).all()
 
     for project in projects:
+        if not project.context.get("rejected_confirmation_state"):
+            continue
         # Only consider recently updated (within 10 min).
-        from datetime import timedelta
-
         age = (datetime.utcnow() - project.updated_at.replace(tzinfo=None)).total_seconds()
         if age < 600:
             return project
@@ -1478,7 +1514,10 @@ async def _handle_rejection_feedback(
         failure_class="human_rejection",
         user_comment=text,
     )
-    project.context = {**project.context, "latest_rejection_feedback": text}
+    new_context = dict(project.context)
+    new_context["latest_rejection_feedback"] = text
+    new_context.pop("rejected_confirmation_state", None)
+    project.context = new_context
     ctx.service.session.commit()
 
     # Summarize the feedback in a card before re-planning.

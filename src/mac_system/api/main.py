@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from sqlmodel import Session
 
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.agents.runtime import FakeRuntime
@@ -31,6 +30,7 @@ from mac_system.api.dependencies import (
     _build_orchestrator,
     get_orchestrator,
     get_project_service,
+    require_control_api_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,9 @@ async def _resume_recovered_project(project_id: str) -> None:
         if project is None or project.status != "active":
             return
         state_machine = StateMachine(project.task_type)
-        if state_machine.state_type(project.current_state) != "agent_execution":
+        if state_machine.is_terminal(project.current_state) or state_machine.is_idle(
+            project.current_state
+        ):
             return
 
         orchestrator = _build_orchestrator(session)
@@ -97,6 +99,7 @@ async def lifespan(app: FastAPI):
                 "Recovered %d stale running tasks as failed", len(recovered)
             )
             recovered_project_ids = {task.project_id for task in recovered}
+        recovered_project_ids.update(service.reconcile_project_invariants())
     settings = get_settings()
     ws_client: FeishuWebSocketClient | None = None
     if (
@@ -138,6 +141,7 @@ def health() -> dict[str, str]:
 @app.post("/projects", response_model=ProjectOut)
 async def create_project(
     req: ProjectCreate,
+    _auth: None = Depends(require_control_api_token),
     service: ProjectService = Depends(get_project_service),
 ) -> ProjectOut:
     try:
@@ -159,6 +163,7 @@ async def create_project(
 @app.get("/projects/{project_id}", response_model=ProjectOut)
 def get_project(
     project_id: str,
+    _auth: None = Depends(require_control_api_token),
     service: ProjectService = Depends(get_project_service),
 ) -> ProjectOut:
     project = service.get_project(project_id)
@@ -170,6 +175,7 @@ def get_project(
 @app.get("/projects/{project_id}/status")
 def get_status(
     project_id: str,
+    _auth: None = Depends(require_control_api_token),
     service: ProjectService = Depends(get_project_service),
 ) -> dict[str, Any]:
     try:
@@ -196,6 +202,7 @@ class DecisionResponse(BaseModel):
 async def submit_decision(
     project_id: str,
     req: DecisionRequest,
+    _auth: None = Depends(require_control_api_token),
     service: ProjectService = Depends(get_project_service),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> DecisionResponse:
@@ -227,6 +234,11 @@ async def submit_decision(
         approval = service.get_approval(req.approval_id)
     except ApprovalNotFoundError:
         raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
+    if approval.project_id != project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="APPROVAL_PROJECT_MISMATCH",
+        )
 
     if req.action == "reject" and req.message:
         source_stage = _confirmation_source_stage(approval.state)
@@ -339,6 +351,7 @@ async def submit_message(
     project_id: str,
     req: UserMessageRequest,
     background_tasks: BackgroundTasks,
+    _auth: None = Depends(require_control_api_token),
     service: ProjectService = Depends(get_project_service),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> UserMessageResponse:
@@ -419,6 +432,7 @@ class CommandResponse(BaseModel):
 async def submit_command(
     project_id: str,
     req: CommandRequest,
+    _auth: None = Depends(require_control_api_token),
     service: ProjectService = Depends(get_project_service),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> CommandResponse:
@@ -500,6 +514,7 @@ async def _run_inject_card_action(action: ButtonAction) -> None:
 @app.post("/test/inject_card_action")
 async def inject_card_action(
     req: InjectCardActionRequest,
+    _auth: None = Depends(require_control_api_token),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> dict[str, Any]:
     """Test-only endpoint to simulate a Feishu card button click.
@@ -559,6 +574,7 @@ class InjectTextMessageRequest(BaseModel):
 @app.post("/test/inject_text_message")
 async def inject_text_message(
     req: InjectTextMessageRequest,
+    _auth: None = Depends(require_control_api_token),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> dict[str, Any]:
     """Test-only endpoint to simulate a Feishu text message."""
@@ -594,6 +610,7 @@ async def inject_text_message(
 @app.post("/test/tick/{project_id}")
 async def test_tick(
     project_id: str,
+    _auth: None = Depends(require_control_api_token),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> dict[str, Any]:
     """Test-only endpoint to manually trigger an orchestrator tick."""
@@ -608,6 +625,7 @@ async def test_tick(
 @app.post("/test/clear_pending_intent/{open_id}")
 async def clear_pending_intent(
     open_id: str,
+    _auth: None = Depends(require_control_api_token),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> dict[str, Any]:
     """Test-only endpoint to clear a user's pending Feishu intent."""

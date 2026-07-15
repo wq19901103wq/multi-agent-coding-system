@@ -9,7 +9,6 @@ LLM-based classifier later without changing callers.
 from __future__ import annotations
 
 import re
-from typing import Callable
 
 from mac_system.config import get_settings
 from mac_system.models import RouteDecision

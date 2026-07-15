@@ -52,6 +52,7 @@ def service(tmp_path, monkeypatch):
 
     settings = get_settings()
     monkeypatch.setattr(settings, "projects_dir", tmp_path)
+    monkeypatch.setattr(settings, "mac_allowed_bind_roots", str(tmp_path))
 
     engine = create_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(engine)
@@ -433,6 +434,115 @@ def test_parse_text_message_keeps_parent_id():
     }
     msg = bridge.parse_text_message(payload)
     assert msg.parent_id == "om_question_card"
+
+
+async def test_recent_planning_project_is_not_assumed_rejected(feishu_ctx):
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_current"
+    feishu_ctx.chat_type = "group"
+    project = await feishu_ctx.service.create_project(
+        name="planning",
+        task_type="feature",
+        description="Test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_current",
+        feishu_chat_type="group",
+    )
+    project.current_state = "PLANNING_REQUIREMENTS"
+    feishu_ctx.service.session.commit()
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_note",
+            text="再补充一个普通说明",
+            is_command=False,
+            is_at_bot=True,
+            chat_id="oc_current",
+            chat_type="group",
+        ),
+    )
+
+    assert feishu_ctx.service.get_open_feedback_packets(project.id) == []
+    assert feishu_ctx.service.get_pending_user_inputs(project.id) == []
+
+
+async def test_rejection_feedback_does_not_cross_chat(feishu_ctx):
+    from mac_system.feishu.handlers import handle_text_message
+
+    project = await feishu_ctx.service.create_project(
+        name="other-chat",
+        task_type="feature",
+        description="Test",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_other",
+        feishu_chat_type="group",
+    )
+    project.current_state = "PLANNING_REQUIREMENTS"
+    project.context = {
+        **project.context,
+        "rejected_confirmation_state": "REQUIREMENT_CONFIRM_PENDING",
+    }
+    feishu_ctx.service.session.commit()
+    feishu_ctx.chat_id = "oc_current"
+    feishu_ctx.chat_type = "group"
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_other_chat",
+            text="这不是另一个群的反馈",
+            is_command=False,
+            is_at_bot=True,
+            chat_id="oc_current",
+            chat_type="group",
+        ),
+    )
+
+    assert feishu_ctx.service.get_open_feedback_packets(project.id) == []
+
+
+async def test_confirmation_free_text_is_not_queued_forever(feishu_ctx):
+    from mac_system.feishu.handlers import handle_text_message
+
+    project = await feishu_ctx.service.create_project(
+        name="confirming",
+        task_type="feature",
+        description="Test",
+        creator_open_id="ou_1",
+    )
+    project.current_state = "REQUIREMENT_CONFIRM_PENDING"
+    feishu_ctx.service.session.commit()
+    approval = await feishu_ctx.service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state=project.current_state,
+        approval_type="confirmation",
+        question="确认需求？",
+        options=[
+            {"action": "confirm", "label": "确认"},
+            {"action": "reject", "label": "驳回"},
+        ],
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_confirm_text",
+            text="我想补充说明",
+            is_command=False,
+        ),
+    )
+
+    assert feishu_ctx.service.get_pending_user_inputs(project.id) == []
+    sent_text = " ".join(
+        str(item[2]) for item in feishu_ctx.bridge.sent if item[0] == "text"
+    )
+    assert f"/confirm {approval.id}" in sent_text
 
 
 async def test_reply_to_question_card_routes_by_parent_message(feishu_ctx):
@@ -985,7 +1095,6 @@ async def test_bind_no_args_without_allowed_roots_falls_back(feishu_ctx, monkeyp
 
     monkeypatch.setattr(cfg_module, "get_allowed_bind_roots", lambda: [])
     # Also patch the imported reference inside handlers.
-    import mac_system.feishu.handlers as h_module
     monkeypatch.setattr(
         "mac_system.config.get_allowed_bind_roots", lambda: []
     )
@@ -2354,7 +2463,7 @@ async def test_create_with_description_skips_agent_when_chat_already_bound(
     feishu_ctx.chat_id = "oc_create_bound"
     feishu_ctx.chat_type = "group"
 
-    bound_dir = tmp_path / "already-bound"
+    bound_dir = allowed_root / "already-bound"
     bound_dir.mkdir()
     (bound_dir / ".git").mkdir()
     feishu_ctx.service.bind_directory_to_chat(

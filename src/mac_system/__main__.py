@@ -3,7 +3,6 @@
 import asyncio
 import os
 import sys
-from pathlib import Path
 
 import click
 import uvicorn
@@ -22,7 +21,6 @@ from mac_system.state_machine import StateMachine
 @click.option("--debug", is_flag=True, help="Enable debug logging.")
 def cli(debug: bool) -> None:
     """Multi-Agent Coding System CLI."""
-    settings = get_settings()
     if debug:
         # Re-create settings with debug enabled is not trivial due to lru_cache;
         # just set the env var for subprocesses.
@@ -141,8 +139,6 @@ def run(
     agent_timeout: int | None,
 ) -> None:
     """Create a project and run orchestrator ticks until terminal or human pending."""
-    settings = get_settings()
-
     async def _run() -> None:
         if agent_timeout is not None:
             os.environ["AGENT_TIMEOUT_SECONDS"] = str(agent_timeout)

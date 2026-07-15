@@ -87,7 +87,9 @@ async def send_text(project_id: str, text: str, http: httpx.AsyncClient) -> None
 
 async def main() -> int:
     feedback = "必须支持任务优先级和截止日期字段"
-    async with httpx.AsyncClient(timeout=300.0) as http:
+    control_token = os.getenv("CONTROL_API_TOKEN") or os.getenv("ADMIN_TOKEN")
+    headers = {"Authorization": f"Bearer {control_token}"} if control_token else {}
+    async with httpx.AsyncClient(timeout=300.0, headers=headers) as http:
         project_id = await create_project(http)
         print(f"Created {project_id}")
         await tick(project_id, http)
@@ -111,7 +113,6 @@ async def main() -> int:
         print("Revised requirements ready; checking content...")
 
         # Read requirements from main workspace
-        import os
         workspace = f"/Users/yihanwang/multi-agent-coding-system/.worktrees/feat-core/projects/{project_id}"
         req_path = f"{workspace}/.mac/REQUIREMENTS.json"
         reqs = json.load(open(req_path, encoding="utf-8"))

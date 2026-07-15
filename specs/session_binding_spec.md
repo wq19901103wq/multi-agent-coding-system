@@ -112,7 +112,9 @@ repository/
 - 群聊中只有绑定到该群的项目允许群成员操作；私聊仍要求 `ProjectUser` 绑定。
 - API 直接传入 `bound_directory` 与飞书 `/bind` 走同一校验逻辑。
 - 目录不存在时允许创建；绑定动作必须由用户明确触发。候选推荐本身不创建目录。
-- 当前本地 MVP 假定飞书来源聊天和 Control API 都是可信控制面。进入多人生产环境前，必须增加"允许绑定的根目录"配置，并限制 `/bind` 为聊天管理员/系统 owner；否则任意群成员可能把 Agent 指向宿主机上的非预期目录。
+- Control API 必须使用 `CONTROL_API_TOKEN`（可回退复用 `ADMIN_TOKEN`）鉴权。
+- `/bind <路径>`、候选选择和 API `bound_directory` 都必须限制在 `MAC_ALLOWED_BIND_ROOTS` 内；allowlist 为空时绑定功能 fail-closed。
+- 多人生产环境仍应进一步限制 `/bind` 为聊天管理员/系统 owner。
 - **目录切换/解绑受活跃项目约束**：当前 chat 存在 `active` 或 `paused` 状态项目时，`/bind <new-path>` 和 `/unbind` 必须拒绝，并提示阻塞项目列表。用户须先 `/cancel` 或等项目进入 `completed`/`failed`/`cancelled` 后才能切换目录。`completed`/`failed`/`cancelled` 项目不阻塞，因为其 `bound_directory` 快照已固化。
 
 ## 7. 验收标准

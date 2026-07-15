@@ -1,4 +1,5 @@
 import json
+import hmac
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -13,7 +14,6 @@ from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.database import get_session
 from mac_system.feishu import FeishuBridge
 from mac_system.feishu.handlers import FeishuHandlerContext, handle_card_action, handle_text_message
-from mac_system.feishu.models import ButtonAction, TextMessage
 
 router = APIRouter(prefix="/feishu", tags=["feishu"])
 
@@ -63,18 +63,29 @@ async def feishu_events(
     body_bytes = await request.body()
     body_text = body_bytes.decode("utf-8")
 
-    # Signature verification when app_secret is available
+    # Require either a valid request signature or the legacy verification
+    # token.  Merely omitting the signature must never bypass authentication.
     signature = request.headers.get("X-Lark-Signature", "")
     timestamp = request.headers.get("X-Lark-Timestamp", "")
     nonce = request.headers.get("X-Lark-Nonce", "")
-    if bridge and signature:
-        if not bridge.verify_request(timestamp, nonce, body_bytes, signature):
-            raise HTTPException(status_code=401, detail="INVALID_SIGNATURE")
-
     try:
         payload = json.loads(body_text)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail="INVALID_JSON") from exc
+
+    if bridge:
+        if signature:
+            if not bridge.verify_request(timestamp, nonce, body_bytes, signature):
+                raise HTTPException(status_code=401, detail="INVALID_SIGNATURE")
+        else:
+            supplied_token = payload.get("token") or payload.get("header", {}).get("token")
+            expected_token = bridge.verification_token
+            if (
+                not supplied_token
+                or not expected_token
+                or not hmac.compare_digest(str(supplied_token), str(expected_token))
+            ):
+                raise HTTPException(status_code=401, detail="MISSING_SIGNATURE")
 
     # Decrypt if needed
     if bridge:

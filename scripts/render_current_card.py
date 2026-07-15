@@ -66,7 +66,7 @@ async def main(project_id: str):
             print("=" * 60)
             print(f"TITLE: {kwargs['title']}")
             print(f"SUMMARY:\n{kwargs['summary']}\n")
-            print(f"DETAILS:")
+            print("DETAILS:")
             for k, v in kwargs['details'].items():
                 print(f"  {k}: {v}")
             print(f"OPTIONS: {kwargs['options']}")

@@ -1,6 +1,5 @@
 import json
 import logging
-from datetime import datetime
 from pathlib import Path
 from collections.abc import Awaitable
 from typing import Any, Callable
@@ -786,6 +785,7 @@ class AgentOrchestrator:
             return {
                 "action": recommendation.get("action"),
                 "reason": recommendation.get("reason"),
+                "result": output.get("result"),
                 "summary": output.get("summary"),
                 "acceptance_matrix": output.get("acceptance_matrix", []),
                 "blocking_conditions": output.get("blocking_conditions", []),
@@ -801,8 +801,22 @@ class AgentOrchestrator:
         self, project: Project, evaluation: dict[str, Any] | None
     ) -> dict[str, Any] | None:
         """Return missing requirement AC IDs from the evaluator matrix."""
+        if evaluation is None:
+            return None
+        if (
+            evaluation.get("result") == "fail"
+            or evaluation.get("blocking_conditions")
+            or str(evaluation.get("action", "")).startswith("reject_")
+        ):
+            return {
+                "missing_ids": [],
+                "message": evaluation.get("reason")
+                or evaluation.get("summary")
+                or "验收评估未通过",
+            }
+
         requirements_path = project_mac_dir(project) / "REQUIREMENTS.json"
-        if not requirements_path.exists() or evaluation is None:
+        if not requirements_path.exists():
             return None
         try:
             requirements = json.loads(requirements_path.read_text(encoding="utf-8"))
@@ -820,7 +834,9 @@ class AgentOrchestrator:
         covered_ids = {
             item.get("acceptance_criterion_id")
             for item in evaluation.get("acceptance_matrix", [])
-            if isinstance(item, dict) and item.get("acceptance_criterion_id")
+            if isinstance(item, dict)
+            and item.get("acceptance_criterion_id")
+            and item.get("result") == "pass"
         }
         missing_ids = sorted(required_ids - covered_ids)
         if not missing_ids:
@@ -877,21 +893,25 @@ class AgentOrchestrator:
         # A failing assessment is recorded as a structured FeedbackPacket and
         # routed to REWORK via the state machine's "fail" event.
         if state == "TESTING":
-            if output.get("passed") is False:
+            if output.get("passed") is not True:
                 event = "fail"
                 packet = await self._create_feedback_from_tester_output(project, task, output)
                 feedback_packet_id = packet.id if packet else None
             else:
-                await self._resolve_verified_feedback(output.get("verified_feedback_ids", []), task.id)
+                await self._resolve_verified_feedback(
+                    output.get("verified_feedback_ids", []), task.id, project.id
+                )
         elif state == "REVIEW":
             issues = output.get("issues", [])
             blocking_issue = any(issue.get("blocking") for issue in issues)
-            if blocking_issue:
+            if output.get("result") != "pass" or blocking_issue:
                 event = "fail"
                 packet = await self._create_feedback_from_reviewer_output(project, task, output)
                 feedback_packet_id = packet.id if packet else None
             else:
-                await self._resolve_verified_feedback(output.get("verified_feedback_ids", []), task.id)
+                await self._resolve_verified_feedback(
+                    output.get("verified_feedback_ids", []), task.id, project.id
+                )
 
         # Unified ask_user: when an agent emits a question_batch, create a
         # QuestionInteraction and route to the state's ask_user event.
@@ -1076,6 +1096,7 @@ class AgentOrchestrator:
         self,
         verified_feedback_ids: list[str] | None,
         resolved_by_task_id: str,
+        project_id: str,
     ) -> None:
         """Mark feedback packets resolved when a quality gate verifies the fix."""
         if not verified_feedback_ids:
@@ -1083,7 +1104,9 @@ class AgentOrchestrator:
         for feedback_id in verified_feedback_ids:
             try:
                 await self.project_service.resolve_feedback_packet(
-                    feedback_id, resolved_by_task_id=resolved_by_task_id
+                    feedback_id,
+                    resolved_by_task_id=resolved_by_task_id,
+                    project_id=project_id,
                 )
             except Exception as exc:
                 logger.warning("Failed to resolve feedback packet %s: %s", feedback_id, exc)
@@ -1486,7 +1509,6 @@ class AgentOrchestrator:
 
         if self.feishu_bridge:
             receive_id, receive_id_type = self._resolve_project_recipient(project)
-            creator_open_id = self._get_creator_open_id(project.id)
             project_tag = project.name or project.id
             context_text = self._build_summary_for_state(project, state)
             if not context_text:

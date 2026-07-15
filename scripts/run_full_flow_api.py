@@ -8,7 +8,6 @@ so the Feishu cards are still sent for real but we do not need a second
 """
 import argparse
 import asyncio
-import json
 import sys
 import time
 
@@ -44,6 +43,9 @@ class RequestsAsyncClient:
     def __init__(self, timeout: float = 300.0):
         self.timeout = timeout
         self._session = requests.Session()
+        control_token = os.getenv("CONTROL_API_TOKEN") or os.getenv("ADMIN_TOKEN")
+        if control_token:
+            self._session.headers["Authorization"] = f"Bearer {control_token}"
 
     async def __aenter__(self) -> "RequestsAsyncClient":
         return self

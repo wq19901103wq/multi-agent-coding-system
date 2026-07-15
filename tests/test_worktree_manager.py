@@ -1,9 +1,8 @@
 import json
-from pathlib import Path
 
 import pytest
 
-from mac_system.core.worktree_manager import WorktreeManager
+from mac_system.core.worktree_manager import WorktreeManager, WorktreeManagerError
 
 
 @pytest.fixture
@@ -102,6 +101,37 @@ def test_merge_worktree(manager, tmp_project):
     manager.merge_worktree("proj_test", "task_001", "coder")
 
     assert (tmp_project / "src" / "hello.py").exists()
+
+
+def test_merge_conflict_preserves_user_stash(manager, tmp_project):
+    worktree = manager.create_worktree(
+        project_id="proj_test",
+        task_id="task_conflict",
+        agent_type="coder",
+    )
+    (worktree / "README.md").write_text("agent version\n")
+
+    import subprocess
+
+    subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "agent edit"], cwd=worktree, check=True
+    )
+    (tmp_project / "README.md").write_text("user version\n")
+
+    with pytest.raises(WorktreeManagerError, match="stash preserved"):
+        manager.merge_worktree(
+            "proj_test", "task_conflict", "coder", workspace_path=tmp_project
+        )
+
+    stash_list = subprocess.run(
+        ["git", "stash", "list"],
+        cwd=tmp_project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "pre-merge cleanup" in stash_list
 
 
 def test_remove_worktree(manager, tmp_project):

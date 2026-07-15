@@ -14,7 +14,6 @@ from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.agents.prompts import PromptRenderer
 from mac_system.agents.runtime import FakeRuntime
 from mac_system.config import get_agent_config
-from mac_system.core.lock_manager import ProjectLockManager
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.models import Approval, Project, Task

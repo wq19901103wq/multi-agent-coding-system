@@ -5,8 +5,10 @@ import os
 import re
 import tempfile
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 _STREAM_READER_LIMIT = 16 * 1024 * 1024
@@ -16,8 +18,6 @@ if not logger.handlers:
     _h.setLevel(logging.INFO)
     logger.addHandler(_h)
     logger.setLevel(logging.INFO)
-from typing import Any, Callable
-from collections.abc import Awaitable
 
 
 @dataclass

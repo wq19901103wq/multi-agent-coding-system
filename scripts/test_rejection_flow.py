@@ -122,7 +122,9 @@ async def send_text(project_id: str, text: str, http: httpx.AsyncClient) -> None
 
 
 async def main() -> int:
-    async with httpx.AsyncClient(timeout=300.0) as http:
+    control_token = os.getenv("CONTROL_API_TOKEN") or os.getenv("ADMIN_TOKEN")
+    headers = {"Authorization": f"Bearer {control_token}"} if control_token else {}
+    async with httpx.AsyncClient(timeout=300.0, headers=headers) as http:
         project_id = await create_project(http)
         await tick(project_id, http)
 

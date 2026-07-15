@@ -21,10 +21,15 @@ pip install -e ".[dev]"
 # 2. 配置环境变量
 cp .env.example .env
 # 编辑 .env 填入 LLM 和飞书配置
+# 同时设置 CONTROL_API_TOKEN；如需绑定现有仓库，设置 MAC_ALLOWED_BIND_ROOTS
 
 # 3. 启动服务
 python -m mac_system
 ```
+
+Control API 使用 `Authorization: Bearer <CONTROL_API_TOKEN>`。未配置 token
+时 `/projects` 与 `/test` 接口会拒绝请求；`/bind` 和 API 的
+`bound_directory` 只能指向 `MAC_ALLOWED_BIND_ROOTS` 内的目录。
 
 ## MVP 任务
 

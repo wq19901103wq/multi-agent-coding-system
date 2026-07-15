@@ -31,7 +31,7 @@
   - 质量关通过时按 `verified_feedback_ids` 关闭历史反馈
   - Agent 运行期间收到的自由文本/命令被消费为 `PendingUserInput`，scope_change/correction 会强制质量关进入 `REWORK`
   - 每轮任务记录 `round_number`，旧 approval 在状态重新进入时标记 `expired`
-- **单元测试基线**：**210 passed**。
+- **单元测试基线**：**223 passed**。
 - **真实飞书端到端**：`full_feature_flow` 已干净跑通到 `COMPLETED`（旧四段规划版本，新三段规划需重跑）；`bind_dir_agent` 场景已验证（覆盖 main 之前）。
   - 注意：**同一聊天窗口不要并发跑多个 e2e scenario**，否则 simulator 会把不同项目的 approval 卡片串扰。
 
@@ -95,7 +95,7 @@
    pytest tests/ -q
    ```
 
-   当前基线：**210 passed**（含 full_flow 分支覆盖测试 + session binding + bind_dir agent）。
+   当前基线：**223 passed**（含 full_flow 分支覆盖测试、安全与恢复回归测试）。
 
 2. **真实飞书端到端验证（必须）**
 
@@ -196,19 +196,19 @@ grep -E "Failed to send summary content card|NoneType.*int" server.log
 
 ---
 
-## 已知待修复容错问题（2026-07-12）
+## 容错问题状态（2026-07-15）
 
-### 1. 服务重启中断运行中任务
-重启时 `status == "running"` 的 task 标记为 failed 后不会自动恢复。需要在服务启动时扫描并重试。
+### 1. 服务重启中断运行中任务（已修复）
+启动时会标记 stale running task、重新调度对应项目，并修复终态 status 与缺失的人机审批。
 
-### 2. `fail_max_retries` 状态机事件缺失
-`_execute_agent` 调用 `transition_state(id, "fail_max_retries")`，但所有状态机 JSON 均未定义此事件。
+### 2. `fail_max_retries` 状态机事件缺失（已修复）
+统一 `delivery.json` 的 quality policy 会编译出 `fail_max_retries -> FAILED`。
 
 ### 3. linter 文件写入冲突
 Agent 写入 `.mac/` 文件后 linter 自动修改，导致下次写前校验失败。需在 worktree 层面跳过 linter。
 
-### 4. 自由文本被卡住项目劫持
-active/failed 项目会拦截所有自由文本消息为 pending input，用户无法通过自由文本创建新项目。
+### 4. 自由文本被卡住项目劫持（已修复）
+只有当前状态确有 running Agent task 时才创建 pending input；确认态文本会路由到输入审批或提示显式确认/驳回。
 
 详细分析见 memory: `known-blockers.md`。
 
