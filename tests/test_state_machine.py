@@ -1,6 +1,11 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from mac_system.state_machine import StateMachine
+
+WORKFLOW_PROFILE_DIR = Path(__file__).parent.parent / "workflow_profiles"
 
 
 def test_feature_state_machine_basic():
@@ -101,3 +106,44 @@ def test_unknown_state_raises():
     sm = StateMachine("feature")
     with pytest.raises(ValueError):
         sm.get_state("NOT_A_STATE")
+
+
+def test_all_profiles_are_valid_json():
+    profiles = list(WORKFLOW_PROFILE_DIR.glob("*.json"))
+    assert profiles, "No workflow profiles found"
+    for path in profiles:
+        data = json.loads(path.read_text())
+        assert data.get("task_type") == path.stem, f"task_type mismatch in {path}"
+        assert isinstance(data.get("stages"), list) and data["stages"], f"{path} has no stages"
+
+
+def test_all_profiles_compile_without_errors():
+    for path in WORKFLOW_PROFILE_DIR.glob("*.json"):
+        sm = StateMachine(path.stem)
+        assert sm.task_type == path.stem
+        assert sm.states
+        assert not sm.validate(), f"Profile {path} produced invalid state machine"
+
+
+def test_profile_stages_have_unique_ids_and_required_fields():
+    for path in WORKFLOW_PROFILE_DIR.glob("*.json"):
+        data = json.loads(path.read_text())
+        seen = set()
+        for stage in data["stages"]:
+            for key in ("id", "kind", "agent", "display", "execution_state", "confirmation"):
+                assert key in stage, f"Missing {key} in {path} stage {stage.get('id')}"
+            assert stage["id"] not in seen, f"Duplicate stage id {stage['id']} in {path}"
+            seen.add(stage["id"])
+            confirmation = stage["confirmation"]
+            for key in ("state", "display"):
+                assert key in confirmation, f"Missing confirmation {key} in {path}"
+
+
+def test_profile_rework_and_acceptance_targets_exist():
+    for path in WORKFLOW_PROFILE_DIR.glob("*.json"):
+        data = json.loads(path.read_text())
+        stage_ids = {stage["id"] for stage in data["stages"]}
+        for item in data.get("rework_targets", []):
+            assert item.get("target_stage") in stage_ids, f"Invalid rework target {item} in {path}"
+        for item in data.get("acceptance_targets", []):
+            assert item.get("target_stage") in stage_ids, f"Invalid acceptance target {item} in {path}"

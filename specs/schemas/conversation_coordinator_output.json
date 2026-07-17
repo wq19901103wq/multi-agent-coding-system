@@ -12,7 +12,6 @@
     "needs_clarification",
     "proposed_action"
   ],
-  "additionalProperties": false,
   "properties": {
     "success": {
       "type": "boolean"
@@ -142,7 +141,6 @@
     },
     "proposed_action": {
       "type": "object",
-      "additionalProperties": false,
       "required": ["type"],
       "properties": {
         "type": {

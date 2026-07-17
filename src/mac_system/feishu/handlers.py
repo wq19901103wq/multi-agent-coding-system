@@ -589,44 +589,91 @@ async def _handle_coordinated_free_text(
         except Exception:
             logger.warning("Failed to send Coordinator progress event", exc_info=True)
 
-    try:
-        output = await runner(
-            agent_type="conversation_coordinator",
-            stage=None,
-            input_data={"message": msg.text},
-            extra_variables=extra_variables,
-            worktree=coordinator_worktree,
-            progress_callback=_coordinator_progress,
-        )
-    except Exception:
-        logger.exception("Conversation coordinator crashed")
-        output = None
-    finally:
-        if progress_refresh_task is not None:
-            progress_refresh_task.cancel()
-            await asyncio.gather(progress_refresh_task, return_exceptions=True)
-        logger.info(
-            "Conversation coordinator finished chat=%s message=%s elapsed=%.2fs success=%s",
-            chat_key,
-            msg.message_id,
-            time.monotonic() - coordinator_started,
-            bool(output and output.get("success")),
-        )
+    # Run the coordinator with one automatic retry so transient API errors
+    # do not immediately surface as failures to the user.
+    output: dict[str, Any] | None = None
+    failure_reason = "未返回有效结果"
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            output = await runner(
+                agent_type="conversation_coordinator",
+                stage=None,
+                input_data={"message": msg.text},
+                extra_variables=extra_variables,
+                worktree=coordinator_worktree,
+                progress_callback=_coordinator_progress,
+            )
+            if output and output.get("success"):
+                break
+            if output:
+                failure_reason = output.get("error", "协调器返回失败")
+                logger.warning(
+                    "Conversation coordinator returned success=false chat=%s message=%s attempt=%s output=%s",
+                    chat_key,
+                    msg.message_id,
+                    attempt,
+                    json.dumps(output, ensure_ascii=False),
+                )
+            else:
+                failure_reason = "调用未返回结果"
+            logger.warning(
+                "Conversation coordinator failed chat=%s message=%s attempt=%s reason=%s",
+                chat_key,
+                msg.message_id,
+                attempt,
+                failure_reason,
+            )
+        except Exception as exc:
+            logger.exception("Conversation coordinator crashed")
+            failure_reason = f"协调器异常：{exc}"
+            output = None
+        if attempt < max_attempts and progress_message_id:
+            try:
+                await ctx.bridge.update_card(
+                    progress_message_id,
+                    build_conversation_progress_card(
+                        stage="retrying",
+                        detail=failure_reason,
+                    ),
+                )
+            except Exception:
+                logger.warning("Failed to update retry progress card", exc_info=True)
+    if progress_refresh_task is not None:
+        progress_refresh_task.cancel()
+        await asyncio.gather(progress_refresh_task, return_exceptions=True)
+    coordinator_success = bool(output and output.get("success"))
+    logger.info(
+        "Conversation coordinator finished chat=%s message=%s elapsed=%.2fs success=%s attempts=%s",
+        chat_key,
+        msg.message_id,
+        time.monotonic() - coordinator_started,
+        coordinator_success,
+        attempt,
+    )
     if progress_message_id:
         try:
-            await ctx.bridge.update_card(
-                progress_message_id,
-                build_conversation_progress_card(
-                    stage="completed", detail="调研与分析完成，结果已整理"
-                ),
-            )
+            if coordinator_success:
+                await ctx.bridge.update_card(
+                    progress_message_id,
+                    build_conversation_progress_card(
+                        stage="completed", detail="调研与分析完成，结果已整理"
+                    ),
+                )
+            else:
+                await ctx.bridge.update_card(
+                    progress_message_id,
+                    build_conversation_progress_card(
+                        stage="failed", detail=failure_reason
+                    ),
+                )
         except Exception:
             logger.warning("Failed to advance conversation progress card", exc_info=True)
-    if not output or not output.get("success"):
+    if not coordinator_success:
         if not wants_execution:
             output = {
                 "success": True,
-                "reply": "这次处理没有在时限内完成。你可以重试一次，或把问题拆成更小的一步。",
+                "reply": f"处理失败（{failure_reason}），已自动重试 1 次仍无法完成。请重试一次，或把问题拆成更小的一步。",
                 "intent": "unknown",
                 "effect": "none",
                 "commitment": "ambiguous",
@@ -637,7 +684,7 @@ async def _handle_coordinated_free_text(
         else:
             output = {
                 "success": True,
-                "reply": "协调服务暂时没有返回完整结果。我已按你的原话整理为待确认执行，不会直接修改。",
+                "reply": f"处理失败（{failure_reason}），已自动重试 1 次仍无法完成。我已按你的原话整理为待确认执行，不会直接修改。",
                 "intent": "start_delivery",
                 "effect": "propose",
                 "commitment": "proposed",
@@ -646,7 +693,7 @@ async def _handle_coordinated_free_text(
                 "proposed_action": {
                     "type": "propose_start_delivery",
                     "task_type": "feature",
-                    "description": msg.text,
+                    "description": f"处理失败（{failure_reason}），已自动重试 1 次仍无法完成。原始请求：{msg.text}",
                     "scope": [],
                     "out_of_scope": [],
                     "permissions": ["workspace_write"],

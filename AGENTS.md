@@ -1,6 +1,6 @@
 # AGENTS.md — MAC System 开发纪律
 
-## 项目当前状态（2026-07-17）
+## 项目当前状态（2026-07-18）
 
 ### 仓库
 
@@ -31,8 +31,9 @@
   - 质量关通过时按 `verified_feedback_ids` 关闭历史反馈
   - Agent 运行期间收到的自由文本/命令被消费为 `PendingUserInput`，scope_change/correction 会强制质量关进入 `REWORK`
   - 每轮任务记录 `round_number`，旧 approval 在状态重新进入时标记 `expired`
-- **单元测试基线**：**246 passed**（2026-07-17 复跑确认）。
-- **真实飞书端到端**：`full_feature_flow` 已在最新代码上全分支跑通到 `COMPLETED`（2026-07-17，`proj_20260717_013549_7aed`：需求/Spec 驳回、编码/测试/评审 REWORK 回退、验收回需求全量重放）；`planning_rejection_form` / `architecture_confirmation` / `acceptance_question_card` / `runtime_recovery_card` / `conversation_delivery` 场景均已真实飞书验证；脚本已能自动接管质量 Agent 主动 fail 的 REWORK（真实运行尚未自然触发）。
+- **Profile 系统校验**：新增 `StateMachine.validate()` 与回归测试，确保所有 `workflow_profiles/*.json` 可解析、阶段 ID 唯一、rework/acceptance 目标存在、编译后状态机无悬空跳转。
+- **单元测试基线**：**252 passed**（2026-07-18 复跑确认）。
+- **真实飞书端到端**：`full_feature_flow` 已在最新代码上全分支跑通到 `COMPLETED`（2026-07-18，`proj_20260717_165349_3f0d`：需求/Spec 驳回、编码/测试/评审 REWORK 回退、验收回需求全量重放）；`planning_rejection_form` / `architecture_confirmation` / `acceptance_question_card` / `runtime_recovery_card` / `conversation_delivery` 场景均已真实飞书验证；脚本已能自动接管质量 Agent 主动 fail 的 REWORK。
   - 注意：**同一聊天窗口不要并发跑多个 e2e scenario**，否则 simulator 会把不同项目的 approval 卡片串扰。
 
 ### 已踩坑 & 必须规避
@@ -95,7 +96,7 @@
    pytest tests/ -q
    ```
 
-   当前基线：**246 passed**（含 full_flow 分支覆盖测试、安全与恢复回归测试）。
+   当前基线：**252 passed**（含 full_flow 分支覆盖测试、状态机 profile 校验、安全与恢复回归测试）。
 
 2. **真实飞书端到端验证（必须）**
 
@@ -152,12 +153,10 @@
 
 ```bash
 cd /Users/yihanwang/multi-agent-coding-system
-source .worktrees/feat-core/.venv/bin/activate
-set -a && source .env && set +a
-pip install -e .
-nohup uvicorn mac_system.api.main:app --host 0.0.0.0 --port 18080 > server.log 2>&1 &
-echo $! > uvicorn.pid
+./scripts/start_server.sh
 ```
+
+日志通过 `logging.yaml` 自动追加到 `server.log` 并按 10 MB 轮转（保留 5 个备份），重启不会丢失。
 
 启动后检查：
 
@@ -170,7 +169,7 @@ tail -20 server.log
 ### 2. 停止服务
 
 ```bash
-kill "$(cat uvicorn.pid)"
+./scripts/stop_server.sh
 ```
 
 ### 3. 单元测试
@@ -218,4 +217,5 @@ Agent 写入 `.mac/` 文件后 linter 自动修改，导致下次写前校验失
 - 只做与当前任务相关的最小修改，禁止“顺手重构”。
 - 改完后必须自己验证，不得把验证责任推给用户。
 - 遇到问题先定位根因，禁止只藏表面现象。
+- **严禁过拟合单个 case**：不得因为用户上报了一个具体失败场景，就只为这个场景写硬编码分支或关键词兜底。必须先找到根因，修复后验证同一类问题全部解决，并补能覆盖这一类场景的回归测试。
 - **Reviewer 规则**：Reviewer Agent 发现 blocking issue（安全漏洞、逻辑错误、功能缺失、与 spec/需求不一致）时，必须设 `blocking: true` 且 `result: "fail"`、`next_state_event: "fail"`。非阻塞建议（代码风格、命名、性能优化）可设 `blocking: false` 不阻塞流程。

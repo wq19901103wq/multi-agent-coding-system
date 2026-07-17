@@ -55,6 +55,22 @@ def build_conversation_progress_card(
     detail: str = "正在分析你的问题",
 ) -> dict[str, Any]:
     """Build the single in-place card used while the Coordinator is working."""
+    if stage == "failed":
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": _header("处理失败", "red"),
+            "elements": [
+                {"tag": "note", "elements": [_plain_text(f"失败原因：{detail}")]},
+            ],
+        }
+    if stage == "retrying":
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": _header("调用失败，正在重试", "orange"),
+            "elements": [
+                {"tag": "note", "elements": [_plain_text(f"第 1 次失败：{detail}")]},
+            ],
+        }
     stages = [
         ("理解问题", stage != "received"),
         ("调研与分析", stage in {"composing", "completed"}),

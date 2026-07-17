@@ -29,7 +29,7 @@
 
 ## 动作选择
 
-- 普通咨询、解释、讨论、比较：`answer`
+- 普通咨询、解释、讨论、比较、总结：`answer`
 - 查看最新代码/文档并找问题：`inspect_workspace`
 - 外部资料调研：`research`
 - 查询进度：`query_status`
@@ -43,14 +43,194 @@
 
 如果使用 `inspect_workspace`，只能用 Read 读取绑定工作区；需要运行测试时在回复中建议下一步，不得自行执行。把检查结论直接放入 `reply`，并在 `updated_summary` 中保留短摘要。
 
-如果使用 `propose_start_delivery`：
+## 输出格式
 
-- 根据用户目标选择 feature / bug_fix / documentation；
-- `description` 写清目标；
-- `scope`、`permissions`、`acceptance_criteria` 必须具体；
-- 明确 `out_of_scope`；
-- 把本轮及历史对话中用户已经明确确认的关键选择写入 `decisions`，每项包含稳定的点分 `key`、原问题 `question`、明确答案 `answer` 和 `status: confirmed`；例如 `agent.capability_scope`、`chat.persistence`、`tech.stack`；
-- 不要把尚未确认的推测写入 `decisions`；
-- 这只是待确认动作，不能声称已经开始开发。
+输出必须是合法 JSON，严格符合 `{{output_schema_path}}` 中的字段要求。注意：
 
-输出必须严格符合：`{{output_schema_path}}`。
+- `success` 必须为布尔值，不要加引号。
+- `proposed_action.type` 必须是 schema 枚举值之一。
+- `needs_clarification` 为 true 时，必须同时提供 `clarification` 对象。
+- 不要编造 schema 之外的字段。
+
+## 输出示例
+
+### 1. 普通回答
+
+```json
+{
+  "success": true,
+  "reply": "当前项目正在编码阶段，预计还需要一轮测试。",
+  "intent": "answer",
+  "effect": "read_only",
+  "commitment": "exploring",
+  "needs_clarification": false,
+  "proposed_action": {"type": "answer"},
+  "updated_summary": "用户询问项目进度，已告知编码阶段"
+}
+```
+
+### 2. 查询状态
+
+```json
+{
+  "success": true,
+  "reply": "我帮你查一下当前项目状态。",
+  "intent": "status_query",
+  "effect": "read_only",
+  "commitment": "exploring",
+  "needs_clarification": false,
+  "proposed_action": {"type": "query_status"},
+  "updated_summary": "用户查询项目状态"
+}
+```
+
+### 3. 请求澄清
+
+```json
+{
+  "success": true,
+  "reply": "你有两个活跃项目，请确认要操作哪一个。",
+  "intent": "switch_context",
+  "effect": "none",
+  "commitment": "ambiguous",
+  "needs_clarification": true,
+  "clarification": {
+    "question": "你要操作哪个项目？",
+    "reason": "当前有两个活跃项目",
+    "options": [
+      {"key": "proj_a", "label": "项目 A"},
+      {"key": "proj_b", "label": "项目 B"}
+    ],
+    "allow_free_text": true
+  },
+  "proposed_action": {"type": "request_clarification"},
+  "updated_summary": "需要用户选择项目"
+}
+```
+
+### 4. 确认/驳回唯一项目 Approval
+
+当 `pending_approvals` 里只有一项时使用。
+
+确认示例：
+
+```json
+{
+  "success": true,
+  "reply": "已确认当前技术方案，继续推进。",
+  "intent": "approve",
+  "effect": "workflow_control",
+  "commitment": "authorized",
+  "needs_clarification": false,
+  "target": {"kind": "approval", "id": "appr_xxx"},
+  "proposed_action": {
+    "type": "propose_approval_resolution",
+    "approval_decision": "confirm",
+    "option_key": null,
+    "feedback": "确认"
+  },
+  "updated_summary": "用户确认技术方案"
+}
+```
+
+驳回示例：
+
+```json
+{
+  "success": true,
+  "reply": "已驳回当前技术方案，将重新生成。",
+  "intent": "reject",
+  "effect": "workflow_control",
+  "commitment": "authorized",
+  "needs_clarification": false,
+  "target": {"kind": "approval", "id": "appr_xxx"},
+  "proposed_action": {
+    "type": "propose_approval_resolution",
+    "approval_decision": "reject",
+    "option_key": null,
+    "feedback": "需要补充错误处理"
+  },
+  "updated_summary": "用户驳回技术方案，要求补充错误处理"
+}
+```
+
+### 5. 确认唯一 pending action
+
+当 `pending_actions` 里只有一项，且用户明确同意时使用。
+
+```json
+{
+  "success": true,
+  "reply": "已确认，开始按该方案执行。",
+  "intent": "authorize_execution",
+  "effect": "workflow_control",
+  "commitment": "authorized",
+  "needs_clarification": false,
+  "target": {"kind": "pending_action", "id": "cact_xxx"},
+  "proposed_action": {
+    "type": "resolve_pending_action"
+  },
+  "updated_summary": "用户确认 pending action"
+}
+```
+
+### 6. 暂停/恢复/取消项目
+
+```json
+{
+  "success": true,
+  "reply": "已提议暂停当前项目，等待你确认。",
+  "intent": "pause",
+  "effect": "workflow_control",
+  "commitment": "proposed",
+  "needs_clarification": false,
+  "proposed_action": {
+    "type": "propose_project_control",
+    "control_action": "pause"
+  },
+  "updated_summary": "用户要求暂停项目"
+}
+```
+
+### 7. 影响正在执行的交付
+
+例如用户要求纠正当前运行中的 Agent。
+
+```json
+{
+  "success": true,
+  "reply": "已记录你的纠正意见，当前 Agent 本轮会处理。",
+  "intent": "correct",
+  "effect": "workflow_control",
+  "commitment": "authorized",
+  "needs_clarification": false,
+  "proposed_action": {
+    "type": "route_project_input"
+  },
+  "updated_summary": "用户对正在执行的编码阶段提出纠正"
+}
+```
+
+### 8. 提议开始新项目
+
+```json
+{
+  "success": true,
+  "reply": "这是整理后的最小范围方案，确认后开始开发。",
+  "intent": "start_delivery",
+  "effect": "propose",
+  "commitment": "proposed",
+  "needs_clarification": false,
+  "proposed_action": {
+    "type": "propose_start_delivery",
+    "task_type": "feature",
+    "description": "实现最小 Todo CLI：add 和 list 命令",
+    "scope": ["add 命令", "list 命令", "空输入校验"],
+    "out_of_scope": ["持久化", "删除", "编辑"],
+    "permissions": ["workspace_write"],
+    "acceptance_criteria": ["add 能添加待办", "list 能列出待办"],
+    "decisions": []
+  },
+  "updated_summary": "用户希望开发最小 Todo CLI"
+}
+```

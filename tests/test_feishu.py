@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import json
+from typing import Any
 
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -1420,6 +1423,23 @@ class _FakeOrchestratorWithBindDir:
         return state
 
 
+class _FakeOrchestratorWithRetry(_FakeOrchestratorWithBindDir):
+    """Fake orchestrator that fails a configurable number of times before succeeding."""
+
+    def __init__(self, outputs: list[dict[str, Any] | Exception]):
+        super().__init__()
+        self._outputs = outputs
+        self._index = 0
+
+    async def run_chat_scoped_agent(self, *args, **kwargs):
+        self.agent_calls.append({"args": args, "kwargs": kwargs})
+        out = self._outputs[self._index]
+        self._index = min(self._index + 1, len(self._outputs) - 1)
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+
 async def test_conversation_coordinator_answers_without_creating_project(feishu_ctx):
     from mac_system.feishu.handlers import handle_text_message
     from mac_system.models import Project
@@ -1739,6 +1759,99 @@ async def test_failed_coordinator_degrades_execution_to_safe_confirmation(feishu
     pending = feishu_ctx.service.session.exec(select(PendingConversationAction)).one()
     assert pending.status == "pending"
     assert any("conversation_action" in str(item[2]) for item in feishu_ctx.bridge.sent)
+
+    # The fallback reply must contain the real failure reason, not the legacy
+    # misleading timeout wording.
+    final_card_text = str(feishu_ctx.bridge.sent[-1][2])
+    assert "No result event received before timeout" in final_card_text
+    assert "时限" not in final_card_text
+    assert "结果已整理" not in final_card_text
+
+    # The progress card should reflect the failure, not completion.
+    failed_update = feishu_ctx.bridge.updated[-1][1]
+    assert failed_update["header"]["title"]["content"] == "处理失败"
+    assert "No result event received before timeout" in str(failed_update)
+
+
+async def test_failed_coordinator_shows_real_reason_no_fake_timeout(feishu_ctx):
+    """When the coordinator fails, the user sees the real reason, not 'timeout'."""
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import Project
+
+    feishu_ctx.chat_id = "oc_real_reason"
+    feishu_ctx.chat_type = "group"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": False,
+        "error": "upstream socket closed",
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_real_reason",
+            text="取消这个项目",
+            is_command=False,
+            is_at_bot=True,
+            chat_id="oc_real_reason",
+            chat_type="group",
+        ),
+    )
+
+    assert feishu_ctx.service.session.exec(select(Project)).all() == []
+    assert len(feishu_ctx.orchestrator.agent_calls) == 2  # original + one retry
+    final_card_text = str(feishu_ctx.bridge.sent[-1][2])
+    assert "upstream socket closed" in final_card_text
+    assert "已自动重试 1 次仍无法完成" in final_card_text
+    assert "时限" not in final_card_text
+    assert "结果已整理" not in final_card_text
+
+
+async def test_coordinator_retries_once_then_succeeds(feishu_ctx):
+    """A transient failure is retried once; success on the second attempt wins."""
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import Project
+
+    feishu_ctx.chat_id = "oc_retry_then_ok"
+    feishu_ctx.chat_type = "group"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithRetry([
+        {"success": False, "error": "socket reset"},
+        {
+            "success": True,
+            "reply": "已帮你取消",
+            "intent": "cancel_project",
+            "effect": "cancel",
+            "commitment": "committed",
+            "needs_clarification": False,
+            "updated_summary": "用户取消项目",
+            "proposed_action": {"type": "cancel_project"},
+        },
+    ])
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_retry_then_ok",
+            text="取消这个项目",
+            is_command=False,
+            is_at_bot=True,
+            chat_id="oc_retry_then_ok",
+            chat_type="group",
+        ),
+    )
+
+    assert len(feishu_ctx.orchestrator.agent_calls) == 2
+    assert feishu_ctx.service.session.exec(select(Project)).all() == []
+    final_card_text = str(feishu_ctx.bridge.sent[-1][2])
+    assert "已帮你取消" in final_card_text
+
+    # Progress card should have shown retrying then completed.
+    updated_headers = [
+        u[1]["header"]["title"]["content"] for u in feishu_ctx.bridge.updated
+    ]
+    assert "调用失败，正在重试" in updated_headers
+    assert "处理完成" in updated_headers
 
 
 async def test_bind_no_args_uses_agent_candidates_when_available(

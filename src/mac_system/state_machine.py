@@ -194,6 +194,25 @@ class StateMachine:
     def states(self) -> dict[str, Any]:
         return self._states
 
+    def validate(self) -> list[str]:
+        """Return a list of consistency errors in the compiled state machine.
+
+        Profiles are declarative and easy to break by typo.  This catches
+        unresolved state references after compilation so tests can reject
+        broken profiles early.
+        """
+        errors: list[str] = []
+        for name, state in self._states.items():
+            for event, target in state.get("next_states", {}).items():
+                if target == "<previous_state>":
+                    continue
+                resolved = self._resolve_alias(target)
+                if resolved not in self._states:
+                    errors.append(
+                        f"State {name!r} event {event!r} targets unknown state {target!r}"
+                    )
+        return errors
+
     def _resolve_alias(self, name: str) -> str:
         """Map a legacy state name to its current name, if renamed."""
         return _STATE_ALIASES.get(name, name)
