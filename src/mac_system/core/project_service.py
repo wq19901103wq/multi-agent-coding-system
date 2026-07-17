@@ -1623,6 +1623,7 @@ class ProjectService:
                         break
             question = Question(
                 id=generate_id("q"), interaction_id=interaction_id, question_id=qid,
+                decision_key=q.get("decision_key"),
                 kind=q.get("kind", "blocking"), question=q.get("question", ""),
                 reason=q.get("reason", ""), allow_free_text=q.get("allow_free_text", False),
                 options=options, multiple=q.get("multiple", False),
@@ -1687,12 +1688,71 @@ class ProjectService:
                 return False
         return True
 
+    def _sync_answered_questions_to_confirmed_brief(
+        self, interaction: QuestionInteraction
+    ) -> None:
+        """Merge answered/skipped questions from an interaction into confirmed_brief.
+
+        This makes subsequent planner runs treat ask_user answers as authoritative
+        confirmed decisions, so the same questions are not asked again.
+        """
+        project = self.session.get(Project, interaction.project_id)
+        if project is None:
+            return
+        questions = self.get_questions_for_interaction(interaction.id)
+        if not questions:
+            return
+
+        ctx = dict(project.context) if isinstance(project.context, dict) else {}
+        brief = ctx.get("confirmed_brief")
+        brief = dict(brief) if isinstance(brief, dict) else {}
+        decisions = list(brief.get("decisions", []))
+        existing_keys = {
+            str(d.get("key") or "").strip().lower()
+            for d in decisions
+            if isinstance(d, dict)
+        }
+
+        updated = False
+        for q in questions:
+            if q.status not in ("answered", "skipped"):
+                continue
+            key = (q.decision_key or q.question_id or "").strip().lower()
+            if not key or key in existing_keys:
+                continue
+            qa = self.get_question_answer(q.id)
+            if q.status == "skipped":
+                answer = q.default_assumption or "(跳过)"
+            else:
+                answer = (qa.answer_label or qa.answer or "") if qa else ""
+            if not answer:
+                continue
+            decisions.append({
+                "key": key,
+                "question_id": q.question_id,
+                "question": q.question,
+                "answer": answer,
+                "status": "confirmed",
+                "source": "ask_user",
+                "stage": interaction.stage,
+                "round": interaction.origin_round,
+            })
+            existing_keys.add(key)
+            updated = True
+
+        if updated:
+            brief["decisions"] = decisions
+            ctx["confirmed_brief"] = brief
+            project.context = ctx
+            self.session.add(project)
+
     async def resolve_question_interaction(self, interaction_id, commit=True) -> QuestionInteraction | None:
         interaction = self.session.get(QuestionInteraction, interaction_id)
         if interaction is None:
             return None
         interaction.status = "answered"
         interaction.answered_at = _now()
+        self._sync_answered_questions_to_confirmed_brief(interaction)
         if commit:
             self.session.commit()
         return interaction

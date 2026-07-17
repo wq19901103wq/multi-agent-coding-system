@@ -1692,3 +1692,113 @@ async def test_auxiliary_agent_crash_fails_task(orchestrator, tmp_path):
     ).all()
     assert len(tasks) == 1
     assert tasks[0].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_unresolved_requirement_ambiguities_force_ask_user(orchestrator, tmp_path):
+    """A REQUIREMENTS.json with ambiguities must not reach confirmation."""
+    service, wm, renderer = orchestrator
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer)
+    project = await service.create_project(
+        name="ambi-req", task_type="feature", description="test"
+    )
+    worktree = tmp_path / "worktree"
+    mac = worktree / ".mac"
+    mac.mkdir(parents=True)
+    (mac / "REQUIREMENTS.json").write_text(
+        json.dumps({
+            "summary": "test",
+            "ambiguities": [
+                {"question": "支持哪些客户端？", "impact": "决定技术栈"},
+                {"question": "是否需要单点登录？", "default_assumption": "不需要"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    output = {"next_state_event": "complete"}
+    result = oc._block_on_unresolved_ambiguities(
+        project, "PLANNING_REQUIREMENTS", worktree, output
+    )
+    assert result == "ask_user"
+    assert output["next_state_event"] == "ask_user"
+    batch = output["question_batch"]
+    assert len(batch["questions"]) == 2
+    assert batch["questions"][0]["decision_key"] == "artifact.ambiguity_0"
+    assert batch["questions"][0]["allow_free_text"] is True
+
+
+@pytest.mark.asyncio
+async def test_unresolved_architecture_open_questions_force_ask_user(orchestrator, tmp_path):
+    """An ARCHITECTURE.json with open_questions must not reach confirmation."""
+    service, wm, renderer = orchestrator
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer)
+    project = await service.create_project(
+        name="ambi-arch", task_type="feature", description="test"
+    )
+    worktree = tmp_path / "worktree"
+    mac = worktree / ".mac"
+    mac.mkdir(parents=True)
+    (mac / "ARCHITECTURE.json").write_text(
+        json.dumps({
+            "summary": "test",
+            "open_questions": ["数据库选 SQLite 还是 PostgreSQL？"],
+        }),
+        encoding="utf-8",
+    )
+    output = {"next_state_event": "complete"}
+    result = oc._block_on_unresolved_ambiguities(
+        project, "PLANNING_ARCHITECTURE", worktree, output
+    )
+    assert result == "ask_user"
+    assert output["question_batch"]["questions"][0]["question"].startswith("数据库选")
+
+
+@pytest.mark.asyncio
+async def test_no_ambiguities_allows_complete(orchestrator, tmp_path):
+    """A clean artifact should not trigger ask_user."""
+    service, wm, renderer = orchestrator
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer)
+    project = await service.create_project(
+        name="clean", task_type="feature", description="test"
+    )
+    worktree = tmp_path / "worktree"
+    mac = worktree / ".mac"
+    mac.mkdir(parents=True)
+    (mac / "REQUIREMENTS.json").write_text(
+        json.dumps({"summary": "test", "ambiguities": []}),
+        encoding="utf-8",
+    )
+    output = {"next_state_event": "complete"}
+    result = oc._block_on_unresolved_ambiguities(
+        project, "PLANNING_REQUIREMENTS", worktree, output
+    )
+    assert result is None
+    assert "question_batch" not in output
+
+
+@pytest.mark.asyncio
+async def test_filter_confirmed_questions_falls_back_to_question_id(orchestrator):
+    """Questions should be suppressed by either decision_key or question_id."""
+    service, wm, renderer = orchestrator
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer)
+    project = await service.create_project(
+        name="filter-qid", task_type="feature", description="test",
+        initial_context={
+            "confirmed_brief": {
+                "decisions": [
+                    {"key": "q1", "answer": "A", "status": "confirmed"},
+                ]
+            }
+        },
+    )
+    batch = {
+        "batch_key": "b1",
+        "questions": [
+            {"question_id": "q1", "decision_key": "", "question": "Q1"},
+            {"question_id": "q2", "decision_key": "", "question": "Q2"},
+        ],
+    }
+    filtered, suppressed = oc._filter_confirmed_questions(project, batch)
+    assert len(filtered["questions"]) == 1
+    assert filtered["questions"][0]["question_id"] == "q2"
+    assert len(suppressed) == 1

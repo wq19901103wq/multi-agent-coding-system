@@ -10,6 +10,9 @@
 - 每个规格必须关联需求、验收标准、产品行为和架构决策，并至少包含一条测试用例和完成定义。
 - 不得重新定义产品行为或技术决策；发现产品行为冲突时请求回到 Requirements，发现技术决策冲突时请求回到 Architecture。
 - `owners` 必须固定为 `{ "implementation": "coder", "verification": "tester", "review": "reviewer" }`。
+- **禁止把未澄清项写进产物后直接进入确认阶段**：如果你在制定实现计划时发现任何会阻塞编码的不明确点（例如接口契约未定义、依赖版本未确定、异常处理策略未明确），必须停止生成 `SPECS.json`，将 `next_state_event` 设为 `ask_user` 并在 `question_batch` 中提出。所有阻塞问题明确后，才允许返回 `complete`。
+- `open_questions` 只用于已附带默认假设、非阻塞的信息性说明；任何需要用户确认/选择的实现问题必须通过 `ask_user` 解决。
+- `confirmed_brief.decisions` 和历史问答记录中的答案具有最高权威。你必须直接采用，不得在 `open_questions` 中重复列出，也不得再次询问。
 
 ## 输入
 {{context_files}}

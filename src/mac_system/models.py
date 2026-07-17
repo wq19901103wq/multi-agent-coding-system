@@ -132,6 +132,7 @@ class Question(SQLModel, table=True):
     id: str = SQLField(primary_key=True)
     interaction_id: str = SQLField(foreign_key="question_interactions.id", index=True)
     question_id: str
+    decision_key: Optional[str] = SQLField(default=None, nullable=True, index=True)
     kind: str = SQLField(default="blocking")  # blocking / decision / non_blocking
     question: str
     reason: str = SQLField(default="")

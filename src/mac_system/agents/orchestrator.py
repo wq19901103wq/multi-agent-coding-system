@@ -933,6 +933,13 @@ class AgentOrchestrator:
                     output.get("verified_feedback_ids", []), task.id, project.id
                 )
 
+        # Planning-stage guard: an artifact with unresolved ambiguities/open
+        # questions must not reach confirmation. Synthesize a question_batch and
+        # route to the stage's ask_user event instead.
+        ambiguity_event = self._block_on_unresolved_ambiguities(project, state, worktree, output)
+        if ambiguity_event:
+            event = ambiguity_event
+
         # Unified ask_user: when an agent emits a question_batch, create a
         # QuestionInteraction and route to the state's ask_user event.
         question_batch = output.get("question_batch")
@@ -1172,13 +1179,17 @@ class AgentOrchestrator:
             if not isinstance(question, dict):
                 retained.append(question)
                 continue
-            key = str(question.get("decision_key") or "").strip().lower()
-            decision = confirmed.get(key)
+            keys = {
+                str(question.get("decision_key") or "").strip().lower(),
+                str(question.get("question_id") or "").strip().lower(),
+            }
+            keys.discard("")
+            decision = next((confirmed[k] for k in keys if k in confirmed), None)
             if not decision:
                 retained.append(question)
                 continue
             suppressed.append({
-                "decision_key": key,
+                "decision_key": next((k for k in keys if k in confirmed), ""),
                 "question": str(question.get("question") or ""),
                 "confirmed_answer": str(decision.get("answer") or ""),
             })
@@ -1186,6 +1197,106 @@ class AgentOrchestrator:
         filtered = dict(question_batch)
         filtered["questions"] = retained
         return filtered, suppressed
+
+    def _extract_unresolved_ambiguities(
+        self, artifact: dict[str, Any], state: str
+    ) -> list[dict[str, Any]]:
+        """Return unresolved ambiguities/open_questions from a planning artifact.
+
+        Requirements use ``ambiguities`` (objects with ``question``).
+        Architecture/specs use ``open_questions`` (plain strings).
+        """
+        questions: list[dict[str, Any]] = []
+        if state == "PLANNING_REQUIREMENTS":
+            for idx, item in enumerate(artifact.get("ambiguities") or []):
+                if not isinstance(item, dict):
+                    continue
+                question = str(item.get("question") or "").strip()
+                if not question:
+                    continue
+                questions.append({
+                    "question": question,
+                    "impact": str(item.get("impact") or "").strip(),
+                    "default_assumption": item.get("default_assumption"),
+                    "id_suffix": f"ambiguity_{idx}",
+                })
+        elif state in ("PLANNING_ARCHITECTURE", "PLANNING_IMPLEMENTATION_SPECS"):
+            for idx, item in enumerate(artifact.get("open_questions") or []):
+                question = str(item or "").strip()
+                if not question:
+                    continue
+                questions.append({
+                    "question": question,
+                    "impact": "",
+                    "default_assumption": None,
+                    "id_suffix": f"open_question_{idx}",
+                })
+        return questions
+
+    def _synthesize_question_batch_from_ambiguities(
+        self, project: Project, state: str, ambiguities: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Build a question_batch from unresolved artifact ambiguities."""
+        stage = state.lower().replace("planning_", "")
+        batch_key = f"{stage}_artifact_clarify_r{project.context.get('round_number', 1)}"
+        questions: list[dict[str, Any]] = []
+        for idx, item in enumerate(ambiguities):
+            suffix = item.get("id_suffix") or f"q_{idx}"
+            default_assumption = item.get("default_assumption")
+            question_text = item["question"]
+            if default_assumption:
+                question_text += (
+                    f"\n\n（当前默认假设：{default_assumption}，"
+                    "如果同意可回复「确认」，否则请说明你的选择。）"
+                )
+            questions.append({
+                "question_id": f"q_{suffix}",
+                "decision_key": f"artifact.{suffix}",
+                "kind": "blocking",
+                "question": question_text,
+                "reason": item.get("impact") or "产物中存在未澄清项，必须明确后才能进入确认阶段",
+                "allow_free_text": True,
+                "options": [],
+                "affected_trace_ids": [],
+                "default_assumption": default_assumption,
+            })
+        return {"batch_key": batch_key, "questions": questions}
+
+    def _block_on_unresolved_ambiguities(
+        self,
+        project: Project,
+        state: str,
+        worktree: Path,
+        output: dict[str, Any],
+    ) -> str | None:
+        """If a planning artifact contains unresolved ambiguities, force ask_user.
+
+        Returns ``ask_user`` if ambiguities were found and a question_batch was
+        synthesized, otherwise None.
+        """
+        if state not in _PLANNER_ARTIFACTS:
+            return None
+        if output.get("next_state_event") not in (None, "complete"):
+            return None
+        filename, _ = _PLANNER_ARTIFACTS[state]
+        artifact_path = worktree / ".mac" / filename
+        if not artifact_path.exists():
+            return None
+        try:
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        ambiguities = self._extract_unresolved_ambiguities(artifact, state)
+        if not ambiguities:
+            return None
+        batch = self._synthesize_question_batch_from_ambiguities(project, state, ambiguities)
+        output["next_state_event"] = "ask_user"
+        output["question_batch"] = batch
+        logger.info(
+            "Forcing ask_user for %s unresolved ambiguities in %s (%s)",
+            len(ambiguities), project.id, state,
+        )
+        return "ask_user"
 
     async def _resolve_verified_feedback(
         self,

@@ -649,6 +649,35 @@ async def test_submit_answer_and_resolvable(service):
     assert resolved.status == "answered"
 
 
+async def test_resolve_question_interaction_syncs_answers_to_confirmed_brief(service):
+    project = await service.create_project(
+        name="qi-brief", task_type="feature", description="Test",
+        initial_context={"confirmed_brief": {"decisions": []}},
+    )
+    interaction = await service.create_question_interaction(
+        project_id=project.id, origin_task_id=None, origin_round=1,
+        resume_state="PLANNING_REQUIREMENTS", agent="planner", stage="requirements",
+        batch_key="b1",
+        questions=[
+            {"question_id": "q1", "decision_key": "requirements.scope", "kind": "blocking",
+             "question": " scope?", "options": [], "allow_free_text": True,
+             "affected_trace_ids": []},
+        ],
+    )
+    questions = service.get_questions_for_interaction(interaction.id)
+    await service.submit_question_answer(
+        questions[0].id, "web only", "仅 Web 端", False, "ou_user"
+    )
+    await service.resolve_question_interaction(interaction.id)
+
+    updated = service.get_project(project.id)
+    brief = updated.context["confirmed_brief"]
+    assert len(brief["decisions"]) == 1
+    assert brief["decisions"][0]["key"] == "requirements.scope"
+    assert brief["decisions"][0]["answer"] == "仅 Web 端"
+    assert brief["decisions"][0]["status"] == "confirmed"
+
+
 async def test_skip_blocking_is_resolvable(service):
     project = await service.create_project(name="qi-s", task_type="feature", description="Test")
     interaction = await service.create_question_interaction(
