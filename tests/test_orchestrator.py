@@ -208,7 +208,8 @@ async def test_tool_progress_uses_project_labeled_content_card(
 
     assert bridge.cards[0]["title"] == "[目录绑定项目] 编码 Agent · 正在执行"
     assert bridge.cards[0]["color"] == "purple"
-    assert "Read" in bridge.cards[0]["content"]
+    assert "读取文件" in bridge.cards[0]["content"]
+    assert "a.py" in bridge.cards[0]["content"]
 
 
 @pytest.mark.asyncio

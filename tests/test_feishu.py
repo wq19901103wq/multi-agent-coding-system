@@ -1512,7 +1512,11 @@ async def test_conversation_coordinator_updates_progress_to_markdown_card(feishu
     assert [item[0] for item in feishu_ctx.bridge.sent] == ["interactive", "interactive"]
     assert "处理完成" in str(feishu_ctx.bridge.updated[-1][1])
     assert "调研结论" in str(feishu_ctx.bridge.sent[-1][2])
-    assert "lark_md" in str(feishu_ctx.bridge.sent[-1][2])
+    assert feishu_ctx.bridge.sent[-1][2].get("schema") == "2.0"
+    assert any(
+        el.get("tag") == "markdown" and "调研结论" in (el.get("content") or "")
+        for el in feishu_ctx.bridge.sent[-1][2].get("body", {}).get("elements", [])
+    )
 
 
 async def test_conversation_clarification_uses_choice_card_and_resumes(feishu_ctx):

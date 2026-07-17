@@ -14,6 +14,10 @@ from mac_system.core.lock_manager import ProjectLockManager, get_default_lock_ma
 from mac_system.core.project_service import ProjectService
 from mac_system.core.project_paths import project_mac_dir
 from mac_system.core.worktree_manager import WorktreeManager
+from mac_system.utils.formatting import (
+    format_tool_preview,
+    split_markdown_sections,
+)
 from mac_system.models import Approval, FeedbackPacket, Project, Task
 from mac_system.state_machine import StateMachine
 
@@ -57,60 +61,6 @@ def _flatten_item(item: Any) -> str:
     if isinstance(item, list):
         return ", ".join(str(i) for i in item)
     return str(item)
-
-
-def _split_markdown_sections(text: str | None, max_chars: int = 1600) -> list[str]:
-    """Split Markdown text into readable chunks at section boundaries.
-
-    Tries to keep sections together; only splits a section if it alone exceeds
-    ``max_chars``.  Returns at least one chunk.
-    """
-    if not text:
-        return ["（暂无详细汇报内容）"]
-    if len(text) <= max_chars:
-        return [text]
-
-    # Split on lines that look like section headers (**title** or ## title).
-    import re
-    header_pattern = re.compile(r"^(\*\*[^*]+\*\*|#{1,6}\s+.+)$", re.MULTILINE)
-    sections: list[str] = []
-    last = 0
-    for m in header_pattern.finditer(text):
-        if m.start() > last:
-            sections.append(text[last:m.start()].strip())
-        last = m.start()
-    if last < len(text):
-        sections.append(text[last:].strip())
-
-    # Drop empty leading chunk if the text started with a header.
-    sections = [s for s in sections if s]
-
-    chunks: list[str] = []
-    current = ""
-    for section in sections:
-        if len(section) > max_chars:
-            # Flush current first.
-            if current:
-                chunks.append(current)
-                current = ""
-            # Hard-split oversized section by paragraphs.
-            paragraphs = [p for p in section.split("\n\n") if p.strip()]
-            for para in paragraphs:
-                if len(current) + len(para) + 2 > max_chars:
-                    if current:
-                        chunks.append(current)
-                    current = para
-                else:
-                    current = f"{current}\n\n{para}".strip() if current else para
-        else:
-            if current and len(current) + len(section) + 2 > max_chars:
-                chunks.append(current)
-                current = section
-            else:
-                current = f"{current}\n\n{section}".strip() if current else section
-    if current:
-        chunks.append(current)
-    return chunks if chunks else [text]
 
 
 def _mention_prefix(open_id: str | None) -> str:
@@ -1609,7 +1559,7 @@ class AgentOrchestrator:
 
         # Always send a separate report card first, then the action card.
         # This separates "本轮汇报" from "状态流转/确认".
-        chunks = _split_markdown_sections(summary_text, max_chars=1600)
+        chunks = split_markdown_sections(summary_text, max_chars=1600)
         total = len(chunks)
         for idx, chunk in enumerate(chunks, start=1):
             try:
@@ -1721,7 +1671,7 @@ class AgentOrchestrator:
             is_long_context = len(context_text) > INPUT_CONTEXT_LIMIT
 
             if is_long_context:
-                chunks = _split_markdown_sections(context_text, max_chars=1600)
+                chunks = split_markdown_sections(context_text, max_chars=1600)
                 total = len(chunks)
                 for idx, chunk in enumerate(chunks, start=1):
                     try:
@@ -2673,11 +2623,11 @@ class AgentOrchestrator:
                     data = json.loads(content)
                     name = data.get("name", "?")
                     inp = data.get("input", {})
-                    preview = json.dumps(inp, ensure_ascii=False)[:200]
+                    preview = format_tool_preview(name, inp)
                     await self.feishu_bridge.send_content_card(
                         open_id=receive_id,
                         title=f"[{project_tag}] {agent_display} · 正在执行",
-                        content=f"⚙️ **{name}**: {preview}",
+                        content=f"⚙️ {preview}",
                         color="purple",
                         receive_id_type=receive_id_type,
                     )

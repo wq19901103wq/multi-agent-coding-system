@@ -1,5 +1,7 @@
 from typing import Any
 
+from mac_system.utils.formatting import format_card_markdown
+
 
 def _plain_text(content: str) -> dict[str, Any]:
     return {"tag": "plain_text", "content": content}
@@ -23,10 +25,11 @@ def build_content_card(
     total: int = 1,
     color: str = "blue",
 ) -> dict[str, Any]:
-    """Build a plain display card for streaming long markdown content.
+    """Build a Card 2.0 display card for long markdown content.
 
-    Use this for multi-card content streams: each card shows one chunk of
-    markdown, and the caller sends the action buttons on the final card.
+    Uses the Feishu ``markdown`` element (full CommonMark support) instead of
+    the limited ``lark_md`` text element, and normalizes the Markdown so
+    headings/lists render correctly.
     """
     # Defensive coercion: callers may accidentally pass None for page/total.
     if not isinstance(page, int):
@@ -34,18 +37,19 @@ def build_content_card(
     if not isinstance(total, int):
         total = 1
     header_title = title if total <= 1 else f"{title}（{page}/{total}）"
-    elements: list[dict[str, Any]] = [
-        {"tag": "div", "text": _lark_md(content)},
+    body_elements: list[dict[str, Any]] = [
+        {"tag": "markdown", "content": format_card_markdown(content)},
     ]
     if total > 1:
-        elements.append({
+        body_elements.append({
             "tag": "note",
             "elements": [_plain_text(f"第 {page}/{total} 页")],
         })
     return {
+        "schema": "2.0",
         "config": {"wide_screen_mode": True},
         "header": _header(header_title, color),
-        "elements": elements,
+        "body": {"elements": body_elements},
     }
 
 

@@ -6,6 +6,9 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from mac_system.config import get_settings
 
+# Import models so SQLModel.metadata is populated for migrations and create_all.
+import mac_system.models  # noqa: F401
+
 _settings = get_settings()
 _is_sqlite = _settings.database_url.startswith("sqlite")
 _engine = create_engine(

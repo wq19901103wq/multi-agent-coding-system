@@ -34,6 +34,7 @@ from mac_system.feishu.card import (
     build_status_card,
     build_transition_card,
 )
+from mac_system.utils.formatting import format_tool_preview
 from mac_system.feishu.menu import (
     build_bind_dir_for_create_card,
     build_create_prompt_card,
@@ -574,7 +575,8 @@ async def _handle_coordinated_free_text(
             elif event_type == "tool":
                 data = json.loads(content)
                 tool_name = data.get("name") or "工具"
-                body = f"⚙️ **{tool_name}**: {json.dumps(data.get('input', {}), ensure_ascii=False)[:300]}"
+                tool_input = data.get("input") or {}
+                body = f"⚙️ {format_tool_preview(tool_name, tool_input)}"
                 title = "对话协调 · 正在执行"
                 color = "purple"
             else:
@@ -1033,14 +1035,20 @@ async def _send_conversation_reply(
     title: str = "答复",
     message_id: str | None = None,
 ) -> str:
-    """Render every Coordinator reply as a card, updating progress in-place."""
-    return await _deliver_conversation_card(
-        ctx,
-        receive_id,
-        receive_id_type,
-        build_content_card(title, text, page=1, total=1),
-        message_id=message_id,
+    """Render a Coordinator reply as one or more content cards.
+
+    Long replies are automatically split into multiple cards so Feishu does
+    not truncate them.  The optional ``message_id`` is the in-progress card;
+    we leave it as-is and post the real reply below it to avoid Card 1.0/2.0
+    schema mismatch.
+    """
+    message_ids = await ctx.bridge.send_content_card(
+        open_id=receive_id,
+        title=title,
+        content=text,
+        receive_id_type=receive_id_type,
     )
+    return message_ids[-1] if message_ids else ""
 
 
 async def _deliver_conversation_card(

@@ -54,6 +54,9 @@ projects/*/
 logs/
 *.log
 
+# Runtime PIDs
+*.pid
+
 # macOS
 .DS_Store
 .worktrees/

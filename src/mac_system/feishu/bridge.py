@@ -13,6 +13,11 @@ from mac_system.feishu.card import (
     build_status_card,
 )
 from mac_system.feishu.crypto import decrypt_feishu, verify_signature
+from mac_system.utils.formatting import (
+    format_tool_preview,
+    split_markdown_sections,
+    split_text,
+)
 from mac_system.feishu.models import ButtonAction, FeishuEvent, TextMessage
 
 
@@ -129,18 +134,24 @@ class FeishuBridge:
         text: str,
         receive_id_type: str = "open_id",
     ) -> str:
-        """Send a plain text message. Returns message_id."""
-        data = await self._request(
-            "POST",
-            "/open-apis/im/v1/messages",
-            params={"receive_id_type": receive_id_type},
-            json_data={
-                "receive_id": receive_id,
-                "msg_type": "text",
-                "content": json.dumps({"text": text}, ensure_ascii=False),
-            },
-        )
-        return data["data"]["message_id"]
+        """Send a plain text message, splitting if it exceeds Feishu's limit.
+
+        Returns the message_id of the last chunk (or the only chunk).
+        """
+        last_message_id = ""
+        for chunk in split_text(text):
+            data = await self._request(
+                "POST",
+                "/open-apis/im/v1/messages",
+                params={"receive_id_type": receive_id_type},
+                json_data={
+                    "receive_id": receive_id,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": chunk}, ensure_ascii=False),
+                },
+            )
+            last_message_id = data["data"]["message_id"]
+        return last_message_id
 
     async def send_text_to_chat(self, chat_id: str, text: str) -> str:
         """Convenience helper to send a plain text message to a chat."""
@@ -180,10 +191,28 @@ class FeishuBridge:
         total: int = 1,
         color: str = "blue",
         receive_id_type: str = "open_id",
-    ) -> str:
-        """Send a plain display card for a chunk of markdown content."""
-        card = build_content_card(title, content, page=page, total=total, color=color)
-        return await self._send_interactive(open_id, card, receive_id_type=receive_id_type)
+    ) -> list[str]:
+        """Send one or more display cards for long markdown content.
+
+        Automatically splits oversized Markdown into multiple cards so Feishu
+        does not silently truncate it.  Returns the list of message_ids.
+        """
+        chunks = split_markdown_sections(content)
+        total_chunks = len(chunks)
+        message_ids: list[str] = []
+        for idx, chunk in enumerate(chunks, start=1):
+            card = build_content_card(
+                title,
+                chunk,
+                page=idx,
+                total=total_chunks,
+                color=color,
+            )
+            message_id = await self._send_interactive(
+                open_id, card, receive_id_type=receive_id_type
+            )
+            message_ids.append(message_id)
+        return message_ids
 
     async def send_confirmation_card(
         self,
