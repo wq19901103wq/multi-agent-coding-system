@@ -3,11 +3,12 @@
   "$id": "https://mac-system.local/schemas/acceptance_evaluator_output.json",
   "title": "Acceptance Evaluator Output",
   "type": "object",
-  "required": ["success", "next_state_event", "result", "summary", "evidence", "acceptance_matrix", "blocking_conditions"],
+  "required": ["success", "next_state_event"],
   "additionalProperties": false,
   "properties": {
     "success": {"type": "boolean"},
-    "next_state_event": {"type": "string"},
+    "next_state_event": {"enum": ["complete", "fail", "ask_user"]},
+    "question_batch": {"$ref": "agent_question_batch.json"},
     "result": {"enum": ["pending_human_review", "pass", "fail"]},
     "summary": {"type": "string"},
     "evidence": {
@@ -57,5 +58,13 @@
         "reason": {"type": "string"}
       }
     }
-  }
+  },
+  "allOf": [{
+    "if": {"properties": {"next_state_event": {"const": "ask_user"}}},
+    "then": {"required": ["question_batch"]},
+    "else": {
+      "required": ["result", "summary", "evidence", "acceptance_matrix", "blocking_conditions"],
+      "not": {"required": ["question_batch"]}
+    }
+  }]
 }

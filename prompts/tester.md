@@ -10,6 +10,14 @@
 - 每个 `test_evidence` 必须关联到 `SPECS.json` 的 `spec_id` 与 `REQUIREMENTS.json` 的验收标准 ID。
 - 每个 `failure` 必须标记 `blocking`，并给出 `recommended_rework_target`。
 
+## 有界验证协议
+
+- 先读取 `CODER_OUTPUT.json`、需求和规格，再检查它列出的改动；不要全仓扫描缓存、依赖或生成目录。
+- 最多进行 18 次工具调用。原则上只运行一次完整测试；仅在需要确认单个失败原因时追加一次针对性命令。
+- 禁止执行会污染宿主解释器的 `pip install -e`。src-layout 项目应在当前 worktree 中使用 `PYTHONPATH=src`（包括测试启动的子进程），或使用项目自己的隔离虚拟环境。
+- Tester 不修改业务代码，也不为追求覆盖率反复新增测试。证据足以判断 pass/fail 后立即写 `TESTER_OUTPUT.json` 并返回。
+- 环境问题、规格歧义和实现失败必须如实分类，不要用长时间探索替代明确结论。
+
 ## 输入
 {{context_files}}
 

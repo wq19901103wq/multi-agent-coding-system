@@ -247,6 +247,26 @@ class FeishuBridge:
             json_data={"content": json.dumps(card_content, ensure_ascii=False)},
         )
 
+    async def add_reaction(self, message_id: str, emoji_type: str = "OnIt") -> str | None:
+        """Attach a processing reaction to the user's original message."""
+        if not message_id:
+            return None
+        data = await self._request(
+            "POST",
+            f"/open-apis/im/v1/messages/{message_id}/reactions",
+            json_data={"reaction_type": {"emoji_type": emoji_type}},
+        )
+        return (data.get("data") or {}).get("reaction_id")
+
+    async def remove_reaction(self, message_id: str, reaction_id: str | None) -> None:
+        """Remove a reaction previously created by this bot."""
+        if not message_id or not reaction_id:
+            return
+        await self._request(
+            "DELETE",
+            f"/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}",
+        )
+
     def _extract_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Return the inner event object from a decrypted payload."""
         if "event" in payload:
@@ -401,4 +421,10 @@ class NullFeishuBridge:
         return ""
 
     async def update_card(self, message_id: str, card_content: dict[str, Any]) -> None:
+        return None
+
+    async def add_reaction(self, message_id: str, emoji_type: str = "OnIt") -> str | None:
+        return None
+
+    async def remove_reaction(self, message_id: str, reaction_id: str | None) -> None:
         return None

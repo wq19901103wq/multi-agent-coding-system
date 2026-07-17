@@ -517,6 +517,20 @@ async def test_list_projects_for_chat(service):
     assert [p.id for p in projects] == [p1.id]
 
 
+async def test_cancelled_project_cannot_transition_from_late_agent_result(service):
+    project = await service.create_project(
+        name="cancel-race", task_type="feature", description="Test"
+    )
+    await service.cancel_project(project.id)
+
+    with pytest.raises(InvalidStateTransitionError):
+        await service.transition_state(project.id, "complete")
+
+    refreshed = service.get_project(project.id)
+    assert refreshed.status == "cancelled"
+    assert refreshed.current_state == "PLANNING_REQUIREMENTS"
+
+
 async def test_create_approval_expires_existing_pending(service):
     project = await service.create_project(
         name="test", task_type="feature", description="Test"

@@ -11,7 +11,9 @@ def agent_config(tmp_path):
     (prompts_dir / "coder.md").write_text(
         "# Coder\nWorkdir: {{worktree_path}}\nProject: {{project_id}}\nDesc: {{description}}\nFiles:\n{{context_files}}"
     )
-    (prompts_dir / "planner_requirements.md").write_text("# Planner\nDesc: {{description}}")
+    (prompts_dir / "planner_requirements.md").write_text(
+        "# Planner\nDesc: {{description}}\nBrief: {{confirmed_brief}}\nGuard: {{question_guard_feedback}}"
+    )
 
     schemas_dir = tmp_path / "specs" / "schemas"
     schemas_dir.mkdir(parents=True)
@@ -47,6 +49,7 @@ class FakeProject:
         self.task_type = "feature"
         self.description = "test project"
         self.workspace_path = "/tmp/proj_001"
+        self.context = {}
 
 
 def test_render_system_prompt(agent_config):
@@ -86,3 +89,31 @@ def test_get_allowed_tools(agent_config):
     renderer = PromptRenderer(agent_config)
     assert renderer.get_allowed_tools("coder") == ["Read", "Edit"]
     assert renderer.get_allowed_tools("planner") == ["Read", "Edit", "Write"]
+
+
+def test_planner_prompt_includes_confirmed_brief(agent_config, tmp_path):
+    renderer = PromptRenderer(agent_config)
+    project = FakeProject()
+    project.context = {
+        "confirmed_brief": {
+            "decisions": [{
+                "key": "agent.capability_scope",
+                "answer": "开放智能体",
+                "status": "confirmed",
+            }]
+        }
+    }
+    worktree = tmp_path / "wt-brief"
+    worktree.mkdir()
+
+    prompt = renderer.render_task_prompt(
+        agent_type="planner",
+        stage="requirements",
+        project=project,
+        state="PLANNING_REQUIREMENTS",
+        worktree=worktree,
+        context_files=[],
+    )
+
+    assert '"key": "agent.capability_scope"' in prompt
+    assert '"answer": "开放智能体"' in prompt

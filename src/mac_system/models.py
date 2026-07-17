@@ -190,6 +190,48 @@ class ConversationInteraction(SQLModel, table=True):
     resolved_at: Optional[datetime] = None
 
 
+class ConversationSession(SQLModel, table=True):
+    """Durable chat-level state for free-form conversation coordination."""
+
+    __tablename__ = "conversation_sessions"
+
+    id: str = SQLField(primary_key=True)
+    chat_id: str = SQLField(unique=True, index=True)
+    summary: str = SQLField(default="")
+    recent_turns: list = SQLField(default_factory=list, sa_column=Column(JSON))
+    active_project_id: Optional[str] = SQLField(
+        default=None, foreign_key="projects.id", nullable=True, index=True
+    )
+    latest_artifact: dict = SQLField(default_factory=dict, sa_column=Column(JSON))
+    pending_action_id: Optional[str] = SQLField(default=None, nullable=True, index=True)
+    status: str = SQLField(default="active")  # active / closed
+    version: int = SQLField(default=1)
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    updated_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class PendingConversationAction(SQLModel, table=True):
+    """A chat-scoped side-effect proposal awaiting explicit authorization."""
+
+    __tablename__ = "pending_conversation_actions"
+
+    id: str = SQLField(primary_key=True)
+    session_id: str = SQLField(foreign_key="conversation_sessions.id", index=True)
+    action_type: str  # start_delivery / project_control
+    target_project_id: Optional[str] = SQLField(
+        default=None, foreign_key="projects.id", nullable=True, index=True
+    )
+    payload: dict = SQLField(default_factory=dict, sa_column=Column(JSON))
+    source_message_ids: list = SQLField(default_factory=list, sa_column=Column(JSON))
+    status: str = SQLField(default="pending")  # pending / processing / resolved / rejected / expired
+    idempotency_key: str = SQLField(unique=True, index=True)
+    created_by: Optional[str] = None
+    resolved_by: Optional[str] = None
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+
+
 class Approval(SQLModel, table=True):
     __tablename__ = "approvals"
 

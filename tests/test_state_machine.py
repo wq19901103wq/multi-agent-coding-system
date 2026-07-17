@@ -20,7 +20,8 @@ def test_feature_transitions():
     assert sm.next_state("REQUIREMENT_CONFIRM_PENDING", "reject") == "PLANNING_REQUIREMENTS"
     assert sm.next_state("PLANNING_ARCHITECTURE", "complete") == "ARCHITECTURE_CONFIRM_PENDING"
     assert sm.next_state("ARCHITECTURE_CONFIRM_PENDING", "confirm") == "PLANNING_IMPLEMENTATION_SPECS"
-    assert sm.next_state("ARCHITECTURE_CONFIRM_PENDING", "select_option") == "PLANNING_ARCHITECTURE"
+    assert sm.next_state("ARCHITECTURE_CONFIRM_PENDING", "select_option") is None
+    assert set(sm.available_events("ARCHITECTURE_CONFIRM_PENDING")) == {"confirm", "reject"}
     assert sm.next_state("PLANNING_IMPLEMENTATION_SPECS", "complete") == "IMPLEMENTATION_SPEC_CONFIRM_PENDING"
     assert sm.next_state("IMPLEMENTATION_SPEC_CONFIRM_PENDING", "confirm") == "CODING"
     assert sm.next_state("CODING", "complete") == "CODING_CONFIRM_PENDING"

@@ -75,6 +75,20 @@ class StateMachine:
                     "fail": policy["fail_target"],
                 },
             }
+            recovery_name = f"{execution_name}_RECOVERY_PENDING"
+            execution["next_states"]["runtime_exhausted"] = recovery_name
+            recovery_events = {
+                "retry": execution_name,
+                "cancel": "CANCELLED",
+            }
+            if kind in ("implementation", "quality"):
+                recovery_events["choose_rework"] = "REWORK"
+            states[recovery_name] = {
+                "type": "human_confirmation",
+                "display": f"{stage['display']}失败，等待处理",
+                "recovery_for": execution_name,
+                "next_states": recovery_events,
+            }
             if stage.get("stage"):
                 execution["stage"] = stage["stage"]
             if stage.get("role"):

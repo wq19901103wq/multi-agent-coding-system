@@ -16,6 +16,11 @@
         "additionalProperties": false,
         "properties": {
           "question_id": {"type": "string", "minLength": 1},
+          "decision_key": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9_]+(?:\\.[a-z0-9_]+)+$"
+          },
           "parent_question_id": {"type": ["string", "null"]},
           "kind": {"enum": ["blocking", "decision", "non_blocking"]},
           "question": {"type": "string", "minLength": 1},

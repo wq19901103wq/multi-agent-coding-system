@@ -3,11 +3,12 @@
   "$id": "https://mac-system.local/schemas/reviewer_output.json",
   "title": "Reviewer Output",
   "type": "object",
-  "required": ["success", "next_state_event", "result"],
+  "required": ["success", "next_state_event"],
   "additionalProperties": false,
   "properties": {
     "success": {"type": "boolean"},
-    "next_state_event": {"type": "string"},
+    "next_state_event": {"enum": ["complete", "fail", "ask_user"]},
+    "question_batch": {"$ref": "agent_question_batch.json"},
     "result": {"enum": ["pass", "fail"]},
     "issues": {
       "type": "array",
@@ -53,5 +54,13 @@
       "type": "array",
       "items": {"type": "string"}
     }
-  }
+  },
+  "allOf": [{
+    "if": {"properties": {"next_state_event": {"const": "ask_user"}}},
+    "then": {"required": ["question_batch"]},
+    "else": {
+      "required": ["result"],
+      "not": {"required": ["question_batch"]}
+    }
+  }]
 }

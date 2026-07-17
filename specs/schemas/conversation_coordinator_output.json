@@ -1,0 +1,286 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mac-system.local/schemas/conversation_coordinator_output.json",
+  "title": "Conversation Coordinator Output",
+  "type": "object",
+  "required": [
+    "success",
+    "reply",
+    "intent",
+    "effect",
+    "commitment",
+    "needs_clarification",
+    "proposed_action"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "success": {
+      "type": "boolean"
+    },
+    "reply": {
+      "type": "string",
+      "minLength": 1
+    },
+    "intent": {
+      "enum": [
+        "inspect",
+        "diagnose",
+        "research",
+        "discuss",
+        "compare",
+        "evaluate",
+        "explain",
+        "recommend_next",
+        "summarize",
+        "draft",
+        "status_query",
+        "provide_information",
+        "provide_feedback",
+        "correct",
+        "change_scope",
+        "authorize_execution",
+        "approve",
+        "reject",
+        "select_option",
+        "pause",
+        "resume",
+        "cancel",
+        "switch_context",
+        "meta_instruction",
+        "unknown"
+      ]
+    },
+    "effect": {
+      "enum": [
+        "none",
+        "read_only",
+        "local_diagnostics",
+        "conversation_write",
+        "workspace_write",
+        "workflow_control",
+        "external_effect"
+      ]
+    },
+    "commitment": {
+      "enum": [
+        "exploring",
+        "considering",
+        "preferred",
+        "authorized",
+        "ambiguous"
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "none",
+            "conversation",
+            "repository",
+            "project",
+            "approval",
+            "pending_action",
+            "latest_artifact",
+            "current_stage"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "name_hint": {
+          "type": "string"
+        }
+      }
+    },
+    "needs_clarification": {
+      "type": "boolean"
+    },
+    "clarification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question", "options", "allow_free_text"],
+      "properties": {
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "label"],
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": {
+                "type": "string"
+              },
+              "recommended": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "allow_free_text": {
+          "type": "boolean"
+        }
+      }
+    },
+    "proposed_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "none",
+            "answer",
+            "inspect_workspace",
+            "research",
+            "query_status",
+            "create_draft",
+            "request_clarification",
+            "propose_start_delivery",
+            "resolve_pending_action",
+            "propose_project_control",
+            "propose_approval_resolution",
+            "route_project_input"
+          ]
+        },
+        "task_type": {
+          "enum": ["feature", "bug_fix", "documentation"]
+        },
+        "description": {
+          "type": "string"
+        },
+        "control_action": {
+          "enum": ["pause", "resume", "cancel", "switch"]
+        },
+        "approval_decision": {
+          "enum": ["confirm", "reject", "select_option"]
+        },
+        "option_key": {
+          "type": "string"
+        },
+        "feedback": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "out_of_scope": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "repository_read",
+              "local_diagnostics",
+              "workspace_write",
+              "git_write",
+              "external_research",
+              "deployment",
+              "destructive_operation"
+            ]
+          }
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "question", "answer", "status"],
+            "properties": {
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[a-z0-9_]+(?:\\.[a-z0-9_]+)+$"
+              },
+              "question": {"type": "string", "minLength": 1},
+              "answer": {"type": "string", "minLength": 1},
+              "status": {"const": "confirmed"},
+              "details": {"type": "object"}
+            }
+          }
+        }
+      }
+    },
+    "updated_summary": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "needs_clarification": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": ["clarification"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "proposed_action": {
+            "properties": {
+              "type": {
+                "const": "propose_start_delivery"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "proposed_action": {
+            "required": [
+              "task_type",
+              "description",
+              "scope",
+              "permissions",
+              "acceptance_criteria"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

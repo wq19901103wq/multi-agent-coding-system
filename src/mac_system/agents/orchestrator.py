@@ -249,13 +249,8 @@ class AgentOrchestrator:
         retry_count = project.context.get("retry_counts", {}).get(retry_key, 0)
         max_retries = self._max_retries_for_state(state)
         if retry_count >= max_retries:
-            # Runtime/infra failures for quality-gate agents must end in FAILED,
-            # not REWORK. Those states expose a dedicated fail_max_retries event.
-            terminal_event = "fail"
-            if state in ("TESTING", "REVIEW"):
-                terminal_event = "fail_max_retries"
             await self.project_service.transition_state(
-                project.id, terminal_event, triggered_by="orchestrator"
+                project.id, "runtime_exhausted", triggered_by="orchestrator"
             )
             return
 
@@ -278,6 +273,9 @@ class AgentOrchestrator:
                 "Skipping _execute_agent for %s at %s — task %s is already running",
                 project.id, state, running_task.id,
             )
+            return
+
+        if await self._recover_unapplied_completed_task(project, state_machine):
             return
 
         # Build round-aware task input.  Each re-entry into the same agent stage
@@ -437,6 +435,7 @@ class AgentOrchestrator:
 
         # If the project was cancelled while the agent was running, discard the result.
         project = self.project_service.require_project(project.id)
+        self.project_service.session.refresh(project)
         if project.status == "cancelled":
             await self.project_service.fail_task(task.id, "Project cancelled while agent was running")
             return
@@ -474,6 +473,8 @@ class AgentOrchestrator:
             await self._handle_agent_failure(project, state, task, error)
             return
 
+        self._persist_stage_output(project, worktree, result.output_json, state)
+
         # Complete task
         await self.project_service.complete_task(
             task.id, result.output_json, result.cost_info
@@ -488,6 +489,54 @@ class AgentOrchestrator:
         # In night/auto modes, quality-gate confirmations do not block the
         # next tick.  Resolve them immediately while still emitting report cards.
         await self._auto_resolve_quality_gates(project, state_machine)
+
+    async def _recover_unapplied_completed_task(
+        self, project: Project, state_machine: StateMachine
+    ) -> bool:
+        """Apply a task result committed just before an orchestrator crash.
+
+        A result is recoverable only while the project is still in the task's
+        original state and the task is newer than the project. Normal completed
+        transitions update the project timestamp, so they are never replayed.
+        """
+        task = self.project_service.session.exec(
+            select(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.state == project.current_state,
+                Task.status == "completed",
+            )
+            .order_by(Task.updated_at.desc())
+        ).first()
+        if task is None or not task.output_data:
+            return False
+        if task.updated_at <= project.updated_at:
+            return False
+        output = dict(task.output_data)
+        worktree = Path(task.worktree_path) if task.worktree_path else Path(project.workspace_path)
+        if not worktree.exists() and not output.get("question_batch"):
+            logger.warning(
+                "Cannot recover completed task %s for %s: worktree is missing",
+                task.id,
+                project.id,
+            )
+            return False
+        logger.warning(
+            "Recovering completed but unapplied task %s for %s at %s",
+            task.id,
+            project.id,
+            project.current_state,
+        )
+        await self.project_service.log_event(
+            project_id=project.id,
+            level="WARNING",
+            message=f"Recovering unapplied completed task: {task.id}",
+            meta={"task_id": task.id, "state": project.current_state},
+        )
+        await self._handle_agent_output(project, state_machine, task, worktree, output)
+        refreshed = self.project_service.require_project(project.id)
+        await self._auto_resolve_quality_gates(refreshed, state_machine)
+        return True
 
     async def _auto_resolve_quality_gates(
         self,
@@ -604,6 +653,7 @@ class AgentOrchestrator:
                 context_files=context_files or self._context_files_for_state(project, project.current_state),
                 task_id=task.id,
                 output_schema_path=str(output_schema),
+                qa_history=self._collect_qa_history(project.id),
             )
             allowed_tools = self.prompt_renderer.get_allowed_tools(task.agent_type)
         except Exception as e:
@@ -631,6 +681,12 @@ class AgentOrchestrator:
             await self.project_service.fail_task(task.id, result.logs or "Agent returned failure")
             return None
 
+        if task.agent_type == "acceptance_evaluator":
+            evidence_path = project_mac_dir(project) / "ACCEPTANCE_EVALUATOR_OUTPUT.json"
+            evidence_path.write_text(
+                json.dumps(result.output_json, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         await self.project_service.complete_task(task.id, result.output_json, result.cost_info)
         return result.output_json
 
@@ -642,6 +698,7 @@ class AgentOrchestrator:
         extra_variables: dict[str, str] | None = None,
         *,
         worktree: Path | None = None,
+        progress_callback: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> dict[str, Any] | None:
         """Run an auxiliary agent for a chat-scoped (non-project) operation.
 
@@ -654,6 +711,7 @@ class AgentOrchestrator:
         """
         import tempfile
 
+        owns_worktree = worktree is None
         if worktree is None:
             worktree = Path(tempfile.mkdtemp(prefix=f"mac_chat_scoped_{agent_type}_"))
         try:
@@ -671,6 +729,11 @@ class AgentOrchestrator:
                     extra_variables=extra_variables,
                 )
                 allowed_tools = self.prompt_renderer.get_allowed_tools(agent_type)
+                if agent_type == "conversation_coordinator" and owns_worktree:
+                    # Ordinary chat turns do not need filesystem tools. Keeping
+                    # the tool surface empty reduces CLI startup/planning work;
+                    # workspace inspections still receive Read explicitly.
+                    allowed_tools = []
             except Exception as e:
                 logger.error(
                     "Chat-scoped agent %s/%s prompt rendering failed: %s",
@@ -690,6 +753,9 @@ class AgentOrchestrator:
                     allowed_tools=allowed_tools,
                     readonly_dirs=[worktree],
                     timeout_seconds=self.settings.agent_timeout_seconds,
+                    progress_callback=(
+                        progress_callback if self.settings.debug_agent_progress else None
+                    ),
                 )
             except Exception as e:
                 logger.error(
@@ -708,7 +774,7 @@ class AgentOrchestrator:
         finally:
             # Best-effort cleanup of the temp dir. Don't raise on failure.
             try:
-                if worktree.exists():
+                if owns_worktree and worktree.exists():
                     import shutil
                     shutil.rmtree(worktree, ignore_errors=True)
             except Exception:
@@ -783,6 +849,8 @@ class AgentOrchestrator:
         recommendation = output.get("recommendation")
         if recommendation:
             return {
+                "next_state_event": output.get("next_state_event"),
+                "question_batch": output.get("question_batch"),
                 "action": recommendation.get("action"),
                 "reason": recommendation.get("reason"),
                 "result": output.get("result"),
@@ -791,6 +859,8 @@ class AgentOrchestrator:
                 "blocking_conditions": output.get("blocking_conditions", []),
             }
         return {
+            "next_state_event": output.get("next_state_event"),
+            "question_batch": output.get("question_batch"),
             "result": output.get("result"),
             "summary": output.get("summary"),
             "acceptance_matrix": output.get("acceptance_matrix", []),
@@ -917,6 +987,20 @@ class AgentOrchestrator:
         # QuestionInteraction and route to the state's ask_user event.
         question_batch = output.get("question_batch")
         if question_batch and isinstance(question_batch, dict) and event not in ("fail",):
+            question_batch, suppressed_questions = self._filter_confirmed_questions(
+                project, question_batch
+            )
+            if suppressed_questions:
+                await self.project_service.log_event(
+                    project_id=project.id,
+                    level="INFO",
+                    message="Suppressed questions already answered by confirmed brief",
+                    meta={"questions": suppressed_questions, "task_id": task.id},
+                )
+                output["question_batch"] = question_batch
+                task.output_data = dict(output)
+                self.project_service.session.commit()
+
             batch_questions = question_batch.get("questions") or []
             if batch_questions:
                 interaction = await self._create_question_interaction_from_output(
@@ -927,6 +1011,21 @@ class AgentOrchestrator:
                 project.context = ctx
                 self.project_service.session.commit()
                 event = "ask_user"
+            elif suppressed_questions:
+                ctx = dict(project.context)
+                ctx["question_guard_feedback"] = suppressed_questions
+                project.context = ctx
+                self.project_service.session.commit()
+                error = "Agent only asked questions already resolved by confirmed decisions"
+                await self.project_service.fail_task(task.id, error)
+                await self._handle_agent_failure(project, state, task, error)
+                return
+
+        if not question_batch and project.context.get("question_guard_feedback"):
+            ctx = dict(project.context)
+            ctx.pop("question_guard_feedback", None)
+            project.context = ctx
+            self.project_service.session.commit()
 
         # Apply any free-text user inputs that arrived while the agent was
         # running.  Blocking inputs discard the agent result instead of merging
@@ -945,6 +1044,11 @@ class AgentOrchestrator:
             "BUG_ANALYSIS",
             "DOC_OUTLINE",
         ):
+            artifact_error = self._planner_artifact_error(worktree, state)
+            if artifact_error:
+                await self.project_service.fail_task(task.id, artifact_error)
+                await self._handle_agent_failure(project, state, task, artifact_error)
+                return
             self._copy_mac_outputs(project, worktree, output, state)
             artifact_entry = _PLANNER_ARTIFACTS.get(state)
             if artifact_entry:
@@ -1092,6 +1196,47 @@ class AgentOrchestrator:
             questions=questions,
         )
 
+    def _filter_confirmed_questions(
+        self, project: Project, question_batch: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        """Remove questions whose decision key is already confirmed.
+
+        The guard is intentionally deterministic. Natural-language similarity
+        remains the Planner's responsibility; the orchestrator only suppresses
+        an exact stable decision key so it cannot silently discard a genuinely
+        different question.
+        """
+        brief = project.context.get("confirmed_brief", {})
+        decisions = brief.get("decisions", []) if isinstance(brief, dict) else []
+        confirmed: dict[str, dict[str, Any]] = {}
+        for decision in decisions:
+            if not isinstance(decision, dict) or decision.get("status") != "confirmed":
+                continue
+            key = str(decision.get("key") or "").strip().lower()
+            if key:
+                confirmed[key] = decision
+
+        retained: list[dict[str, Any]] = []
+        suppressed: list[dict[str, str]] = []
+        for question in question_batch.get("questions") or []:
+            if not isinstance(question, dict):
+                retained.append(question)
+                continue
+            key = str(question.get("decision_key") or "").strip().lower()
+            decision = confirmed.get(key)
+            if not decision:
+                retained.append(question)
+                continue
+            suppressed.append({
+                "decision_key": key,
+                "question": str(question.get("question") or ""),
+                "confirmed_answer": str(decision.get("answer") or ""),
+            })
+
+        filtered = dict(question_batch)
+        filtered["questions"] = retained
+        return filtered, suppressed
+
     async def _resolve_verified_feedback(
         self,
         verified_feedback_ids: list[str] | None,
@@ -1211,7 +1356,14 @@ class AgentOrchestrator:
             # Persist the retry count immediately so the next tick sees it even
             # if the outer session_scope rolls back for unrelated reasons.
             self.project_service.session.commit()
-            # Stay in same state for retry
+            await self.project_service.log_event(
+                project_id=project.id,
+                level="INFO",
+                message=f"Automatically retrying {task.agent_type} at {state}",
+                meta={"next_attempt": next_retry_count + 1, "max_attempts": max_retries},
+            )
+            refreshed = self.project_service.require_project(project.id)
+            await self._execute_agent(refreshed, StateMachine(project.task_type))
             return
 
         # This failure consumed the last allowed attempt. Transition now;
@@ -1221,13 +1373,18 @@ class AgentOrchestrator:
         project.context = {**project.context, "retry_counts": new_counts}
         self.project_service.session.commit()
 
-        # Runtime/infra failures for quality-gate agents must still end in FAILED,
-        # not REWORK.  Those states expose a dedicated fail_max_retries event.
-        terminal_event = "fail"
-        if state in ("TESTING", "REVIEW"):
-            terminal_event = "fail_max_retries"
+        failure_context = dict(project.context)
+        failure_context["last_agent_failure"] = {
+            "state": state,
+            "agent": task.agent_type,
+            "task_id": task.id,
+            "attempts": next_retry_count,
+            "error": error[-1200:],
+        }
+        project.context = failure_context
+        self.project_service.session.commit()
         await self.project_service.transition_state(
-            project.id, terminal_event, triggered_by="orchestrator"
+            project.id, "runtime_exhausted", triggered_by="orchestrator"
         )
 
     def _state_requires_confirmation(
@@ -1244,7 +1401,7 @@ class AgentOrchestrator:
         - it is the REWORK state, which must always be driven by a human decision.
         """
         # REWORK is a human decision on where to roll back; never auto-resolve it.
-        if state == "REWORK":
+        if state == "REWORK" or state.endswith("_RECOVERY_PENDING"):
             return True
         require_names = approval_config.get("require_confirmation_for", [])
         require_types = approval_config.get("require_confirmation_for_types", [])
@@ -1269,6 +1426,51 @@ class AgentOrchestrator:
         acceptance_coverage_violation = None
         if state == "ACCEPTANCE_PENDING":
             acceptance_recommendation = await self._evaluate_acceptance(project)
+            question_batch = (
+                acceptance_recommendation.get("question_batch")
+                if acceptance_recommendation
+                else None
+            )
+            if (
+                acceptance_recommendation
+                and acceptance_recommendation.get("next_state_event") == "ask_user"
+                and isinstance(question_batch, dict)
+                and question_batch.get("questions")
+            ):
+                acceptance_task = self.project_service.session.exec(
+                    select(Task)
+                    .where(
+                        Task.project_id == project.id,
+                        Task.agent_type == "acceptance_evaluator",
+                        Task.status == "completed",
+                    )
+                    .order_by(Task.created_at.desc())
+                ).first()
+                if acceptance_task is not None:
+                    self.project_service.expire_open_question_interactions(project.id)
+                    interaction = await self.project_service.create_question_interaction(
+                        project_id=project.id,
+                        origin_task_id=acceptance_task.id,
+                        origin_round=acceptance_task.round_number,
+                        resume_state="ACCEPTANCE_PENDING",
+                        agent="acceptance_evaluator",
+                        stage="acceptance",
+                        batch_key=question_batch.get("batch_key") or f"acceptance_{acceptance_task.id}",
+                        questions=question_batch["questions"],
+                    )
+                    project.context = {
+                        **project.context,
+                        "_pending_question_interaction_id": interaction.id,
+                    }
+                    self.project_service.session.commit()
+                    await self.project_service.transition_state(
+                        project.id, "ask_user", triggered_by="acceptance_evaluator"
+                    )
+                    refreshed = self.project_service.require_project(project.id)
+                    await self._handle_human_input(
+                        refreshed, state_machine, auto_resolve=False
+                    )
+                    return
             acceptance_coverage_violation = self._check_acceptance_coverage(
                 project, acceptance_recommendation
             )
@@ -1795,8 +1997,54 @@ class AgentOrchestrator:
                 files.append(mac / "REQUIREMENTS.json")
             if (mac / "ARCHITECTURE.json").exists():
                 files.append(mac / "ARCHITECTURE.json")
+            if state in ("TESTING", "REVIEW") and (mac / "CODER_OUTPUT.json").exists():
+                files.append(mac / "CODER_OUTPUT.json")
+            if state == "REVIEW" and (mac / "TESTER_OUTPUT.json").exists():
+                files.append(mac / "TESTER_OUTPUT.json")
+
+        elif state == "ACCEPTANCE_PENDING":
+            files.extend(
+                mac / filename
+                for filename in (
+                    "REQUIREMENTS.json",
+                    "ARCHITECTURE.json",
+                    "SPECS.json",
+                    "CODER_OUTPUT.json",
+                    "TESTER_OUTPUT.json",
+                    "REVIEWER_OUTPUT.json",
+                )
+            )
 
         return [f for f in files if f.exists()]
+
+    def _persist_stage_output(
+        self,
+        project: Project,
+        worktree: Path,
+        output: dict[str, Any],
+        state: str,
+    ) -> None:
+        """Persist compact execution evidence for downstream quality agents."""
+        mapping = {
+            "CODING": "CODER_OUTPUT.json",
+            "TESTING": "TESTER_OUTPUT.json",
+            "REVIEW": "REVIEWER_OUTPUT.json",
+        }
+        filename = mapping.get(state)
+        if filename is None:
+            return
+        destination = project_mac_dir(project) / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = worktree / ".mac" / filename
+        if source.is_file():
+            import shutil
+
+            shutil.copy2(source, destination)
+            return
+        destination.write_text(
+            json.dumps(output, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def _copy_mac_outputs(
         self, project: Project, worktree: Path, output: dict[str, Any], state: str
@@ -1833,6 +2081,35 @@ class AgentOrchestrator:
                 json.dump(output, f, ensure_ascii=False, indent=2)
             logger.debug("Wrote %s from agent output (fallback)", filename)
 
+    @staticmethod
+    def _planner_artifact_error(worktree: Path, state: str) -> str | None:
+        """Reject a malformed planner file before it reaches the main workspace.
+
+        Fake runtimes used by unit tests may not write a file; their structured
+        output continues through the existing fallback path. A real agent file,
+        once present, must at least be valid JSON so recovery/retry can repair it.
+        """
+        mapping = {
+            "PLANNING_REQUIREMENTS": "REQUIREMENTS.json",
+            "PLANNING_ARCHITECTURE": "ARCHITECTURE.json",
+            "PLANNING_IMPLEMENTATION_SPECS": "SPECS.json",
+            "BUG_ANALYSIS": "BUG_ANALYSIS.json",
+            "DOC_OUTLINE": "DOC_OUTLINE.json",
+        }
+        filename = mapping.get(state)
+        if filename is None:
+            return None
+        artifact_path = worktree / ".mac" / filename
+        if not artifact_path.is_file():
+            return None
+        try:
+            parsed = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"Planner artifact {filename} is not valid JSON: {exc}"
+        if not isinstance(parsed, dict):
+            return f"Planner artifact {filename} must contain a JSON object"
+        return None
+
     def _write_planner_output(self, project: Project, state: str, output: dict[str, Any]) -> None:
         mapping = {
             "PLANNING_REQUIREMENTS": "REQUIREMENTS.json",
@@ -1860,54 +2137,6 @@ class AgentOrchestrator:
             payload["rollback_target"] = output["request_rollback_to"]
         return payload
 
-    def _build_architecture_options(
-        self, project: Project, state_machine: StateMachine, state: str
-    ) -> list[dict[str, Any]]:
-        """Render concrete architecture decisions as selectable card options."""
-        options: list[dict[str, Any]] = [
-            {
-                "action": "confirm",
-                "label": "确认方案",
-                "next_state": state_machine.next_state(state, "confirm"),
-            }
-        ]
-        architecture_path = project_mac_dir(project) / "ARCHITECTURE.json"
-        if architecture_path.exists():
-            try:
-                architecture = json.loads(architecture_path.read_text(encoding="utf-8"))
-                for decision in architecture.get("decisions", []):
-                    decision_id = decision.get("id")
-                    recommended = decision.get("recommended")
-                    for decision_option in decision.get("options", []):
-                        option_key = decision_option.get("key")
-                        if not decision_id or not option_key:
-                            continue
-                        label = decision_option.get("label") or option_key
-                        is_recommended = option_key == recommended
-                        options.append(
-                            {
-                                "action": "select_option",
-                                "label": f"✓ {label}" if is_recommended else label,
-                                "decision_id": decision_id,
-                                "option_key": option_key,
-                                "next_state": state_machine.next_state(state, "select_option"),
-                                "type": "primary" if is_recommended else "default",
-                            }
-                        )
-            except (OSError, json.JSONDecodeError, TypeError):
-                logger.warning(
-                    "Failed to read architecture decisions for %s", project.id,
-                    exc_info=True,
-                )
-        options.append(
-            {
-                "action": "reject",
-                "label": "驳回重写",
-                "next_state": state_machine.next_state(state, "reject"),
-            }
-        )
-        return options
-
     def _build_confirmation_question(self, project: Project, state: str) -> tuple[str, list[dict]]:
         state_machine = StateMachine(project.task_type)
 
@@ -1919,11 +2148,6 @@ class AgentOrchestrator:
             confirmation = stage["confirmation"]
             if confirmation["state"] != state:
                 continue
-            if stage["id"] == "architecture" and "select_option" in state_machine.available_events(state):
-                subject = confirmation.get("subject") or confirmation["display"].removeprefix("等待确认")
-                return f"请确认{subject}", self._build_architecture_options(
-                    project, state_machine, state
-                )
             label_map = {
                 "confirm": "确认",
                 "reject": "驳回",
@@ -1955,6 +2179,25 @@ class AgentOrchestrator:
 
         if state == "REWORK":
             return "本轮未通过，请选择如何处理", state_machine.rework_options()
+
+        if state.endswith("_RECOVERY_PENDING"):
+            failure = project.context.get("last_agent_failure", {})
+            agent = failure.get("agent", "Agent")
+            attempts = failure.get("attempts", "多次")
+            label_map = {
+                "retry": "再次重试",
+                "choose_rework": "选择回退阶段",
+                "cancel": "终止项目",
+            }
+            options = [
+                {
+                    "action": event,
+                    "label": label_map.get(event, event),
+                    "next_state": state_machine.next_state(state, event),
+                }
+                for event in state_machine.available_events(state)
+            ]
+            return f"{agent} 已连续失败 {attempts} 次，请选择恢复方式", options
 
         if state == "ACCEPTANCE_PENDING":
             restart_option = {
@@ -2008,6 +2251,8 @@ class AgentOrchestrator:
             return "Tester 请求澄清，请回复你的答案"
         elif state == "REVIEW_INPUT_PENDING":
             return "Reviewer 请求澄清，请回复你的答案"
+        elif state == "ACCEPTANCE_INPUT_PENDING":
+            return "验收评估 Agent 请求澄清，请回复你的答案"
         return f"请输入 {state}"
 
     def _build_summary_for_state(self, project: Project, state: str) -> str:
@@ -2017,6 +2262,18 @@ class AgentOrchestrator:
         """
         if state == "ACCEPTANCE_PENDING":
             return self._build_acceptance_summary(project)
+
+        if state.endswith("_RECOVERY_PENDING"):
+            failure = project.context.get("last_agent_failure", {})
+            error = failure.get("error") or "Agent 未返回有效结果"
+            return (
+                f"**执行失败**\n"
+                f"- Agent：{failure.get('agent', 'unknown')}\n"
+                f"- 阶段：{failure.get('state', state)}\n"
+                f"- 已尝试：{failure.get('attempts', '多次')} 次\n"
+                f"- 原因：{error}\n\n"
+                "请选择再次重试、回退处理或终止项目。"
+            )
 
         # Quality gates: pull the latest completed task output for the report card.
         quality_gate_agent = {

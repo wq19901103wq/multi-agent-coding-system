@@ -140,6 +140,57 @@ def build_create_prompt_card(
     }
 
 
+def build_pending_action_card(
+    action_id: str,
+    payload: dict[str, Any],
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Ask the user to authorize one frozen, chat-scoped action."""
+    objective = str(payload.get("objective") or payload.get("description") or "开始执行")
+    scope = [str(item) for item in payload.get("scope", [])]
+    out_of_scope = [str(item) for item in payload.get("out_of_scope", [])]
+    acceptance = [str(item) for item in payload.get("acceptance_criteria", [])]
+
+    sections = [f"**目标**\n{objective}"]
+    if scope:
+        sections.append("**包含**\n" + "\n".join(f"- {item}" for item in scope[:6]))
+    if out_of_scope:
+        sections.append("**不包含**\n" + "\n".join(f"- {item}" for item in out_of_scope[:4]))
+    if acceptance:
+        sections.append("**完成标准**\n" + "\n".join(f"- {item}" for item in acceptance[:4]))
+
+    def action_button(label: str, decision: str, button_type: str = "default") -> dict[str, Any]:
+        return {
+            "tag": "button",
+            "text": _plain_text(label),
+            "type": button_type,
+            "value": {
+                "action": "conversation_action",
+                "decision": decision,
+                "pending_action_id": action_id,
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+            },
+        }
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header("确认执行范围", "orange"),
+        "elements": [
+            {"tag": "div", "text": _lark_md("\n\n".join(sections))},
+            {"tag": "div", "text": _lark_md(f"执行请求ID：{action_id}")},
+            {
+                "tag": "action",
+                "actions": [
+                    action_button("按此范围开始", "confirm", "primary"),
+                    action_button("继续讨论", "reject"),
+                ],
+            },
+        ],
+    }
+
+
 def build_intent_confirm_card(
     task_type: str,
     chat_id: str | None = None,
@@ -282,8 +333,8 @@ def build_bind_dir_for_create_card(
         {
             "tag": "div",
             "text": _lark_md(
-                f"根据你的需求描述，检测到可能匹配的代码目录：\n\n> {preview}\n\n"
-                "选择一个目录绑定后再创建项目，或跳过使用系统工作区。"
+                f"根据你的需求描述，推荐以下目录（点击后将**自动创建并初始化 Git**）：\n\n> {preview}\n\n"
+                "选择一个目录绑定后创建项目，或跳过使用系统工作区。"
             ),
         }
     )

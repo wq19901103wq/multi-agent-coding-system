@@ -22,6 +22,25 @@
 - 原始需求：{{description}}
 - 当前轮次：{{round_number}}
 
+## 调研阶段已确认方案（最高优先级）
+
+```json
+{{confirmed_brief}}
+```
+
+- `decisions` 中 `status: confirmed` 的条目是用户已确认事实，必须直接写入需求，不得再次提问。
+- `conversation_summary` 和 `recent_turns` 是兜底证据；如果其中包含用户明确回答但尚未结构化到 `decisions` 的事项，也不得重复询问，应直接纳入需求并标注其对话来源。
+- 对已确认事项需要进一步细化时，只能询问尚未覆盖的子问题，并在问题中先说明继承的既有结论。
+- 若本节与原始需求摘要表述不一致，以本节为准；只有用户后来明确提出变更时才重新确认。
+
+## 上轮重复问题拦截记录
+
+```json
+{{question_guard_feedback}}
+```
+
+若这里存在记录，说明上轮问题与已确认决策重复。本轮必须直接采用对应答案并继续生成需求产物。
+
 ## 产物要求（REQUIREMENTS.json）
 
 按 schema 必须包含以下字段：
@@ -81,6 +100,7 @@
     "questions": [
       {
         "question_id": "q_<topic>",
+        "decision_key": "module.decision_name",
         "kind": "blocking",
         "question": "问题正文",
         "reason": "为什么需要问这个",
@@ -97,6 +117,7 @@
 ```
 
 - `kind`: `blocking`（必须回答）/ `decision`（决策）/ `non_blocking`（可选）
+- 每个需求决策问题都必须提供稳定的点分 `decision_key`；如果该 key 已存在于已确认方案的 `decisions` 中，禁止提问。
 - 选择题必须提供 `options`，其中恰好一个 `recommended: true`
 - 开放问题用 `allow_free_text: true`，不需 `options`
 - 不要问已经在历史问答记录中出现过的问题

@@ -7,7 +7,8 @@
   "additionalProperties": false,
   "properties": {
     "success": {"type": "boolean"},
-    "next_state_event": {"type": "string"},
+    "next_state_event": {"enum": ["complete", "fail", "ask_user", "clarify", "conflict"]},
+    "question_batch": {"$ref": "agent_question_batch.json"},
     "modified_files": {
       "type": "array",
       "items": {
@@ -57,5 +58,10 @@
       }
     },
     "request_rollback_to": {"type": "string"}
-  }
+  },
+  "allOf": [{
+    "if": {"properties": {"next_state_event": {"const": "ask_user"}}},
+    "then": {"required": ["question_batch"]},
+    "else": {"not": {"required": ["question_batch"]}}
+  }]
 }

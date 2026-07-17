@@ -17,6 +17,7 @@ from mac_system.config import get_agent_config
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.models import Approval, Project, Task
+from mac_system.state_machine import StateMachine
 
 
 @pytest.fixture
@@ -621,7 +622,9 @@ async def test_full_feature_flow_reject_review_quality_gate(base_orchestrator):
 
 
 @pytest.mark.asyncio
-async def test_full_feature_flow_select_option_architecture(base_orchestrator):
+async def test_full_feature_flow_architecture_confirmation_has_no_option_selection(
+    base_orchestrator,
+):
     service, wm, renderer = base_orchestrator
     runtime = _make_runtime()
     oc = AgentOrchestrator(service, wm, runtime, renderer)
@@ -635,10 +638,8 @@ async def test_full_feature_flow_select_option_architecture(base_orchestrator):
     await oc.tick(project.id)
     project, _ = await _tick_until_pending(oc, service, project.id)
     assert project.current_state == "ARCHITECTURE_CONFIRM_PENDING"
-    await _resolve_pending(service, project, "select_option", payload={"option_key": "a"})
-    await oc.tick(project.id)
-    project, _ = await _tick_until_pending(oc, service, project.id)
-    assert project.current_state == "ARCHITECTURE_CONFIRM_PENDING"
+    state_machine = StateMachine("feature")
+    assert set(state_machine.available_events(project.current_state)) == {"confirm", "reject"}
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
     project, _ = await _tick_until_pending(oc, service, project.id)

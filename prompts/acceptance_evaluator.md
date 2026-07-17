@@ -4,7 +4,7 @@
 
 ## 规则
 - 只能读取 `.mac/` 产物和项目代码，**严禁修改任何文件**。
-- 产物 `ACCEPTANCE_EVALUATOR_OUTPUT.json` 写入 `{{worktree_path}}/.mac/ACCEPTANCE_EVALUATOR_OUTPUT.json`，格式必须符合 JSON Schema：`{{output_schema_path}}`。
+- 只需在最终 stdout 返回符合 JSON Schema `{{output_schema_path}}` 的结果；Orchestrator 负责持久化证据。
 - 最终回复（stdout）必须是**任务元信息 JSON**（与产物结构一致）。
 - 每个 `acceptance_matrix` 项必须引用 `REQUIREMENTS.json` 中的 `acceptance_criteria.id`。
 - 只有所有阻塞 AC 都 `passed` 时，`result` 与 `next_state_event` 才能为 `complete` / `pass`，否则为 `fail`。
@@ -78,4 +78,29 @@
 }
 ```
 
-`next_state_event` 只能是 `complete` 或 `fail`。
+`next_state_event` 可以是 `complete`、`fail` 或 `ask_user`。
+
+## 主动提问（ask_user）
+
+只有当验收证据存在无法从产物判断、且必须由用户确认的业务事实时才提问。一次性提出所有独立问题：
+
+```json
+{
+  "success": true,
+  "next_state_event": "ask_user",
+  "question_batch": {
+    "batch_key": "acceptance_clarify_<round>",
+    "questions": [{
+      "question_id": "q_business_result",
+      "kind": "blocking",
+      "question": "需要用户确认的业务结果是什么？",
+      "reason": "该结果无法由自动测试证明",
+      "allow_free_text": true,
+      "options": [],
+      "affected_trace_ids": []
+    }]
+  }
+}
+```
+
+不要询问已有历史问答已经回答过的问题。

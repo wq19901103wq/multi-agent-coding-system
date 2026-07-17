@@ -1,7 +1,7 @@
 # MAC System Agent 入职与工作交接
 
-> 更新时间：2026-07-15（Asia/Shanghai）  
-> 工作目录：`/Users/yihanwang/multi-agent-coding-system/.worktrees/feat-core`  
+> 更新时间：2026-07-16（Asia/Shanghai）
+> 工作目录：以当前 workspace root 为准；不要假设固定 worktree
 > GitHub 仓库：https://github.com/wq19901103wq/multi-agent-coding-system（public）  
 > 用途：让后续 Agent 在不重做已完成调查、不误解当前能力、不覆盖其他 Agent 修改的前提下继续工作。
 
@@ -15,8 +15,9 @@
    - Implementation Planner → `SPECS.json`
 4. 当前代码中存在名为 `project_manager` 的辅助 Agent，但它**不是完整 Project Manager**。它只是无状态、只读的控制决策辅助 Agent，用于 project 已确定后的普通追问和受授权默认建议。
 5. 项目未确定时的聊天路由不能交给 LLM 猜测，必须由确定性 ConversationRouter 创建 conversation-scoped 选择交互。
-6. “所有业务 Agent 都能主动 ask_user”目前仍未全部交付。Planner/Coder 已有路径，Tester/Reviewer 已能恢复原阶段；Acceptance Evaluator 和 Project Manager 尚未完成统一闭环。
-7. 三份重复状态机已经收敛为一个 `state_machines/delivery.json`；任务类型差异只在 `workflow_profiles/`。不要再新增 `{task_type}.json` 状态机。
+6. Planner/Coder/Tester/Reviewer/Acceptance Evaluator 已接入统一 QuestionInteraction；Project Manager 是控制辅助 Agent，其澄清由对话协调层处理，不应伪装成交付阶段。
+7. Runtime 重试会在同一 tick 内自动完成；耗尽后进入 `<EXECUTION_STATE>_RECOVERY_PENDING`，等待用户重试、回退或终止，禁止把技术失败当作质量失败。
+8. 三份重复状态机已经收敛为一个 `state_machines/delivery.json`；任务类型差异只在 `workflow_profiles/`。不要再新增 `{task_type}.json` 状态机。
 
 ## 2. 当前 Feature 状态机
 

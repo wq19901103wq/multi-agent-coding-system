@@ -65,8 +65,8 @@
     "reviewer": {
       "model": "claude-sonnet-4-20250514",
       "description": "Review 代码并给出验收结论",
-      "skills": ["chinese-code-review"],
-      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "skills": [],
+      "default_allowed_tools": ["Read", "Write", "Bash"],
       "prompt_file": "prompts/reviewer.md",
       "output_file": "TASK.json",
       "output_schema": "specs/schemas/reviewer_output.json"
@@ -84,7 +84,7 @@
       "model": "claude-sonnet-4-20250514",
       "description": "处理用户追问、生成确认摘要、推荐下一步动作、目录候选推荐",
       "skills": [],
-      "default_allowed_tools": ["Read", "Bash"],
+      "default_allowed_tools": ["Read"],
       "prompt_file": "prompts/project_manager.md",
       "output_file": "TASK.json",
       "output_schema": "specs/schemas/project_manager_output.json",
@@ -92,8 +92,21 @@
         "bind_dir": {
           "prompt_file": "prompts/project_manager_bind_dir.md",
           "output_schema": "specs/schemas/project_manager_bind_dir_output.json"
+        },
+        "create_dir": {
+          "prompt_file": "prompts/project_manager_create_dir.md",
+          "output_schema": "specs/schemas/project_manager_bind_dir_output.json"
         }
       }
+    },
+    "conversation_coordinator": {
+      "model": "claude-sonnet-4-20250514",
+      "description": "理解自由文本对话并在受约束能力之间路由，不直接执行副作用",
+      "skills": [],
+      "default_allowed_tools": ["Read"],
+      "prompt_file": "prompts/conversation_coordinator.md",
+      "output_file": "TASK.json",
+      "output_schema": "specs/schemas/conversation_coordinator_output.json"
     }
   }
 }

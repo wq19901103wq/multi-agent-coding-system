@@ -49,6 +49,88 @@ def build_content_card(
     }
 
 
+def build_conversation_progress_card(
+    *,
+    stage: str = "working",
+    detail: str = "正在分析你的问题",
+) -> dict[str, Any]:
+    """Build the single in-place card used while the Coordinator is working."""
+    stages = [
+        ("理解问题", stage != "received"),
+        ("调研与分析", stage in {"composing", "completed"}),
+        ("整理结果", stage == "completed"),
+    ]
+    lines = []
+    for label, completed in stages:
+        if completed:
+            marker = "✅"
+        elif not lines or all(done for _, done in stages[: len(lines)]):
+            marker = "⏳"
+        else:
+            marker = "○"
+        lines.append(f"{marker} {label}")
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header(
+            "处理完成" if stage == "completed" else "正在处理",
+            "green" if stage == "completed" else "blue",
+        ),
+        "elements": [
+            {"tag": "div", "text": _lark_md("\n".join(lines))},
+            {"tag": "note", "elements": [_plain_text(detail)]},
+        ],
+    }
+
+
+def build_conversation_clarification_card(
+    action_id: str,
+    question: str,
+    options: list[dict[str, Any]],
+    *,
+    reason: str = "",
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Build a chat-scoped multiple-choice card for the Coordinator."""
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": _lark_md(f"**{question}**")},
+    ]
+    if reason:
+        elements.append({"tag": "div", "text": _lark_md(reason)})
+    actions: list[dict[str, Any]] = []
+    for option in options[:3]:
+        label = str(option.get("label") or option.get("key") or "选择")
+        description = str(option.get("description") or "").strip()
+        if description:
+            elements.append(
+                {"tag": "div", "text": _lark_md(f"**{label}**：{description}")}
+            )
+        actions.append(
+            {
+                "tag": "button",
+                "text": _plain_text(
+                    f"{label}{'（推荐）' if option.get('recommended') else ''}"
+                ),
+                "type": "primary" if option.get("recommended") else "default",
+                "value": {
+                    "approval_id": "",
+                    "action": "conversation_clarification",
+                    "pending_action_id": action_id,
+                    "option_key": str(option.get("key") or ""),
+                    "option_label": label,
+                    "chat_id": chat_id,
+                    "chat_type": chat_type,
+                },
+            }
+        )
+    elements.append({"tag": "action", "actions": actions})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header("请选择一个方向", "blue"),
+        "elements": elements,
+    }
+
+
 def build_confirmation_card(
     title: str,
     summary: str,
@@ -263,7 +345,7 @@ def build_feedback_card(
     """Build a small card confirming the user's card action."""
     content = f"你选择了「{selected_label}」"
     if is_rejection:
-        content += "\n\n项目将返回上一阶段，请直接回复修改意见。"
+        content += f"\n\n{note or '项目将返回上一阶段，请直接回复修改意见。'}"
     elif note:
         content += f"\n\n{note}"
     return {
@@ -291,6 +373,72 @@ def build_rejection_summary_card(
             {"tag": "div", "text": _lark_md(f"**意见**：{feedback}")},
             {"tag": "div", "text": _lark_md("Agent 会根据以上意见重新规划。")},
         ],
+    }
+
+
+def build_rejection_input_card(
+    project_name: str,
+    approval_id: str,
+    state: str,
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+) -> dict[str, Any]:
+    """Collect planning-rejection feedback before changing project state."""
+    value = {
+        "approval_id": approval_id,
+        "action": "submit_rejection_feedback",
+        "state": state,
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+    }
+    # ``form`` and ``input`` are Card JSON 2.0 components.  Mixing them into
+    # the legacy 1.0 ``elements`` envelope makes Feishu reject the complete
+    # message with HTTP 400, so this card intentionally uses the 2.0 envelope.
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": _plain_text(f"[{project_name}] 填写修改意见"),
+            "template": "orange",
+        },
+        "body": {"elements": [
+            {
+                "tag": "markdown",
+                "content": "审批尚未流转。填写意见并提交后，Agent 才会开始重做。",
+            },
+            {
+                "tag": "form",
+                "name": "rejection_feedback_form",
+                "elements": [
+                    {
+                        "tag": "input",
+                        "name": "rejection_feedback",
+                        "required": True,
+                        "input_type": "multiline_text",
+                        "width": "fill",
+                        "placeholder": _plain_text("请说明哪里需要修改、期望结果是什么"),
+                    },
+                    {
+                        "tag": "button",
+                        "text": _plain_text("提交并驳回"),
+                        "type": "primary_filled",
+                        "form_action_type": "submit",
+                        "behaviors": [{"type": "callback", "value": value}],
+                    },
+                ],
+            },
+            {
+                "tag": "button",
+                "text": _plain_text("跳过说明，直接驳回"),
+                "type": "default",
+                "behaviors": [
+                    {
+                        "type": "callback",
+                        "value": {**value, "action": "reject_without_feedback"},
+                    }
+                ],
+            },
+        ]},
     }
 
 
@@ -339,7 +487,8 @@ def build_question_batch_card(
         elements.append({"tag": "div", "text": _lark_md(f"**影响说明**：{impact}")})
     if not is_submitted:
         elements.append({"tag": "div", "text": _lark_md(
-            f"共 {len(questions)} 个选择题，点击选项即可选择，最后点 **提交答案** 确认。"
+            f"共 {len(questions)} 道独立单选题，每题只能选 1 项。"
+            "点击选项只会暂存选择，不会立即提交；全部选好后点 **提交答案**。"
         )})
     for q in questions:
         qid = q.get("question_id") or q.get("db_id") or ""

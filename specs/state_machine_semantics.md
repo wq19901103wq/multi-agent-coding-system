@@ -7,6 +7,8 @@
 
 系统只有一个交付生命周期状态机。`delivery.json` 定义 INIT、阶段执行、等待输入、人工确认、REWORK、验收、合并和终态的统一事件语义；`workflow_profiles/{task_type}.json` 只声明该任务类型有哪些阶段、由哪个 Agent 执行、产物确认名以及允许回退到哪些阶段。
 
+每个 Agent 执行态由编译器生成对应的 `<EXECUTION_STATE>_RECOVERY_PENDING`。网络、模型、Schema、进程或合并等技术失败会在同一 tick 内按上限自动重试；耗尽后触发 `runtime_exhausted` 进入恢复态，由用户选择 `retry`、适用时 `choose_rework` 或 `cancel`。技术失败不得伪装为质量 `fail`，也不得未经用户选择直接终止项目。
+
 Profile 不得复制完整 `states` 或自行重定义 `complete / fail / ask_user / confirm / reject` 语义。新增 `refactor`、`migration` 等任务类型时，应优先新增 profile；只有所有任务都需要改变的生命周期规则才允许修改 `delivery.json`。
 
 运行时将模板和 profile 编译为现有的具体状态名，因此 API、飞书卡片、审计日志仍展示 `PLANNING_REQUIREMENTS`、`TESTING_CONFIRM_PENDING` 等可读状态。可观测性必须同时记录 `task_type + current_state`，不能只显示抽象的“执行中”。
@@ -208,19 +210,15 @@ reject 必须按确认节点类型分流，不能用同一条“先消费 approv
 - **触发**：planner stage=architecture 成功输出 `ARCHITECTURE.json`。
 - **副作用**：
   - 合并 `ARCHITECTURE.json`
-  - 将 `decisions` 渲染为确认卡片按钮
+  - 将完整技术方案渲染为汇报卡片
+  - 发送仅包含“确认 / 驳回”的方案确认卡片
 
 ### `ARCHITECTURE_CONFIRM_PENDING`
 
 - **`confirm`**：进入 `PLANNING_IMPLEMENTATION_SPECS`
 - **`reject`**：回到 `PLANNING_ARCHITECTURE`。交互流程见上方「Reject 交互流程」。
-- **`select_option`**：
-  - 用户选择了 Architect 给出的某个决策选项
-  - 请求体中携带 `decision_id` 和 `option_key`
-  - Orchestrator 将选择结果追加到 `ARCHITECTURE.json` 的 `resolved_decisions` 中
-  - 重新进入 `PLANNING_ARCHITECTURE` 让 planner 按选择重写方案
 
-> 说明：`select_option` 事件的结构为：事件名 `select_option`，payload 中 `{decision_id, option_key}`。状态机 JSON 中统一用 `select_option` 作为事件名。
+需要用户选择的技术决策必须在 `PLANNING_ARCHITECTURE` 阶段通过 `ask_user` 进入 `ARCHITECTURE_INPUT_PENDING`。多个决策渲染为多道独立单选题，逐题选择后统一提交；回答完成后 Planner 重新生成完整架构方案。
 
 ### `PLANNING_IMPLEMENTATION_SPECS` → `IMPLEMENTATION_SPEC_CONFIRM_PENDING`
 

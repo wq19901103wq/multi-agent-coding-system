@@ -34,8 +34,15 @@
       "display": "等待验收",
       "next_states": {
         "confirm": "MERGING",
-        "reject": "REWORK"
+        "reject": "REWORK",
+        "ask_user": "ACCEPTANCE_INPUT_PENDING"
       }
+    },
+    "ACCEPTANCE_INPUT_PENDING": {
+      "type": "human_input",
+      "input_purpose": "acceptance_clarification",
+      "display": "等待验收澄清",
+      "next_states": {"answer": "ACCEPTANCE_PENDING"}
     },
     "MERGING": {
       "type": "system_action",

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,17 @@ class PromptRenderer:
             f"- {f.name}: {f}" for f in context_files
         )
 
+        confirmed_brief = (
+            getattr(project, "context", {}).get("confirmed_brief", {})
+            if project and isinstance(getattr(project, "context", {}), dict)
+            else {}
+        )
+        question_guard_feedback = (
+            getattr(project, "context", {}).get("question_guard_feedback", [])
+            if project and isinstance(getattr(project, "context", {}), dict)
+            else []
+        )
+
         variables = {
             "project_id": project.id if project else "",
             "task_id": task_id or "",
@@ -101,6 +113,10 @@ class PromptRenderer:
             "rejection_note": rejection_note or "无",
             "round_number": round_number,
             "open_feedback_count": len(open_feedback) if open_feedback else 0,
+            "confirmed_brief": json.dumps(confirmed_brief, ensure_ascii=False, indent=2),
+            "question_guard_feedback": json.dumps(
+                question_guard_feedback, ensure_ascii=False, indent=2
+            ),
         }
         if extra_variables:
             variables.update(extra_variables)

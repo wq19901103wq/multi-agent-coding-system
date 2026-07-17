@@ -1,12 +1,13 @@
 import asyncio
 from contextlib import asynccontextmanager
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlmodel import select
 
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.agents.runtime import FakeRuntime
@@ -22,7 +23,7 @@ from mac_system.feishu import NullFeishuBridge
 from mac_system.feishu.handlers import FeishuHandlerContext, handle_card_action, handle_text_message
 from mac_system.feishu.models import ButtonAction, TextMessage
 from mac_system.feishu.ws_client import FeishuWebSocketClient
-from mac_system.models import ProjectCreate, ProjectOut
+from mac_system.models import Approval, ProjectCreate, ProjectOut
 from mac_system.state_machine import StateMachine
 
 from mac_system.api import admin_routes, feishu_routes
@@ -501,14 +502,23 @@ class InjectCardActionRequest(BaseModel):
 
 async def _run_inject_card_action(action: ButtonAction) -> None:
     """Run an injected card action in a fresh DB session/orchestrator."""
-    with session_scope() as session:
-        orchestrator = _build_orchestrator(session)
-        ctx = FeishuHandlerContext(
-            bridge=orchestrator.feishu_bridge or NullFeishuBridge(),
-            service=orchestrator.project_service,
-            orchestrator=orchestrator,
+    try:
+        with session_scope() as session:
+            orchestrator = _build_orchestrator(session)
+            ctx = FeishuHandlerContext(
+                bridge=orchestrator.feishu_bridge or NullFeishuBridge(),
+                service=orchestrator.project_service,
+                orchestrator=orchestrator,
+            )
+            await handle_card_action(ctx, action)
+    except Exception:
+        # Background tasks otherwise surface only as "exception was never
+        # retrieved", which leaves the E2E driver waiting with no useful cause.
+        logging.getLogger(__name__).exception(
+            "Background injected card action failed: action=%s approval_id=%s",
+            action.action,
+            action.approval_id,
         )
-        await handle_card_action(ctx, action)
 
 
 @app.post("/test/inject_card_action")
@@ -571,6 +581,18 @@ class InjectTextMessageRequest(BaseModel):
     chat_type: str = "p2p"
 
 
+class SeedFeishuInteractionRequest(BaseModel):
+    kind: Literal[
+        "planning_rejection",
+        "architecture_confirmation",
+        "acceptance_question",
+        "runtime_recovery",
+    ]
+    open_id: str
+    chat_id: str
+    chat_type: str = "group"
+
+
 @app.post("/test/inject_text_message")
 async def inject_text_message(
     req: InjectTextMessageRequest,
@@ -605,6 +627,99 @@ async def inject_text_message(
         logging.getLogger(__name__).exception("inject_text_message failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"inject_text_message failed: {exc}")
     return {"status": "ok"}
+
+
+@app.post("/test/seed_feishu_interaction")
+async def seed_feishu_interaction(
+    req: SeedFeishuInteractionRequest,
+    _auth: None = Depends(require_control_api_token),
+    orchestrator: AgentOrchestrator = Depends(get_orchestrator),
+) -> dict[str, Any]:
+    """Seed one deterministic human-interaction state and send its real card."""
+    settings = get_settings()
+    if not settings.feishu_test_mode:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+
+    service = orchestrator.project_service
+    project = await service.create_project(
+        name=f"e2e-{req.kind}",
+        task_type="feature",
+        description=f"飞书交互验证：{req.kind}",
+        approval_mode="normal",
+        creator_open_id=req.open_id,
+        feishu_chat_id=req.chat_id,
+        feishu_chat_type=req.chat_type,
+    )
+
+    interaction_id = None
+    if req.kind == "planning_rejection":
+        project.current_state = "REQUIREMENT_CONFIRM_PENDING"
+    elif req.kind == "architecture_confirmation":
+        project.current_state = "ARCHITECTURE_CONFIRM_PENDING"
+    elif req.kind == "runtime_recovery":
+        project.current_state = "CODING_RECOVERY_PENDING"
+        project.context = {
+            **project.context,
+            "last_agent_failure": {
+                "state": "CODING",
+                "error": "E2E seeded runtime timeout",
+                "retry_count": 2,
+            },
+        }
+    else:
+        project.current_state = "ACCEPTANCE_INPUT_PENDING"
+        interaction = await service.create_question_interaction(
+            project_id=project.id,
+            origin_task_id=None,
+            origin_round=1,
+            resume_state="ACCEPTANCE_PENDING",
+            agent="acceptance_evaluator",
+            stage="acceptance",
+            batch_key=f"e2e_acceptance_{project.id}",
+            questions=[
+                {
+                    "question_id": "q_acceptance_mode",
+                    "kind": "blocking",
+                    "question": "最终验收采用哪种确认方式？",
+                    "reason": "用于验证 Acceptance ask_user 卡片和恢复流转",
+                    "allow_free_text": False,
+                    "options": [
+                        {
+                            "key": "strict",
+                            "label": "严格验收",
+                            "impact": "所有验收证据必须完整",
+                            "recommended": True,
+                        },
+                        {
+                            "key": "manual",
+                            "label": "人工复核",
+                            "impact": "保留人工最终判断",
+                            "recommended": False,
+                        },
+                    ],
+                    "affected_trace_ids": ["AC-E2E-001"],
+                }
+            ],
+        )
+        interaction_id = interaction.id
+        project.context = {
+            **project.context,
+            "_pending_question_interaction_id": interaction.id,
+        }
+    service.session.commit()
+
+    await orchestrator.tick(project.id)
+    approval = service.session.exec(
+        select(Approval)
+        .where(Approval.project_id == project.id, Approval.status == "pending")
+        .order_by(Approval.created_at.desc())
+    ).first()
+    return {
+        "project_id": project.id,
+        "approval_id": approval.id if approval else None,
+        "interaction_id": interaction_id,
+        "state": service.require_project(project.id).current_state,
+    }
 
 
 @app.post("/test/tick/{project_id}")

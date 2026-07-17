@@ -171,6 +171,10 @@ class FeishuWebSocketClient:
                     return P2CardActionTriggerResponse({"card": {"type": "raw", "data": card}})
                 return P2CardActionTriggerResponse()
 
+            if action.action == "conversation_clarification":
+                _run_handler_in_thread(self._handle_card_action(action, event_id))
+                return P2CardActionTriggerResponse()
+
             _run_handler_in_thread(self._handle_card_action(action, event_id))
             return P2CardActionTriggerResponse(
                 {"toast": {"type": "success", "content": "已收到"}}
@@ -237,6 +241,7 @@ class FeishuWebSocketClient:
                         bot_open_id,
                     )
                     return
+                msg.is_at_bot = bool(mentioned_by_list or mentioned_by_text)
                 msg.text = _strip_mention_placeholders(msg.text)
                 msg.is_command = msg.text.startswith("/")
 

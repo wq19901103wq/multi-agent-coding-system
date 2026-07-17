@@ -167,8 +167,12 @@ class ClaudeCodeRuntime(AgentRuntime):
         ]
         if self.claude_model:
             cmd.extend(["--model", self.claude_model])
+        # Claude treats an empty --allowedTools value as the default tool set.
+        # Its explicit no-tools form is `--tools ""`.
         if allowed_tools:
             cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+        else:
+            cmd.extend(["--tools", "", "--bare", "--strict-mcp-config"])
         for d in readonly_dirs:
             cmd.extend(["--add-dir", str(d)])
         # The orchestrator observes and auto-approves tool calls centrally.

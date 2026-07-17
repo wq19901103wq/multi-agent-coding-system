@@ -10,7 +10,8 @@
 - **反馈闭环**：测试与 Review 生成结构化反馈，按根因回退到 Specify、Design、Plan、编码或测试
 - **中途控制**：Agent 运行期间的命令立即生效，自由文本持久化排队并在状态推进前消费
 - **多会话路由**：群聊和私聊均可关联多个项目，当前项目按“用户 × 聊天”隔离，避免跨项目串话
-- **全业务 Agent 主动澄清（建设中）**：目标是 Specify、架构、实现 Spec、编码、测试、Review 和验收 Agent 均可多轮 grill-me；当前仅部分阶段已有专用输入路径
+- **业务 Agent 主动澄清**：Specify、架构、实现 Spec、编码、测试、Review 和验收评估均可进入统一问题交互并在回答后恢复原阶段；Project Manager 控制辅助仍通过协调层澄清
+- **可恢复运行失败**：技术重试自动执行；重试耗尽后进入恢复卡，可再次重试、选择回退阶段或终止，不与质量失败混淆
 
 ## 快速开始
 
@@ -68,4 +69,4 @@ multi-agent-coding-system/
 - 一个聊天可以关联多个项目；使用 `/use <project_id>` 切换当前上下文。卡片和显式命令始终按其 project_id/approval_id 路由，不受后来切换影响。
 - 群聊只处理 @机器人、命令、回复机器人消息和卡片动作；没有唯一当前项目时必须先选择。
 
-详细语义见 `specs/state_machine_semantics.md`、`specs/orchestrator_spec.md`、`specs/mac_protocol.md`、`specs/conversation_routing_spec.md` 和 `specs/artifact_traceability_spec.md`。
+当前真实状态见 `CURRENT_STATE.md`，后续工作见 `ROADMAP.md`。详细语义见 `specs/state_machine_semantics.md`、`specs/orchestrator_spec.md`、`specs/mac_protocol.md`、`specs/conversation_routing_spec.md`、`specs/conversation_router_spec.md` 和 `specs/artifact_traceability_spec.md`。

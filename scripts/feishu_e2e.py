@@ -274,6 +274,20 @@ class MacApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def seed_feishu_interaction(self, **fields: Any) -> dict[str, Any]:
+        if self.dry_run:
+            return {
+                "project_id": "proj_dryrun_interaction",
+                "approval_id": "appr_dryrun_interaction",
+                "interaction_id": "qi_dryrun_interaction",
+                "state": "DRYRUN",
+            }
+        resp = await self._client.post(
+            f"{self.base_url}/test/seed_feishu_interaction", json=fields
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def clear_pending_intent(self, open_id: str) -> dict[str, Any]:
         if self.dry_run:
             return {"status": "ok"}
@@ -475,6 +489,7 @@ async def inject_action(
     option_key: str | None = None,
     decision_id: str | None = None,
     state: str = "",
+    extras: dict[str, Any] | None = None,
 ) -> None:
     """Inject a card button click via the test endpoint."""
     if ctx.dry_run:
@@ -491,6 +506,7 @@ async def inject_action(
         state=state,
         chat_id=chat_id,
         chat_type=chat_type,
+        extras=extras or {},
     )
 
 
@@ -729,10 +745,38 @@ async def scenario_requirement_reject(ctx: ScenarioContext) -> None:
         return
     assert ctx.sim is not None
     reply = await ctx.sim.wait_for_reply(
-        pattern=r"已创建项目", after_message_id=msg_id, timeout=120.0
+        pattern=(
+            r"正在根据需求描述生成候选目录名|正在根据需求描述查找|"
+            r"选择目录|跳过|自动创建并初始化|已创建项目"
+        ),
+        after_message_id=msg_id,
+        timeout=120.0,
     )
     if reply is None:
-        raise RuntimeError("MAC bot did not confirm project creation")
+        raise RuntimeError("MAC bot did not start project creation")
+    if "正在根据需求描述生成候选目录名" in reply.text or "正在根据需求描述查找" in reply.text:
+        reply = await ctx.sim.wait_for_reply(
+            pattern=r"选择目录|跳过|自动创建并初始化|已创建项目",
+            after_message_id=reply.message_id,
+            timeout=120.0,
+        )
+        if reply is None:
+            raise RuntimeError("MAC bot did not send directory selection card")
+    if "已创建项目" not in reply.text:
+        await inject_action(
+            ctx,
+            open_id=ctx.args.open_id,
+            approval_id="",
+            action="menu",
+            option_key="bind_dir_for_create_skip",
+        )
+        reply = await ctx.sim.wait_for_reply(
+            pattern=r"已创建项目",
+            after_message_id=reply.message_id,
+            timeout=120.0,
+        )
+        if reply is None:
+            raise RuntimeError("MAC bot did not create project after directory skip")
     project_id = extract_project_id(reply.text)
     if not project_id:
         raise RuntimeError(f"Could not extract project_id from reply: {reply.text!r}")
@@ -962,7 +1006,7 @@ async def scenario_bind_dir_agent(ctx: ScenarioContext) -> None:
     # 2. /create <description> -> agent recommendation -> skip -> project created
     msg2 = await send_feishu_text(ctx, "/create --type=feature 实现 config-validator CLI")
     reply2 = await ctx.sim.wait_for_reply(
-        pattern=r"正在根据需求描述查找|选择要绑定的目录|已创建项目",
+        pattern=r"正在根据需求描述生成候选目录名|正在根据需求描述查找|选择要绑定的目录|已创建项目",
         after_message_id=msg2,
         timeout=120.0,
     )
@@ -972,9 +1016,9 @@ async def scenario_bind_dir_agent(ctx: ScenarioContext) -> None:
         eprint("  /create skipped agent (binding exists or no allowed roots); project created directly")
         return
     # Agent returned candidates; wait for the pick card.
-    if "正在根据需求描述查找" in reply2.text:
+    if "正在根据需求描述生成候选目录名" in reply2.text or "正在根据需求描述查找" in reply2.text:
         reply2 = await ctx.sim.wait_for_reply(
-            pattern=r"选择目录|跳过|已创建项目",
+            pattern=r"选择目录|跳过|已创建项目|自动创建并初始化",
             after_message_id=reply2.message_id,
             timeout=120.0,
         )
@@ -1059,7 +1103,8 @@ async def wait_for_next_approval(
     # 20-minute Agent timeout. The full flow must not fail at 10 minutes while
     # the task is still healthy and deliver its approval moments later.
     if ctx.args.scenario == "full_feature_flow":
-        timeout = max(timeout, 1500.0)
+        # Two legal 20-minute attempts plus recovery/card delivery overhead.
+        timeout = max(timeout, 2700.0)
     if ctx.dry_run:
         return "appr_dryrun", FeishuMessage("msg_dryrun", "", "")
     assert ctx.sim is not None
@@ -1083,14 +1128,75 @@ async def wait_for_approval_at_state(
     *,
     after_message_id: str,
     timeout: float = 300.0,
+    recovery_depth: int = 0,
 ) -> tuple[str, Any]:
-    """Wait for the next card and fail fast if the scenario and state machine drift."""
+    """Wait for one approval, recovering legitimate quality-agent failures."""
     approval_id, reply = await wait_for_next_approval(
         ctx, after_message_id=after_message_id, timeout=timeout
     )
     status = await ctx.mac.get_status(project_id)
     actual_state = status.get("current_state")
     pending = status.get("pending_approval") or {}
+    if (
+        actual_state == "REWORK"
+        and expected_state in {
+            "CODING_CONFIRM_PENDING",
+            "TESTING_CONFIRM_PENDING",
+            "REVIEW_CONFIRM_PENDING",
+        }
+        and recovery_depth < 3
+    ):
+        target = {
+            "CODING_CONFIRM_PENDING": "to_coding",
+            "TESTING_CONFIRM_PENDING": "to_testing",
+            "REVIEW_CONFIRM_PENDING": "to_coding",
+        }[expected_state]
+        recommended = next(
+            (
+                option.get("option_key")
+                for option in pending.get("options", [])
+                if option.get("type") == "primary"
+                and option.get("option_key") in {"to_coding", "to_testing"}
+            ),
+            None,
+        )
+        target = recommended or target
+        eprint(
+            f"  quality agent entered REWORK before {expected_state}; "
+            f"auto-select {target}"
+        )
+        msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} {target}")
+        if target == "to_coding" and expected_state in {
+            "TESTING_CONFIRM_PENDING",
+            "REVIEW_CONFIRM_PENDING",
+        }:
+            coding_id, _ = await wait_for_approval_at_state(
+                ctx,
+                project_id,
+                "CODING_CONFIRM_PENDING",
+                after_message_id=msg_id,
+                timeout=timeout,
+                recovery_depth=recovery_depth + 1,
+            )
+            msg_id = await send_feishu_text(ctx, f"/confirm {coding_id}")
+        if expected_state == "REVIEW_CONFIRM_PENDING":
+            testing_id, _ = await wait_for_approval_at_state(
+                ctx,
+                project_id,
+                "TESTING_CONFIRM_PENDING",
+                after_message_id=msg_id,
+                timeout=timeout,
+                recovery_depth=recovery_depth + 1,
+            )
+            msg_id = await send_feishu_text(ctx, f"/confirm {testing_id}")
+        return await wait_for_approval_at_state(
+            ctx,
+            project_id,
+            expected_state,
+            after_message_id=msg_id,
+            timeout=timeout,
+            recovery_depth=recovery_depth + 1,
+        )
     if actual_state != expected_state or pending.get("approval_id") != approval_id:
         raise RuntimeError(
             "Approval/state mismatch: "
@@ -1105,7 +1211,7 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
 
     Branch coverage:
     - Requirement:  reject → re-plan → confirm
-    - Architecture: select_option → re-plan → confirm
+    - Architecture: confirmation card exposes only confirm/reject → confirm
     - Spec:         reject → re-plan → confirm
     - Coding:       reject → REWORK → to_coding → re-plan → confirm
     - Testing:      reject → REWORK → to_testing → re-plan → confirm
@@ -1122,10 +1228,38 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
         return
     assert ctx.sim is not None
     reply = await ctx.sim.wait_for_reply(
-        pattern=r"已创建项目", after_message_id=msg_id, timeout=120.0
+        pattern=(
+            r"正在根据需求描述生成候选目录名|正在根据需求描述查找|"
+            r"选择目录|跳过|自动创建并初始化|已创建项目"
+        ),
+        after_message_id=msg_id,
+        timeout=120.0,
     )
     if reply is None:
-        raise RuntimeError("MAC bot did not confirm project creation")
+        raise RuntimeError("MAC bot did not start project creation")
+    if "正在根据需求描述生成候选目录名" in reply.text or "正在根据需求描述查找" in reply.text:
+        reply = await ctx.sim.wait_for_reply(
+            pattern=r"选择目录|跳过|自动创建并初始化|已创建项目",
+            after_message_id=reply.message_id,
+            timeout=300.0,
+        )
+        if reply is None:
+            raise RuntimeError("MAC bot did not send directory selection card")
+    if "已创建项目" not in reply.text:
+        await inject_action(
+            ctx,
+            open_id=ctx.args.open_id,
+            approval_id="",
+            action="menu",
+            option_key="bind_dir_for_create_skip",
+        )
+        reply = await ctx.sim.wait_for_reply(
+            pattern=r"已创建项目",
+            after_message_id=reply.message_id,
+            timeout=120.0,
+        )
+        if reply is None:
+            raise RuntimeError("MAC bot did not create project after directory skip")
     project_id = extract_project_id(reply.text)
     if not project_id:
         raise RuntimeError(f"Could not extract project_id from reply: {reply.text!r}")
@@ -1146,37 +1280,21 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
     eprint(f"  requirement re-approval {approval_id} (now confirm)")
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
-    # ── 2. Architecture: select another option then confirm ───────────
+    # ── 2. Architecture: final review is confirm/reject only ──────────
     approval_id, reply = await wait_for_approval_at_state(
         ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
     )
-    eprint(f"  architecture approval {approval_id} (select_option)")
+    eprint(f"  architecture approval {approval_id} (confirm/reject only)")
     status = await ctx.mac.get_status(project_id)
-    architecture_options = [
-        option for option in (status.get("pending_approval") or {}).get("options", [])
-        if option.get("action") == "select_option"
-        and option.get("decision_id") and option.get("option_key")
-    ]
-    if not architecture_options:
-        raise RuntimeError("Architecture approval did not expose a concrete decision option")
-    selected = next(
-        (option for option in architecture_options if option.get("type") != "primary"),
-        architecture_options[0],
-    )
-    await inject_action(
-        ctx,
-        ctx.args.open_id,
-        approval_id,
-        "select_option",
-        option_key=selected["option_key"],
-        decision_id=selected["decision_id"],
-        state="ARCHITECTURE_CONFIRM_PENDING",
-    )
-    msg_id = reply.message_id
-    approval_id, reply = await wait_for_approval_at_state(
-        ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING", after_message_id=msg_id, timeout=600.0
-    )
-    eprint(f"  architecture re-approval {approval_id} (now confirm)")
+    architecture_actions = {
+        option.get("action")
+        for option in (status.get("pending_approval") or {}).get("options", [])
+    }
+    if architecture_actions != {"confirm", "reject"}:
+        raise RuntimeError(
+            "Architecture confirmation must expose only confirm/reject; "
+            f"got {sorted(architecture_actions)}"
+        )
     msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
     # ── 3. Implementation Spec: reject then confirm ───────────────────
@@ -1327,10 +1445,283 @@ async def scenario_p2p_create_interactive(ctx: ScenarioContext) -> None:
     eprint(f"  reached {status['current_state']}")
 
 
+async def scenario_conversation_delivery(ctx: ScenarioContext) -> None:
+    """Discuss first, then confirm one bounded delivery action exactly once."""
+    eprint("Scenario: conversation_delivery")
+    msg_id = await send_feishu_text(
+        ctx,
+        "先帮我分析一个最小书签整理 CLI 应该怎么设计，只讨论方案，不要开始开发。",
+    )
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(after_message_id=msg_id, timeout=600.0)
+    if reply is None:
+        raise RuntimeError("Conversation coordinator did not answer the discussion")
+
+    msg_id = await send_feishu_text(
+        ctx,
+        "按刚才的最小范围开始开发，只做 add 和 list，完成标准是单元测试通过。",
+    )
+    action_card = await ctx.sim.wait_for_reply(
+        pattern=r"确认执行范围|执行请求ID.*cact_",
+        after_message_id=msg_id,
+        timeout=600.0,
+    )
+    if action_card is None:
+        raise RuntimeError("Conversation coordinator did not send an execution confirmation card")
+    match = re.search(r"执行请求ID[：:]\s*(cact_[A-Za-z0-9_]+)", action_card.text)
+    if match is None:
+        raise RuntimeError(f"Could not extract pending action id: {action_card.text!r}")
+    action_id = match.group(1)
+
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        "",
+        "conversation_action",
+        extras={"pending_action_id": action_id, "decision": "confirm"},
+    )
+    created = await ctx.sim.wait_for_reply(
+        pattern=r"已创建项目.*proj_",
+        after_message_id=action_card.message_id,
+        timeout=180.0,
+    )
+    if created is None:
+        raise RuntimeError("Confirmed conversation action did not create a project")
+    project_id = extract_project_id(created.text)
+    if project_id is None:
+        raise RuntimeError(f"Could not extract created project id: {created.text!r}")
+
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        "",
+        "conversation_action",
+        extras={"pending_action_id": action_id, "decision": "confirm"},
+    )
+    duplicate_receipt = await ctx.sim.wait_for_reply(
+        pattern=r"已经处理|无需重复点击",
+        after_message_id=created.message_id,
+        timeout=60.0,
+    )
+    if duplicate_receipt is None:
+        raise RuntimeError("Repeated conversation action did not return an idempotent receipt")
+    await send_feishu_text(ctx, f"/cancel {project_id}")
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        status = await ctx.mac.get_status(project_id)
+        if status.get("status") == "cancelled":
+            break
+        await asyncio.sleep(2.0)
+    else:
+        raise RuntimeError("Conversation delivery project was not cancelled")
+    # Leave a short quiet window so a late Feishu card cannot leak into the
+    # next scenario when --all is run in the same group chat.
+    await asyncio.sleep(5.0)
+
+
+async def _seed_card_anchor(ctx: ScenarioContext) -> str:
+    """Return a fresh MAC reply id so seeded cards cannot match old messages."""
+    assert ctx.sim is not None
+    message_id = await send_feishu_text(ctx, "/whoami")
+    reply = await ctx.sim.wait_for_reply(after_message_id=message_id, timeout=60.0)
+    if reply is None:
+        raise RuntimeError("MAC bot did not answer the interaction anchor")
+    return reply.message_id
+
+
+async def _cancel_seeded_project(ctx: ScenarioContext, project_id: str) -> None:
+    """Cancel a seeded project and wait until it can no longer leak work/cards."""
+    await send_feishu_text(ctx, f"/cancel {project_id}")
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        status = await ctx.mac.get_status(project_id)
+        if status.get("status") == "cancelled":
+            await asyncio.sleep(2.0)
+            return
+        await asyncio.sleep(1.0)
+    raise RuntimeError(f"Seeded project was not cancelled: {project_id}")
+
+
+async def scenario_planning_rejection_form(ctx: ScenarioContext) -> None:
+    """Render the planning rejection form and submit structured feedback."""
+    eprint("Scenario: planning_rejection_form")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    anchor = await _seed_card_anchor(ctx)
+    seeded = await ctx.mac.seed_feishu_interaction(
+        kind="planning_rejection",
+        open_id=ctx.args.open_id,
+        chat_id=ctx.args.chat_id or f"p2p:{ctx.args.open_id}",
+        chat_type="group" if ctx.args.chat_id else "p2p",
+    )
+    approval_id = seeded["approval_id"]
+    confirmation = await ctx.sim.wait_for_reply(
+        pattern=rf"审批ID.*{re.escape(approval_id)}",
+        after_message_id=anchor,
+        timeout=120.0,
+    )
+    if confirmation is None:
+        raise RuntimeError("Planning confirmation card was not rendered")
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        approval_id,
+        "reject",
+        state="REQUIREMENT_CONFIRM_PENDING",
+    )
+    form = await ctx.sim.wait_for_reply(
+        pattern=r"填写修改意见|提交并驳回",
+        after_message_id=confirmation.message_id,
+        timeout=120.0,
+    )
+    if form is None:
+        raise RuntimeError("Planning rejection input form was not rendered")
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        approval_id,
+        "submit_rejection_feedback",
+        state="REQUIREMENT_CONFIRM_PENDING",
+        extras={"rejection_feedback": "范围太大，先保留核心路径"},
+    )
+    status = await wait_for_state(
+        ctx, seeded["project_id"], "PLANNING_REQUIREMENTS", timeout=60.0
+    )
+    if status is None:
+        raise RuntimeError("Submitted rejection feedback did not restart planning")
+    await _cancel_seeded_project(ctx, seeded["project_id"])
+
+
+async def scenario_architecture_confirmation(ctx: ScenarioContext) -> None:
+    """Architecture final review exposes only confirm/reject actions."""
+    eprint("Scenario: architecture_confirmation")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    anchor = await _seed_card_anchor(ctx)
+    seeded = await ctx.mac.seed_feishu_interaction(
+        kind="architecture_confirmation",
+        open_id=ctx.args.open_id,
+        chat_id=ctx.args.chat_id or f"p2p:{ctx.args.open_id}",
+        chat_type="group" if ctx.args.chat_id else "p2p",
+    )
+    approval_id = seeded["approval_id"]
+    confirmation = await ctx.sim.wait_for_reply(
+        pattern=rf"审批ID.*{re.escape(approval_id)}",
+        after_message_id=anchor,
+        timeout=120.0,
+    )
+    if confirmation is None:
+        raise RuntimeError("Architecture confirmation card was not rendered")
+    status = await ctx.mac.get_status(seeded["project_id"])
+    actions = {
+        option.get("action")
+        for option in (status.get("pending_approval") or {}).get("options", [])
+    }
+    if actions != {"confirm", "reject"}:
+        raise RuntimeError(
+            "Architecture confirmation must expose only confirm/reject; "
+            f"got {sorted(actions)}"
+        )
+    await _cancel_seeded_project(ctx, seeded["project_id"])
+
+
+async def scenario_acceptance_question_card(ctx: ScenarioContext) -> None:
+    """Render and answer an Acceptance ask_user choice card."""
+    eprint("Scenario: acceptance_question_card")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    anchor = await _seed_card_anchor(ctx)
+    seeded = await ctx.mac.seed_feishu_interaction(
+        kind="acceptance_question",
+        open_id=ctx.args.open_id,
+        chat_id=ctx.args.chat_id or f"p2p:{ctx.args.open_id}",
+        chat_type="group" if ctx.args.chat_id else "p2p",
+    )
+    card = await ctx.sim.wait_for_reply(
+        pattern=r"最终验收采用哪种确认方式|严格验收",
+        after_message_id=anchor,
+        timeout=120.0,
+    )
+    if card is None:
+        raise RuntimeError("Acceptance question card was not rendered")
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        seeded["approval_id"],
+        "select_question_option",
+        option_key="strict",
+        state="ACCEPTANCE_INPUT_PENDING",
+        extras={
+            "interaction_id": seeded["interaction_id"],
+            "question_id": "q_acceptance_mode",
+        },
+    )
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        seeded["approval_id"],
+        "submit_selected_options",
+        state="ACCEPTANCE_INPUT_PENDING",
+        extras={"interaction_id": seeded["interaction_id"]},
+    )
+    status = await wait_for_state(
+        ctx, seeded["project_id"], "ACCEPTANCE_PENDING", timeout=60.0
+    )
+    if status is None:
+        raise RuntimeError("Acceptance answer did not resume the original state")
+    await _cancel_seeded_project(ctx, seeded["project_id"])
+
+
+async def scenario_runtime_recovery_card(ctx: ScenarioContext) -> None:
+    """Render a runtime recovery card and terminate through its callback."""
+    eprint("Scenario: runtime_recovery_card")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    anchor = await _seed_card_anchor(ctx)
+    seeded = await ctx.mac.seed_feishu_interaction(
+        kind="runtime_recovery",
+        open_id=ctx.args.open_id,
+        chat_id=ctx.args.chat_id or f"p2p:{ctx.args.open_id}",
+        chat_type="group" if ctx.args.chat_id else "p2p",
+    )
+    card = await ctx.sim.wait_for_reply(
+        pattern=r"执行失败|重新执行|终止项目",
+        after_message_id=anchor,
+        timeout=120.0,
+    )
+    if card is None:
+        raise RuntimeError("Runtime recovery card was not rendered")
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        seeded["approval_id"],
+        "cancel",
+        state="CODING_RECOVERY_PENDING",
+    )
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        status = await ctx.mac.get_status(seeded["project_id"])
+        if status.get("status") == "cancelled":
+            return
+        await asyncio.sleep(2.0)
+    raise RuntimeError("Runtime recovery cancel did not terminate the project")
+
+
 SCENARIOS: dict[str, Any] = {
     "p2p_create": scenario_p2p_create,
     "p2p_create_with_type": scenario_p2p_create_with_type,
     "p2p_create_interactive": scenario_p2p_create_interactive,
+    "conversation_delivery": scenario_conversation_delivery,
+    "planning_rejection_form": scenario_planning_rejection_form,
+    "architecture_confirmation": scenario_architecture_confirmation,
+    "acceptance_question_card": scenario_acceptance_question_card,
+    "runtime_recovery_card": scenario_runtime_recovery_card,
     "group_create_at_mention": scenario_group_create_at_mention,
     "group_create_menu": scenario_group_create_menu,
     "intent_confirm_override": scenario_intent_confirm_override,

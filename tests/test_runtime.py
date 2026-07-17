@@ -33,6 +33,21 @@ def test_build_claude_command():
     assert "/tmp/ref" in cmd
 
 
+def test_stream_command_empty_allowed_tools_disables_tools():
+    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
+    cmd = runtime._build_command(
+        system_prompt_file=Path("/tmp/sys.md"),
+        allowed_tools=[],
+        readonly_dirs=[],
+    )
+
+    index = cmd.index("--tools")
+    assert cmd[index + 1] == ""
+    assert "--allowedTools" not in cmd
+    assert "--bare" in cmd
+    assert "--strict-mcp-config" in cmd
+
+
 def test_parse_json_output_single():
     runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
     output = runtime._parse_json_output('{"success": true}')

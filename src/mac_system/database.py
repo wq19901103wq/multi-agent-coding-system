@@ -1,17 +1,29 @@
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlmodel import Session, SQLModel, create_engine
 
 from mac_system.config import get_settings
 
 _settings = get_settings()
+_is_sqlite = _settings.database_url.startswith("sqlite")
 _engine = create_engine(
     _settings.database_url,
     echo=_settings.debug,
-    connect_args={"check_same_thread": False} if _settings.database_url.startswith("sqlite") else {},
+    connect_args={"check_same_thread": False, "timeout": 30} if _is_sqlite else {},
 )
+
+
+if _is_sqlite:
+    @event.listens_for(_engine, "connect")
+    def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
+        """Allow concurrent readers and wait briefly for the single writer."""
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 
 def _sqlite_column_def(column) -> str:

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import hashlib
 import logging
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,9 +23,13 @@ from mac_system.core.project_service import (
 )
 from mac_system.feishu.bridge import FeishuBridge
 from mac_system.feishu.card import (
+    build_content_card,
+    build_conversation_clarification_card,
+    build_conversation_progress_card,
     build_feedback_card,
     build_input_card,
     build_question_batch_card,
+    build_rejection_input_card,
     build_rejection_summary_card,
     build_status_card,
     build_transition_card,
@@ -32,11 +40,19 @@ from mac_system.feishu.menu import (
     build_directory_candidate_card,
     build_intent_confirm_card,
     build_main_menu_card,
+    build_pending_action_card,
     build_project_list_card,
     build_restart_type_card,
 )
 from mac_system.feishu.models import ButtonAction, TextMessage
-from mac_system.models import Approval, Project, ProjectUser, RouteDecision
+from mac_system.models import (
+    Approval,
+    ConversationSession,
+    PendingConversationAction,
+    Project,
+    ProjectUser,
+    RouteDecision,
+)
 from mac_system.state_machine import StateMachine
 
 logger = logging.getLogger(__name__)
@@ -152,7 +168,12 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
             ctx.service.delete_pending_intent(open_id)
             await _bind_directory(ctx, open_id, text.strip())
             return
-        if not text.startswith("/"):
+        # The real coordinator gets first refusal so a user can ask a question
+        # or pause instead of having every sentence consumed as a description.
+        # Test/legacy orchestrators without the coordinator keep the old path.
+        if not text.startswith("/") and not callable(
+            getattr(ctx.orchestrator, "run_chat_scoped_agent", None)
+        ):
             ctx.service.delete_pending_intent(open_id)
             if pending.stage == "awaiting_type_confirm" and pending.description:
                 # User typed again while we were waiting for type confirmation;
@@ -288,6 +309,12 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
         await _show_menu(ctx, open_id)
         return
 
+    # Natural-language conversation is handled before legacy project-input
+    # fallbacks.  If the coordinator is unavailable, return False and retain
+    # the existing deterministic behavior as a safe compatibility path.
+    if await _handle_coordinated_free_text(ctx, msg):
+        return
+
     # Before treating free-form text as a new project, check whether the user
     # has an active project that was recently rejected and needs feedback.
     active_project = _find_rejected_project_for_feedback(ctx, open_id)
@@ -400,6 +427,702 @@ async def handle_text_message(ctx: FeishuHandlerContext, msg: TextMessage) -> No
 
     # Default: do not auto-create projects from free-form text. Show help instead.
     await _show_help(ctx, open_id)
+
+
+async def _handle_coordinated_free_text(
+    ctx: FeishuHandlerContext,
+    msg: TextMessage,
+    *,
+    progress_message_id: str | None = None,
+) -> bool:
+    """Run the bounded conversation coordinator for one free-text turn."""
+    runner = getattr(ctx.orchestrator, "run_chat_scoped_agent", None)
+    if runner is None:
+        return False
+
+    open_id = msg.open_id
+    chat_key = ctx.chat_id or msg.chat_id or f"p2p:{open_id}"
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    reaction_id: str | None = None
+    if msg.message_id and not msg.message_id.startswith("card:"):
+        try:
+            reaction_id = await ctx.bridge.add_reaction(msg.message_id, "OnIt")
+        except Exception:
+            logger.warning("Failed to add processing reaction", exc_info=True)
+
+    progress_card = build_conversation_progress_card(
+        stage="working", detail="正在结合上下文调研与分析"
+    )
+    try:
+        if progress_message_id:
+            await ctx.bridge.update_card(progress_message_id, progress_card)
+        else:
+            progress_message_id = await ctx.bridge._send_interactive(
+                receive_id, progress_card, receive_id_type=receive_id_type
+            )
+    except Exception:
+        logger.warning("Failed to send conversation progress card", exc_info=True)
+        progress_message_id = None
+    progress_refresh_task = (
+        asyncio.create_task(
+            _refresh_conversation_progress(ctx, progress_message_id)
+        )
+        if progress_message_id
+        else None
+    )
+    conversation = ctx.service.append_conversation_turn(
+        chat_key,
+        role="user",
+        content=msg.text,
+        open_id=open_id,
+        message_id=msg.message_id,
+    )
+    active_project = _find_active_project_for_user(ctx, open_id)
+    if active_project is None and conversation.active_project_id:
+        active_project = ctx.service.get_project(conversation.active_project_id)
+
+    approvals: list[dict[str, Any]] = []
+    if active_project is not None:
+        approvals = [
+            {
+                "id": approval.id,
+                "type": approval.approval_type,
+                "state": approval.state,
+                "question": approval.question,
+            }
+            for approval in ctx.service.session.exec(
+                select(Approval)
+                .where(
+                    Approval.project_id == active_project.id,
+                    Approval.status == "pending",
+                )
+                .order_by(Approval.created_at.desc())
+            ).all()
+        ]
+    pending_actions = [
+        {
+            "id": action.id,
+            "type": action.action_type,
+            "payload": action.payload,
+        }
+        for action in ctx.service.get_session_pending_actions(conversation.id)
+    ]
+    pending_intent = ctx.service.get_pending_intent(open_id)
+
+    binding = ctx.service.get_chat_directory_binding(ctx.chat_id) if ctx.chat_id else None
+    workspace = Path(binding.directory) if binding else None
+    if workspace is None and active_project is not None:
+        workspace = Path(active_project.workspace_path)
+
+    active_project_data = (
+        {
+            "id": active_project.id,
+            "name": active_project.name,
+            "task_type": active_project.task_type,
+            "status": active_project.status,
+            "current_state": active_project.current_state,
+        }
+        if active_project is not None
+        else None
+    )
+    extra_variables = {
+        "user_message": msg.text,
+        "open_id": open_id,
+        "chat_id": chat_key,
+        "conversation_summary": conversation.summary or "无",
+        # The rolling summary carries older context. Keeping only the latest
+        # eight turns bounds prompt size and reduces chat latency.
+        "recent_turns": json.dumps(conversation.recent_turns[-8:], ensure_ascii=False),
+        "active_project": json.dumps(active_project_data, ensure_ascii=False),
+        "pending_approvals": json.dumps(approvals, ensure_ascii=False),
+        "pending_actions": json.dumps(pending_actions, ensure_ascii=False),
+        "pending_intent": json.dumps(
+            {
+                "stage": pending_intent.stage,
+                "description": pending_intent.description,
+            }
+            if pending_intent is not None
+            else None,
+            ensure_ascii=False,
+        ),
+        "latest_artifact": json.dumps(conversation.latest_artifact, ensure_ascii=False),
+        "workspace_path": str(workspace) if workspace else "未绑定工作区",
+    }
+    inspect_markers = (
+        "看下最新", "看看最新", "检查代码", "检查文档", "查看代码",
+        "查看文档", "review code", "inspect workspace",
+    )
+    coordinator_worktree = (
+        workspace
+        if workspace and workspace.exists() and any(marker in msg.text.lower() for marker in inspect_markers)
+        else None
+    )
+    execution_markers = (
+        "开始开发", "开始实现", "开始修复", "按刚才", "按这个做",
+        "着手开发", "执行这个方案",
+    )
+    wants_execution = any(marker in msg.text for marker in execution_markers)
+    coordinator_started = time.monotonic()
+
+    async def _coordinator_progress(event_type: str, content: str) -> None:
+        """Preserve the same real thinking/tool history used by project Agents."""
+        try:
+            if event_type == "thinking":
+                title = "对话协调 · 思考中"
+                body = content
+                color = "blue"
+            elif event_type == "tool":
+                data = json.loads(content)
+                tool_name = data.get("name") or "工具"
+                body = f"⚙️ **{tool_name}**: {json.dumps(data.get('input', {}), ensure_ascii=False)[:300]}"
+                title = "对话协调 · 正在执行"
+                color = "purple"
+            else:
+                return
+            await ctx.bridge.send_content_card(
+                open_id=receive_id,
+                title=title,
+                content=body,
+                color=color,
+                receive_id_type=receive_id_type,
+            )
+        except Exception:
+            logger.warning("Failed to send Coordinator progress event", exc_info=True)
+
+    try:
+        output = await runner(
+            agent_type="conversation_coordinator",
+            stage=None,
+            input_data={"message": msg.text},
+            extra_variables=extra_variables,
+            worktree=coordinator_worktree,
+            progress_callback=_coordinator_progress,
+        )
+    except Exception:
+        logger.exception("Conversation coordinator crashed")
+        output = None
+    finally:
+        if progress_refresh_task is not None:
+            progress_refresh_task.cancel()
+            await asyncio.gather(progress_refresh_task, return_exceptions=True)
+        logger.info(
+            "Conversation coordinator finished chat=%s message=%s elapsed=%.2fs success=%s",
+            chat_key,
+            msg.message_id,
+            time.monotonic() - coordinator_started,
+            bool(output and output.get("success")),
+        )
+    if progress_message_id:
+        try:
+            await ctx.bridge.update_card(
+                progress_message_id,
+                build_conversation_progress_card(
+                    stage="completed", detail="调研与分析完成，结果已整理"
+                ),
+            )
+        except Exception:
+            logger.warning("Failed to advance conversation progress card", exc_info=True)
+    if not output or not output.get("success"):
+        if not wants_execution:
+            output = {
+                "success": True,
+                "reply": "这次处理没有在时限内完成。你可以重试一次，或把问题拆成更小的一步。",
+                "intent": "unknown",
+                "effect": "none",
+                "commitment": "ambiguous",
+                "needs_clarification": False,
+                "updated_summary": conversation.summary or msg.text[:300],
+                "proposed_action": {"type": "answer"},
+            }
+        else:
+            output = {
+                "success": True,
+                "reply": "协调服务暂时没有返回完整结果。我已按你的原话整理为待确认执行，不会直接修改。",
+                "intent": "start_delivery",
+                "effect": "propose",
+                "commitment": "proposed",
+                "needs_clarification": False,
+                "updated_summary": conversation.summary or msg.text[:300],
+                "proposed_action": {
+                    "type": "propose_start_delivery",
+                    "task_type": "feature",
+                    "description": msg.text,
+                    "scope": [],
+                    "out_of_scope": [],
+                    "permissions": ["workspace_write"],
+                    "acceptance_criteria": [],
+                },
+            }
+
+    required_fields = {
+        "reply", "intent", "effect", "commitment", "needs_clarification",
+        "proposed_action",
+    }
+    if not required_fields.issubset(output):
+        result_text = str(output.get("result_text") or "").strip()
+        if wants_execution:
+            output = {
+                "success": True,
+                "reply": "模型没有返回完整动作结构。我已按最小安全范围整理为待确认执行，不会直接修改。",
+                "intent": "start_delivery",
+                "effect": "propose",
+                "commitment": "proposed",
+                "needs_clarification": False,
+                "updated_summary": conversation.summary or msg.text[:300],
+                "proposed_action": {
+                    "type": "propose_start_delivery",
+                    "task_type": "feature",
+                    "description": msg.text,
+                    "scope": [],
+                    "out_of_scope": [],
+                    "permissions": ["workspace_write"],
+                    "acceptance_criteria": [],
+                },
+            }
+        elif result_text:
+            output = {
+                "success": True,
+                "reply": result_text,
+                "intent": "consult",
+                "effect": "read_only",
+                "commitment": "none",
+                "needs_clarification": False,
+                "updated_summary": conversation.summary or result_text[:300],
+                "proposed_action": {"type": "answer"},
+            }
+        else:
+            logger.warning("Conversation coordinator returned an invalid contract")
+            output = {
+                "success": True,
+                "reply": "本次结果格式不完整，请重试一次。",
+                "intent": "unknown",
+                "effect": "none",
+                "commitment": "ambiguous",
+                "needs_clarification": False,
+                "updated_summary": conversation.summary or msg.text[:300],
+                "proposed_action": {"type": "answer"},
+            }
+
+    try:
+        await _apply_conversation_result(
+            ctx,
+            msg,
+            conversation,
+            output,
+            active_project=active_project,
+            # Completed milestones stay visible. The result/decision is a new
+            # card so users retain the execution history in the chat.
+            progress_message_id=None,
+        )
+    finally:
+        if reaction_id:
+            try:
+                await ctx.bridge.remove_reaction(msg.message_id, reaction_id)
+            except Exception:
+                logger.warning("Failed to remove processing reaction", exc_info=True)
+    return True
+
+
+async def _refresh_conversation_progress(
+    ctx: FeishuHandlerContext, message_id: str
+) -> None:
+    """Keep a long Coordinator turn visibly alive without sending new messages."""
+    started = time.monotonic()
+    while True:
+        await asyncio.sleep(10)
+        elapsed = int(time.monotonic() - started)
+        try:
+            await ctx.bridge.update_card(
+                message_id,
+                build_conversation_progress_card(
+                    stage="working",
+                    detail=f"已处理 {elapsed} 秒，仍在调研与分析",
+                ),
+            )
+        except Exception:
+            logger.warning("Failed to refresh conversation progress card", exc_info=True)
+
+
+async def _apply_conversation_result(
+    ctx: FeishuHandlerContext,
+    msg: TextMessage,
+    conversation: Any,
+    output: dict[str, Any],
+    *,
+    active_project: Project | None,
+    progress_message_id: str | None = None,
+) -> None:
+    """Apply one schema-validated coordinator result through safe handlers."""
+    open_id = msg.open_id
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    reply = str(output.get("reply") or "").strip()
+    action = output.get("proposed_action") or {"type": "none"}
+    action_type = action.get("type", "none")
+    sent_message_id: str | None = None
+
+    clarification = output.get("clarification") or {}
+    clarification_options = clarification.get("options") or []
+    if output.get("needs_clarification") and clarification_options:
+        payload = {
+            "question": clarification.get("question") or reply,
+            "reason": clarification.get("reason") or "",
+            "options": clarification_options[:3],
+            "allow_free_text": bool(clarification.get("allow_free_text")),
+        }
+        digest_source = json.dumps(
+            {
+                "session": conversation.id,
+                "message_id": msg.message_id,
+                "clarification": payload,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        pending = ctx.service.create_pending_conversation_action(
+            session_id=conversation.id,
+            action_type="clarification",
+            payload=payload,
+            source_message_ids=[msg.message_id] if msg.message_id else [],
+            idempotency_key=hashlib.sha256(digest_source.encode("utf-8")).hexdigest(),
+            created_by=open_id,
+        )
+        clarification_card = build_conversation_clarification_card(
+                pending.id,
+                payload["question"],
+                payload["options"],
+                reason=payload["reason"],
+                chat_id=ctx.chat_id,
+                chat_type=ctx.chat_type,
+        )
+        sent_message_id = await _deliver_conversation_card(
+            ctx, receive_id, receive_id_type, clarification_card,
+            message_id=progress_message_id,
+        )
+    elif action_type == "resolve_pending_action":
+        pending = ctx.service.get_session_pending_actions(conversation.id)
+        target_id = (output.get("target") or {}).get("id")
+        if target_id:
+            pending = [item for item in pending if item.id == target_id]
+        if len(pending) != 1 or output.get("commitment") != "authorized":
+            sent_message_id = await _send_conversation_reply(
+                ctx, receive_id, receive_id_type,
+                reply or "当前无法唯一确定要确认的执行动作，请从最新决策卡片中选择。",
+                message_id=progress_message_id,
+            )
+        else:
+            if reply:
+                sent_message_id = await _send_conversation_reply(
+                    ctx, receive_id, receive_id_type, reply,
+                    message_id=progress_message_id,
+                )
+            await _execute_pending_conversation_action(
+                ctx, open_id, pending[0].id, decision="confirm"
+            )
+    elif action_type == "propose_approval_resolution":
+        target_id = (output.get("target") or {}).get("id")
+        pending_approvals = []
+        if active_project is not None:
+            pending_approvals = list(
+                ctx.service.session.exec(
+                    select(Approval).where(
+                        Approval.project_id == active_project.id,
+                        Approval.status == "pending",
+                    )
+                ).all()
+            )
+        if target_id:
+            pending_approvals = [a for a in pending_approvals if a.id == target_id]
+        decision = action.get("approval_decision")
+        if (
+            len(pending_approvals) != 1
+            or output.get("commitment") != "authorized"
+            or decision not in {"confirm", "reject", "select_option"}
+        ):
+            sent_message_id = await _send_conversation_reply(
+                ctx, receive_id, receive_id_type,
+                reply or "当前无法唯一确定待处理审批，请从最新审批卡片中选择。",
+                message_id=progress_message_id,
+            )
+        else:
+            if reply:
+                sent_message_id = await _send_conversation_reply(
+                    ctx, receive_id, receive_id_type, reply,
+                    message_id=progress_message_id,
+                )
+            extra = {"option_key": action.get("option_key")} if action.get("option_key") else None
+            await _respond_to_approval(
+                ctx,
+                open_id,
+                pending_approvals[0].id,
+                decision,
+                feedback_text=action.get("feedback"),
+                extra=extra,
+            )
+    elif action_type == "propose_start_delivery":
+        if ctx.service.get_pending_intent(open_id) is not None:
+            ctx.service.delete_pending_intent(open_id)
+        payload = {
+            "task_type": action.get("task_type", "feature"),
+            "objective": action.get("description") or msg.text,
+            "description": action.get("description") or msg.text,
+            "scope": action.get("scope") or [],
+            "out_of_scope": action.get("out_of_scope") or [],
+            "permissions": action.get("permissions") or ["workspace_write"],
+            "acceptance_criteria": action.get("acceptance_criteria") or [],
+            "decisions": action.get("decisions") or [],
+        }
+        digest_source = json.dumps(
+            {
+                "session": conversation.id,
+                "message_id": msg.message_id,
+                "payload": payload,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        idem_key = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+        pending = ctx.service.create_pending_conversation_action(
+            session_id=conversation.id,
+            action_type="start_delivery",
+            payload=payload,
+            source_message_ids=[msg.message_id] if msg.message_id else [],
+            idempotency_key=idem_key,
+            created_by=open_id,
+        )
+        sent_message_id = await _deliver_conversation_card(
+            ctx, receive_id, receive_id_type,
+            build_pending_action_card(
+                pending.id,
+                pending.payload,
+                chat_id=ctx.chat_id,
+                chat_type=ctx.chat_type,
+            ),
+            message_id=progress_message_id,
+        )
+    elif action_type == "query_status" and active_project is not None:
+        if reply:
+            sent_message_id = await _send_conversation_reply(
+                ctx, receive_id, receive_id_type, reply, title="项目状态",
+                message_id=progress_message_id,
+            )
+        await _show_status(ctx, open_id, active_project.id)
+    elif action_type == "route_project_input" and active_project is not None:
+        state_machine = StateMachine(active_project.task_type)
+        running_state_tasks = [
+            task
+            for task in ctx.service._running_tasks(active_project.id)
+            if task.state == active_project.current_state
+        ]
+        if state_machine.is_agent_execution(active_project.current_state) and running_state_tasks:
+            intent = output.get("intent")
+            kind = (
+                "correction" if intent == "correct"
+                else "scope_change" if intent == "change_scope"
+                else "question"
+            )
+            await ctx.service.create_pending_user_input(
+                project_id=active_project.id,
+                sender_id=open_id,
+                observed_state=active_project.current_state,
+                content=msg.text,
+                kind=kind,
+                source_chat_id=ctx.chat_id,
+            )
+            sent_message_id = await _send_conversation_reply(
+                ctx, receive_id, receive_id_type,
+                reply or "已记录这项对当前执行有影响的输入，Agent 本轮结束后会处理。",
+                message_id=progress_message_id,
+            )
+        else:
+            sent_message_id = await _send_conversation_reply(
+                ctx, receive_id, receive_id_type,
+                reply or "当前没有正在运行的 Agent；我暂未修改项目状态。",
+                message_id=progress_message_id,
+            )
+    else:
+        sent_message_id = await _send_conversation_reply(
+            ctx,
+            receive_id,
+            receive_id_type,
+            reply or "我已经理解你的消息，但暂时没有需要执行的动作。",
+            message_id=progress_message_id,
+        )
+
+    ctx.service.append_conversation_turn(
+        conversation.chat_id,
+        role="assistant",
+        content=reply or f"[{action_type}]",
+        message_id=sent_message_id,
+    )
+    updated_summary = output.get("updated_summary")
+    latest_artifact = None
+    if action_type in {"inspect_workspace", "create_draft", "research"}:
+        latest_artifact = {
+            "kind": action_type,
+            "summary": updated_summary or reply[:500],
+            "message_id": sent_message_id,
+        }
+    ctx.service.update_conversation_session(
+        conversation,
+        summary=updated_summary if isinstance(updated_summary, str) else None,
+        latest_artifact=latest_artifact,
+        active_project_id=active_project.id if active_project else None,
+        update_active_project=active_project is not None,
+    )
+
+
+def _conversation_reply_needs_card(text: str) -> bool:
+    """Return whether a Coordinator reply benefits from Markdown rendering."""
+    markdown_markers = ("\n#", "\n- ", "\n1. ", "```", "**", "|---", "\n>")
+    return len(text) > 240 or any(marker in text for marker in markdown_markers)
+
+
+async def _send_conversation_reply(
+    ctx: FeishuHandlerContext,
+    receive_id: str,
+    receive_id_type: str,
+    text: str,
+    *,
+    title: str = "答复",
+    message_id: str | None = None,
+) -> str:
+    """Render every Coordinator reply as a card, updating progress in-place."""
+    return await _deliver_conversation_card(
+        ctx,
+        receive_id,
+        receive_id_type,
+        build_content_card(title, text, page=1, total=1),
+        message_id=message_id,
+    )
+
+
+async def _deliver_conversation_card(
+    ctx: FeishuHandlerContext,
+    receive_id: str,
+    receive_id_type: str,
+    card: dict[str, Any],
+    *,
+    message_id: str | None = None,
+) -> str:
+    """Update the active Coordinator card, falling back to a new card."""
+    if message_id:
+        try:
+            await ctx.bridge.update_card(message_id, card)
+            return message_id
+        except Exception:
+            logger.warning("Failed to update conversation card", exc_info=True)
+    return await ctx.bridge._send_interactive(
+        receive_id, card, receive_id_type=receive_id_type
+    )
+
+
+async def _execute_pending_conversation_action(
+    ctx: FeishuHandlerContext,
+    open_id: str,
+    action_id: str,
+    *,
+    decision: str,
+) -> None:
+    """Confirm/reject a chat-scoped action with idempotent side effects."""
+    receive_id, receive_id_type = _reply_target(ctx, open_id)
+    action = ctx.service.session.get(PendingConversationAction, action_id)
+    if action is None:
+        await ctx.bridge.send_text(
+            receive_id, "该执行请求不存在或已经清理。", receive_id_type=receive_id_type
+        )
+        return
+    if action.status in {"resolved", "rejected", "expired"}:
+        await ctx.bridge.send_text(
+            receive_id, "该操作已经处理，无需重复点击。", receive_id_type=receive_id_type
+        )
+        return
+    if action.created_by and action.created_by != open_id:
+        await ctx.bridge.send_text(
+            receive_id, "只有发起该执行请求的用户可以确认。", receive_id_type=receive_id_type
+        )
+        return
+    if decision != "confirm":
+        ctx.service.resolve_pending_conversation_action(
+            action_id, decision="reject", resolved_by=open_id
+        )
+        await ctx.bridge.send_text(
+            receive_id, "已保留当前讨论，不会开始修改。", receive_id_type=receive_id_type
+        )
+        return
+
+    claimed = ctx.service.claim_pending_conversation_action(
+        action_id, claimed_by=open_id
+    )
+    if claimed is None:
+        await ctx.bridge.send_text(
+            receive_id, "该操作正在处理或已经完成，请勿重复点击。", receive_id_type=receive_id_type
+        )
+        return
+    if claimed.action_type != "start_delivery":
+        ctx.service.finish_pending_conversation_action(action_id, status="pending")
+        await ctx.bridge.send_text(
+            receive_id, "暂不支持该操作类型。", receive_id_type=receive_id_type
+        )
+        return
+
+    payload = dict(claimed.payload)
+    source_conversation = ctx.service.session.get(
+        ConversationSession, claimed.session_id
+    )
+    confirmed_brief = {
+        "objective": payload.get("objective") or payload.get("description") or "",
+        "scope": payload.get("scope") or [],
+        "out_of_scope": payload.get("out_of_scope") or [],
+        "permissions": payload.get("permissions") or [],
+        "acceptance_criteria": payload.get("acceptance_criteria") or [],
+        "decisions": payload.get("decisions") or [],
+        "source_session_id": claimed.session_id,
+        "source_message_ids": claimed.source_message_ids or [],
+        # Structured decisions are authoritative. The bounded conversation
+        # snapshot is retained as a fallback for details the coordinator did
+        # not normalize, so the delivery Planner still sees confirmed context.
+        "conversation_summary": source_conversation.summary if source_conversation else "",
+        "recent_turns": list(source_conversation.recent_turns or [])
+        if source_conversation
+        else [],
+    }
+    try:
+        project = await ctx.service.create_project(
+            name=suggest_name(payload.get("description") or payload.get("objective") or "新项目"),
+            task_type=payload.get("task_type", "feature"),
+            description=payload.get("description") or payload.get("objective") or "",
+            creator_open_id=open_id,
+            feishu_chat_id=ctx.chat_id,
+            feishu_chat_type=ctx.chat_type,
+            initial_context={"confirmed_brief": confirmed_brief},
+        )
+    except Exception as exc:
+        ctx.service.finish_pending_conversation_action(action_id, status="pending")
+        logger.exception("Failed to create project from pending conversation action")
+        await ctx.bridge.send_text(
+            receive_id, f"未能开始实施：{exc}", receive_id_type=receive_id_type
+        )
+        return
+
+    payload["created_project_id"] = project.id
+    ctx.service.finish_pending_conversation_action(
+        action_id,
+        status="resolved",
+        target_project_id=project.id,
+        payload=payload,
+    )
+    await ctx.bridge.send_text(
+        receive_id,
+        f"已创建项目 {project.id}（{project.name or '未命名'}），当前正在准备第一个交付阶段。",
+        receive_id_type=receive_id_type,
+    )
+    try:
+        await _advance_until_confirm(ctx, project, receive_id, receive_id_type)
+    except Exception as exc:
+        logger.exception("Orchestrator tick failed after conversation action")
+        await ctx.bridge.send_text(
+            receive_id, f"项目已创建，但启动失败：{exc}", receive_id_type=receive_id_type
+        )
 
 
 async def _handle_question_card_reply(
@@ -778,6 +1501,7 @@ async def _respond_to_approval(
     chosen: str,
     feedback_text: str | None = None,
     extra: dict[str, Any] | None = None,
+    skip_rejection_feedback: bool = False,
 ) -> None:
     """Shared logic for card actions and text commands responding to an approval."""
     receive_id, receive_id_type = _reply_target(ctx, open_id)
@@ -787,6 +1511,14 @@ async def _respond_to_approval(
     except ApprovalNotFoundError:
         await ctx.bridge.send_text(
             receive_id, "该审批已过期或不存在", receive_id_type=receive_id_type
+        )
+        return
+
+    if approval.status != "pending":
+        await ctx.bridge.send_text(
+            receive_id,
+            "该审批已经处理或过期，无需重复点击。",
+            receive_id_type=receive_id_type,
         )
         return
 
@@ -806,6 +1538,29 @@ async def _respond_to_approval(
         await ctx.bridge.send_text(
             receive_id,
             f"你没有权限操作项目 {project.id} 的审批。",
+            receive_id_type=receive_id_type,
+        )
+        return
+
+    if (
+        chosen == "reject"
+        and not feedback_text
+        and not skip_rejection_feedback
+        and any(
+            stage.get("kind") == "planning"
+            and stage.get("confirmation", {}).get("state") == project.current_state
+            for stage in StateMachine(project.task_type).profile.get("stages", [])
+        )
+    ):
+        await ctx.bridge._send_interactive(
+            receive_id,
+            build_rejection_input_card(
+                project_name=project.name or project.id,
+                approval_id=approval.id,
+                state=project.current_state,
+                chat_id=project.feishu_chat_id or ctx.chat_id,
+                chat_type=project.feishu_chat_type or ctx.chat_type,
+            ),
             receive_id_type=receive_id_type,
         )
         return
@@ -844,13 +1599,22 @@ async def _respond_to_approval(
             break
 
     is_rejection = chosen == "reject"
+    action_note = {
+        "retry": "已重新排队执行。",
+        "choose_rework": "接下来请选择要回退的阶段。",
+        "cancel": "项目已终止。",
+    }.get(chosen, "项目继续执行。")
+    if is_rejection and feedback_text:
+        action_note = "修改意见已记录，Agent 将据此重做。"
+    elif is_rejection and skip_rejection_feedback:
+        action_note = "已跳过修改说明，项目将按原有上下文回退。"
 
     # Confirm the user's choice with a card before continuing.
     feedback_card = build_feedback_card(
         project_name=project.name or project.id,
         selected_label=selected_label,
         is_rejection=is_rejection,
-        note="项目继续执行。" if not is_rejection else "",
+        note=action_note,
     )
     await ctx.bridge._send_interactive(
         receive_id, feedback_card, receive_id_type=receive_id_type
@@ -1215,6 +1979,34 @@ def _path_within_allowed_roots(path: Path, allowed_roots: list[Path]) -> bool:
         except ValueError:
             continue
     return False
+
+
+def _valid_create_dir_candidate(path: Path, allowed_roots: list[Path]) -> bool:
+    """Validate an agent/card supplied directory before creating or binding it."""
+    try:
+        resolved = path.expanduser().resolve()
+    except Exception:
+        return False
+    direct_child = False
+    for root in allowed_roots:
+        try:
+            if resolved.parent == root.expanduser().resolve():
+                direct_child = True
+                break
+        except Exception:
+            continue
+    if not direct_child or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", resolved.name):
+        return False
+    if not resolved.exists():
+        return True
+    if not resolved.is_dir():
+        return False
+    if (resolved / ".git").exists():
+        return True
+    try:
+        return next(resolved.iterdir(), None) is None
+    except OSError:
+        return False
 
 
 async def _leave_project(
@@ -1823,32 +2615,39 @@ async def _maybe_pause_for_bind_dir_recommendation(
 
     await ctx.bridge.send_text(
         receive_id,
-        "正在根据需求描述查找可能匹配的代码目录…",
+        "正在根据需求描述生成候选目录名…",
         receive_id_type=receive_id_type,
     )
 
     allowed_roots_str = "\n".join(str(r) for r in allowed_roots)
     try:
-        output = await ctx.orchestrator.run_chat_scoped_agent(
-            agent_type="project_manager",
-            stage="bind_dir",
-            input_data={
-                "allowed_bind_roots": [str(r) for r in allowed_roots],
-                "description": description,
-            },
-            extra_variables={
-                "allowed_bind_roots": allowed_roots_str,
-                "description": description,
-            },
+        output = await asyncio.wait_for(
+            ctx.orchestrator.run_chat_scoped_agent(
+                agent_type="project_manager",
+                stage="create_dir",
+                input_data={
+                    "allowed_bind_roots": [str(r) for r in allowed_roots],
+                    "description": description,
+                },
+                extra_variables={
+                    "allowed_bind_roots": allowed_roots_str,
+                    "description": description,
+                },
+            ),
+            timeout=45.0,
         )
+    except asyncio.TimeoutError:
+        logger.warning("project_manager create_dir timed out; continuing without recommendation")
+        return False
     except Exception as exc:
-        logger.warning("project_manager bind_dir agent crashed in /create: %s", exc)
+        logger.warning("project_manager create_dir agent crashed in /create: %s", exc)
         return False
 
     if not output or not output.get("success") or not output.get("candidates"):
         return False
 
     valid: list[dict[str, str]] = []
+    seen: set[Path] = set()
     for c in output["candidates"][:8]:
         path_str = c.get("path", "")
         if not path_str:
@@ -1859,14 +2658,14 @@ async def _maybe_pause_for_bind_dir_recommendation(
         except Exception:
             logger.warning("bind_dir candidate path resolve failed: %s", path_str)
             continue
-        if not _path_within_allowed_roots(path, allowed_roots):
+        if not _valid_create_dir_candidate(path, allowed_roots):
             logger.warning(
-                "project_manager returned path outside allowed roots: %s", path
+                "project_manager returned unsafe create-dir candidate: %s", path
             )
             continue
-        if not (path / ".git").exists():
-            logger.warning("bind_dir candidate missing .git: %s", path)
+        if path in seen:
             continue
+        seen.add(path)
         valid.append({"path": str(path), "name": c.get("name") or path.name})
     if not valid:
         return False
@@ -1925,6 +2724,19 @@ async def _resume_create_with_bind_dir(
         return
     chat_id = pending.chat_id or ctx.chat_id
     chat_type = pending.chat_type or ctx.chat_type
+
+    if directory:
+        from mac_system.config import get_allowed_bind_roots
+
+        if not _valid_create_dir_candidate(
+            Path(directory), get_allowed_bind_roots()
+        ):
+            await ctx.bridge.send_text(
+                receive_id,
+                "该目录选项已失效或不符合安全规则，请使用最新候选卡片重新选择。",
+                receive_id_type=receive_id_type,
+            )
+            return
     ctx.service.delete_pending_intent(open_id)
 
     if directory:
@@ -2083,6 +2895,92 @@ async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) ->
         await _handle_menu_action(ctx, action)
         return
 
+    if action.action == "conversation_clarification":
+        pending_action_id = action.extras.get("pending_action_id")
+        pending = (
+            ctx.service.session.get(PendingConversationAction, pending_action_id)
+            if pending_action_id
+            else None
+        )
+        receive_id, receive_id_type = _reply_target(ctx, open_id)
+        if pending is None or pending.action_type != "clarification":
+            await _deliver_conversation_card(
+                ctx, receive_id, receive_id_type,
+                build_content_card("选择已失效", "该选择已经失效，请查看最新卡片。"),
+                message_id=action.message_id,
+            )
+            return
+        if pending.status != "pending":
+            await _deliver_conversation_card(
+                ctx, receive_id, receive_id_type,
+                build_content_card("已经处理", "该选择已经处理，无需重复点击。"),
+                message_id=action.message_id,
+            )
+            return
+        if pending.created_by and pending.created_by != open_id:
+            await _deliver_conversation_card(
+                ctx, receive_id, receive_id_type,
+                build_content_card("无法操作", "只有发起问题的用户可以选择。"),
+                message_id=action.message_id,
+            )
+            return
+        option_key = action.option_key or ""
+        options = pending.payload.get("options") or []
+        selected = next(
+            (item for item in options if str(item.get("key")) == option_key), None
+        )
+        if selected is None:
+            await _deliver_conversation_card(
+                ctx, receive_id, receive_id_type,
+                build_content_card("选项无效", "未找到这个选项，请查看最新卡片。"),
+                message_id=action.message_id,
+            )
+            return
+        ctx.service.resolve_pending_conversation_action(
+            pending.id, decision="confirm", resolved_by=open_id
+        )
+        label = str(selected.get("label") or option_key)
+        progress_message_id = action.message_id
+        if progress_message_id:
+            await ctx.bridge.update_card(
+                progress_message_id,
+                build_content_card("已完成选择", f"✅ 已选择：**{label}**", color="green"),
+            )
+        question = str(pending.payload.get("question") or "当前问题")
+        await _handle_coordinated_free_text(
+            ctx,
+            TextMessage(
+                open_id=open_id,
+                message_id=f"card:{pending.id}:{option_key}",
+                text=f"关于“{question}”，我选择「{label}」（{option_key}）。",
+                is_command=False,
+                chat_id=ctx.chat_id,
+                chat_type=ctx.chat_type,
+            ),
+            # Preserve the selected decision card and start a new milestone.
+            progress_message_id=None,
+        )
+        return
+
+    if action.action == "conversation_action":
+        pending_action_id = action.extras.get("pending_action_id")
+        decision = action.extras.get("decision", "confirm")
+        if not pending_action_id:
+            receive_id, receive_id_type = _reply_target(ctx, open_id)
+            await ctx.bridge.send_text(
+                receive_id,
+                "卡片缺少执行请求标识，请查看最新卡片。",
+                receive_id_type=receive_id_type,
+            )
+            return
+        await _execute_pending_conversation_action(
+            ctx,
+            open_id,
+            pending_action_id,
+            decision=decision,
+        )
+        return
+
     # Question batch card actions (unified ask_user).
     if action.action in (
         "answer_all_recommended",
@@ -2096,6 +2994,35 @@ async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) ->
 
     if action.action == "skip_free_text":
         return await _handle_skip_free_text(ctx, action)
+
+    if action.action == "submit_rejection_feedback":
+        feedback = str((action.extras or {}).get("rejection_feedback", "")).strip()
+        if not feedback:
+            receive_id, receive_id_type = _reply_target(ctx, open_id)
+            await ctx.bridge.send_text(
+                receive_id,
+                "请先填写修改意见，再提交驳回。",
+                receive_id_type=receive_id_type,
+            )
+            return
+        await _respond_to_approval(
+            ctx,
+            open_id,
+            action.approval_id,
+            "reject",
+            feedback_text=feedback,
+        )
+        return
+
+    if action.action == "reject_without_feedback":
+        await _respond_to_approval(
+            ctx,
+            open_id,
+            action.approval_id,
+            "reject",
+            skip_rejection_feedback=True,
+        )
+        return
 
     # Otherwise treat as an approval/decision button.
     if action.action == "select_option":

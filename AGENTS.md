@@ -1,6 +1,6 @@
 # AGENTS.md — MAC System 开发纪律
 
-## 项目当前状态（2026-07-15）
+## 项目当前状态（2026-07-17）
 
 ### 仓库
 
@@ -31,8 +31,8 @@
   - 质量关通过时按 `verified_feedback_ids` 关闭历史反馈
   - Agent 运行期间收到的自由文本/命令被消费为 `PendingUserInput`，scope_change/correction 会强制质量关进入 `REWORK`
   - 每轮任务记录 `round_number`，旧 approval 在状态重新进入时标记 `expired`
-- **单元测试基线**：**223 passed**。
-- **真实飞书端到端**：`full_feature_flow` 已干净跑通到 `COMPLETED`（旧四段规划版本，新三段规划需重跑）；`bind_dir_agent` 场景已验证（覆盖 main 之前）。
+- **单元测试基线**：**246 passed**（2026-07-17 复跑确认）。
+- **真实飞书端到端**：`full_feature_flow` 已在最新代码上全分支跑通到 `COMPLETED`（2026-07-17，`proj_20260717_013549_7aed`：需求/Spec 驳回、编码/测试/评审 REWORK 回退、验收回需求全量重放）；`planning_rejection_form` / `architecture_confirmation` / `acceptance_question_card` / `runtime_recovery_card` / `conversation_delivery` 场景均已真实飞书验证；脚本已能自动接管质量 Agent 主动 fail 的 REWORK（真实运行尚未自然触发）。
   - 注意：**同一聊天窗口不要并发跑多个 e2e scenario**，否则 simulator 会把不同项目的 approval 卡片串扰。
 
 ### 已踩坑 & 必须规避
@@ -90,17 +90,17 @@
 1. **单元测试全绿**
 
    ```bash
-   cd /Users/yihanwang/multi-agent-coding-system/.worktrees/feat-core
-   source .venv/bin/activate
+   cd /Users/yihanwang/multi-agent-coding-system
+   source .worktrees/feat-core/.venv/bin/activate
    pytest tests/ -q
    ```
 
-   当前基线：**223 passed**（含 full_flow 分支覆盖测试、安全与恢复回归测试）。
+   当前基线：**246 passed**（含 full_flow 分支覆盖测试、安全与恢复回归测试）。
 
 2. **真实飞书端到端验证（必须）**
 
    ```bash
-   source .venv/bin/activate
+   source .worktrees/feat-core/.venv/bin/activate
    set -a && source .env && set +a
    python scripts/feishu_e2e.py --scenario full_feature_flow
    ```
@@ -134,7 +134,7 @@
 | 项 | 值 |
 |---|---|
 | Python | 3.10 |
-| 虚拟环境 | `.venv/`（位于项目根目录） |
+| 虚拟环境 | `.worktrees/feat-core/.venv/`（editable install 指向仓库根 `src/`） |
 | 服务端口 | `18080`（`.env` 中 `MCS_PORT=18080`） |
 | 框架 | FastAPI + Uvicorn |
 | 数据库 | SQLite `mac_system.db` |
@@ -151,8 +151,8 @@
 ### 1. 启动服务（验证/生产用，**不带 reload**）
 
 ```bash
-cd /Users/yihanwang/multi-agent-coding-system/.worktrees/feat-core
-source .venv/bin/activate
+cd /Users/yihanwang/multi-agent-coding-system
+source .worktrees/feat-core/.venv/bin/activate
 set -a && source .env && set +a
 pip install -e .
 nohup uvicorn mac_system.api.main:app --host 0.0.0.0 --port 18080 > server.log 2>&1 &

@@ -67,6 +67,36 @@ def test_health(client):
     assert response.json() == {"status": "ok"}
 
 
+@pytest.mark.parametrize(
+    ("kind", "expected_state", "has_interaction"),
+    [
+        ("planning_rejection", "REQUIREMENT_CONFIRM_PENDING", False),
+        ("acceptance_question", "ACCEPTANCE_INPUT_PENDING", True),
+        ("runtime_recovery", "CODING_RECOVERY_PENDING", False),
+    ],
+)
+def test_seed_feishu_interaction(
+    client, monkeypatch, kind, expected_state, has_interaction
+):
+    monkeypatch.setattr(get_settings(), "feishu_test_mode", True)
+
+    response = client.post(
+        "/test/seed_feishu_interaction",
+        json={
+            "kind": kind,
+            "open_id": "ou_seed",
+            "chat_id": "oc_seed",
+            "chat_type": "group",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["state"] == expected_state
+    assert payload["approval_id"].startswith("appr_")
+    assert bool(payload["interaction_id"]) is has_interaction
+
+
 def test_control_api_rejects_missing_token(client):
     authorization = client.headers.pop("authorization")
     try:

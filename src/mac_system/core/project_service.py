@@ -17,10 +17,12 @@ from mac_system.models import (
     ChatDirectoryBinding,
     ChatUserContext,
     ConversationInteraction,
+    ConversationSession,
     DefaultAuthorization,
     EventLog,
     FeedbackPacket,
     PendingIntent,
+    PendingConversationAction,
     PendingUserInput,
     ProcessedEvent,
     Project,
@@ -98,6 +100,221 @@ class ProjectService:
         self.session = session
         self.settings = get_settings()
 
+    def get_or_create_conversation_session(self, chat_id: str) -> ConversationSession:
+        conversation = self.session.exec(
+            select(ConversationSession).where(ConversationSession.chat_id == chat_id)
+        ).first()
+        if conversation is not None:
+            return conversation
+        conversation = ConversationSession(
+            id=generate_id("conv"),
+            chat_id=chat_id,
+        )
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
+        return conversation
+
+    def append_conversation_turn(
+        self,
+        chat_id: str,
+        *,
+        role: str,
+        content: str,
+        open_id: str | None = None,
+        message_id: str | None = None,
+        max_turns: int = 20,
+    ) -> ConversationSession:
+        conversation = self.get_or_create_conversation_session(chat_id)
+        turns = list(conversation.recent_turns or [])
+        turns.append(
+            {
+                "role": role,
+                "content": content,
+                "open_id": open_id,
+                "message_id": message_id,
+                "created_at": _now().isoformat(),
+            }
+        )
+        conversation.recent_turns = turns[-max_turns:]
+        conversation.version += 1
+        conversation.updated_at = _now()
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
+        return conversation
+
+    def update_conversation_session(
+        self,
+        conversation: ConversationSession,
+        *,
+        summary: str | None = None,
+        latest_artifact: dict[str, Any] | None = None,
+        active_project_id: str | None = None,
+        update_active_project: bool = False,
+    ) -> ConversationSession:
+        if summary is not None:
+            conversation.summary = summary
+        if latest_artifact is not None:
+            conversation.latest_artifact = latest_artifact
+        if update_active_project:
+            conversation.active_project_id = active_project_id
+        conversation.version += 1
+        conversation.updated_at = _now()
+        self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(conversation)
+        return conversation
+
+    def create_pending_conversation_action(
+        self,
+        *,
+        session_id: str,
+        action_type: str,
+        payload: dict[str, Any],
+        source_message_ids: list[str],
+        idempotency_key: str,
+        created_by: str | None,
+        target_project_id: str | None = None,
+    ) -> PendingConversationAction:
+        existing = self.session.exec(
+            select(PendingConversationAction).where(
+                PendingConversationAction.idempotency_key == idempotency_key
+            )
+        ).first()
+        if existing is not None:
+            return existing
+
+        pending = self.session.exec(
+            select(PendingConversationAction).where(
+                PendingConversationAction.session_id == session_id,
+                PendingConversationAction.status == "pending",
+            )
+        ).all()
+        for item in pending:
+            item.status = "expired"
+            item.resolved_at = _now()
+            self.session.add(item)
+
+        action = PendingConversationAction(
+            id=generate_id("cact"),
+            session_id=session_id,
+            action_type=action_type,
+            target_project_id=target_project_id,
+            payload=payload,
+            source_message_ids=source_message_ids,
+            idempotency_key=idempotency_key,
+            created_by=created_by,
+        )
+        self.session.add(action)
+        conversation = self.session.get(ConversationSession, session_id)
+        if conversation is not None:
+            conversation.pending_action_id = action.id
+            conversation.version += 1
+            conversation.updated_at = _now()
+            self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(action)
+        return action
+
+    def get_pending_conversation_action(
+        self, action_id: str
+    ) -> PendingConversationAction | None:
+        action = self.session.get(PendingConversationAction, action_id)
+        if action is None or action.status != "pending":
+            return None
+        return action
+
+    def get_session_pending_actions(
+        self, session_id: str
+    ) -> list[PendingConversationAction]:
+        return list(
+            self.session.exec(
+                select(PendingConversationAction)
+                .where(
+                    PendingConversationAction.session_id == session_id,
+                    PendingConversationAction.status == "pending",
+                )
+                .order_by(PendingConversationAction.created_at.desc())
+            ).all()
+        )
+
+    def resolve_pending_conversation_action(
+        self,
+        action_id: str,
+        *,
+        decision: str,
+        resolved_by: str,
+    ) -> PendingConversationAction:
+        action = self.session.get(PendingConversationAction, action_id)
+        if action is None:
+            raise ValueError("待确认动作不存在")
+        if action.status != "pending":
+            return action
+        action.status = "resolved" if decision == "confirm" else "rejected"
+        action.resolved_by = resolved_by
+        action.resolved_at = _now()
+        self.session.add(action)
+        conversation = self.session.get(ConversationSession, action.session_id)
+        if conversation is not None and conversation.pending_action_id == action.id:
+            conversation.pending_action_id = None
+            conversation.version += 1
+            conversation.updated_at = _now()
+            self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(action)
+        return action
+
+    def claim_pending_conversation_action(
+        self, action_id: str, *, claimed_by: str
+    ) -> PendingConversationAction | None:
+        """Atomically claim a pending action before executing its side effect."""
+        result = self.session.exec(
+            update(PendingConversationAction)
+            .where(
+                PendingConversationAction.id == action_id,
+                PendingConversationAction.status == "pending",
+            )
+            .values(status="processing", resolved_by=claimed_by)
+        )
+        self.session.commit()
+        if getattr(result, "rowcount", 0) != 1:
+            return None
+        return self.session.get(PendingConversationAction, action_id)
+
+    def finish_pending_conversation_action(
+        self,
+        action_id: str,
+        *,
+        status: str,
+        target_project_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> PendingConversationAction:
+        if status not in {"resolved", "rejected", "pending"}:
+            raise ValueError(f"Unsupported pending action status: {status}")
+        action = self.session.get(PendingConversationAction, action_id)
+        if action is None:
+            raise ValueError("待确认动作不存在")
+        action.status = status
+        action.target_project_id = target_project_id or action.target_project_id
+        if payload is not None:
+            action.payload = payload
+        action.resolved_at = _now() if status in {"resolved", "rejected"} else None
+        if status == "pending":
+            action.resolved_by = None
+        self.session.add(action)
+        conversation = self.session.get(ConversationSession, action.session_id)
+        if conversation is not None:
+            conversation.pending_action_id = action.id if status == "pending" else None
+            if target_project_id:
+                conversation.active_project_id = target_project_id
+            conversation.version += 1
+            conversation.updated_at = _now()
+            self.session.add(conversation)
+        self.session.commit()
+        self.session.refresh(action)
+        return action
+
     async def create_project(
         self,
         name: str | None,
@@ -108,6 +325,7 @@ class ProjectService:
         feishu_chat_id: str | None = None,
         feishu_chat_type: str = "p2p",
         bound_directory: str | None = None,
+        initial_context: dict | None = None,
     ) -> Project:
         project_id = generate_id("proj")
         if bound_directory is None and feishu_chat_id:
@@ -156,6 +374,14 @@ class ProjectService:
 
         approval_config = self._resolve_approval_config(approval_mode)
 
+        project_context = dict(initial_context or {})
+        project_context.update({
+            "task_type": task_type,
+            "description": description,
+            "approval_mode": approval_mode,
+            "retry_counts": {},
+        })
+
         project = Project(
             id=project_id,
             name=name,
@@ -166,12 +392,7 @@ class ProjectService:
             previous_state=None,
             workspace_path=str(workspace_path),
             bound_directory=str(workspace_path) if bound_directory else None,
-            context={
-                "task_type": task_type,
-                "description": description,
-                "approval_mode": approval_mode,
-                "retry_counts": {},
-            },
+            context=project_context,
             approval_config=approval_config,
             feishu_chat_id=feishu_chat_id,
             feishu_chat_type=feishu_chat_type,
@@ -811,6 +1032,12 @@ class ProjectService:
         triggered_by: str = "system",
     ) -> Project:
         project = self.require_project(project_id)
+        # A long-running Agent may finish after another request has cancelled
+        # or paused the project. Refresh before applying its transition so a
+        # cached ORM object cannot resurrect a terminal project.
+        self.session.refresh(project)
+        if project.status != "active":
+            raise InvalidStateTransitionError(project.current_state, event)
         state_machine = StateMachine(project.task_type)
 
         next_state = state_machine.next_state(project.current_state, event)
@@ -827,6 +1054,16 @@ class ProjectService:
         elif next_state == "CANCELLED":
             project.status = "cancelled"
         project.updated_at = _now()
+
+        if previous_state.endswith("_RECOVERY_PENDING"):
+            recovery_for = state_machine.get_state(previous_state).get("recovery_for")
+            retry_counts = dict(project.context.get("retry_counts", {}))
+            if recovery_for:
+                retry_counts[recovery_for] = 0
+            new_context = dict(project.context)
+            new_context["retry_counts"] = retry_counts
+            new_context.pop("last_agent_failure", None)
+            project.context = new_context
 
         # Update context if payload provided rollback/resolved decisions
         if payload:
@@ -994,6 +1231,31 @@ class ProjectService:
             try:
                 state_machine = StateMachine(project.task_type)
             except (ValueError, FileNotFoundError):
+                continue
+            if state_machine.is_agent_execution(project.current_state):
+                running = self.session.exec(
+                    select(Task).where(
+                        Task.project_id == project.id,
+                        Task.state == project.current_state,
+                        Task.status == "running",
+                    )
+                ).first()
+                latest_completed = self.session.exec(
+                    select(Task)
+                    .where(
+                        Task.project_id == project.id,
+                        Task.state == project.current_state,
+                        Task.status == "completed",
+                    )
+                    .order_by(Task.updated_at.desc())
+                ).first()
+                if (
+                    running is None
+                    and latest_completed is not None
+                    and latest_completed.output_data
+                    and latest_completed.updated_at > project.updated_at
+                ):
+                    projects_needing_tick.add(project.id)
                 continue
             if not (
                 state_machine.is_human_confirmation(project.current_state)
@@ -1347,6 +1609,9 @@ class ProjectService:
             stage=stage, batch_key=batch_key, status="pending", approval_id=approval_id,
         )
         self.session.add(interaction)
+        # These models intentionally have no ORM relationship. With foreign
+        # keys enabled, explicitly materialize the parent before its questions.
+        self.session.flush()
         for idx, q in enumerate(questions):
             qid = q.get("question_id") or generate_id("q")
             options = q.get("options") or []

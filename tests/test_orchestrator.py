@@ -13,6 +13,7 @@ from mac_system.core.lock_manager import ProjectLockManager
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.models import Approval, FeedbackPacket, Task
+from mac_system.state_machine import StateMachine
 
 
 @pytest.fixture
@@ -66,7 +67,7 @@ async def test_orchestrator_auto_runs_planner_requirements(orchestrator, tmp_pat
     assert data["summary"] == "config-validator CLI"
 
 
-def test_architecture_confirmation_exposes_concrete_decision_options(
+def test_architecture_confirmation_only_allows_confirm_or_reject(
     orchestrator, tmp_path
 ):
     service, wm, renderer = orchestrator
@@ -95,10 +96,9 @@ def test_architecture_confirmation_exposes_concrete_decision_options(
     _, options = oc._build_confirmation_question(
         project, "ARCHITECTURE_CONFIRM_PENDING"
     )
-    selectable = [opt for opt in options if opt["action"] == "select_option"]
-    assert [(opt["decision_id"], opt["option_key"]) for opt in selectable] == [
-        ("DEC-DB-001", "sqlite"),
-        ("DEC-DB-001", "postgres"),
+    assert [(opt["action"], opt["label"]) for opt in options] == [
+        ("confirm", "确认"),
+        ("reject", "驳回"),
     ]
 
 
@@ -339,7 +339,7 @@ def test_build_acceptance_options_per_task_type(orchestrator):
 
 
 @pytest.mark.asyncio
-async def test_agent_failure_persists_retry_count(orchestrator):
+async def test_agent_failure_retries_automatically_and_persists_count(orchestrator):
     service, wm, renderer = orchestrator
 
     runtime = FakeRuntime({
@@ -351,6 +351,7 @@ async def test_agent_failure_persists_retry_count(orchestrator):
     })
 
     oc = AgentOrchestrator(service, wm, runtime, renderer)
+    oc.settings.max_agent_retries = 2
     project = await service.create_project(
         name="test",
         task_type="feature",
@@ -360,11 +361,13 @@ async def test_agent_failure_persists_retry_count(orchestrator):
 
     await oc.tick(project.id)
 
-    # Fake runtime returns failure; orchestrator should increment retry count
-    # and stay in PLANNING_REQUIREMENTS.
+    # One tick performs both allowed attempts, then waits for a user recovery
+    # decision instead of requiring an external/manual tick.
     updated = service.get_project(project.id)
-    assert updated.current_state == "PLANNING_REQUIREMENTS"
-    assert updated.context.get("retry_counts", {}).get("PLANNING_REQUIREMENTS") == 1
+    assert updated.current_state == "PLANNING_REQUIREMENTS_RECOVERY_PENDING"
+    assert updated.context.get("retry_counts", {}).get("PLANNING_REQUIREMENTS") == 2
+    tasks = service.session.exec(select(Task).where(Task.project_id == project.id)).all()
+    assert len(tasks) == 2
 
 
 @pytest.mark.asyncio
@@ -543,7 +546,7 @@ async def test_night_mode_auto_confirms_bug_fix_confirmation(orchestrator, monke
 
 
 @pytest.mark.asyncio
-async def test_agent_transitions_failed_on_last_allowed_attempt(orchestrator):
+async def test_agent_transitions_to_recovery_on_last_allowed_attempt(orchestrator):
     service, wm, renderer = orchestrator
     runtime = FakeRuntime({
         "planner": {
@@ -561,20 +564,23 @@ async def test_agent_transitions_failed_on_last_allowed_attempt(orchestrator):
     )
 
     await oc.tick(project.id)
-    assert service.get_project(project.id).current_state == "PLANNING_REQUIREMENTS"
-    await oc.tick(project.id)
-    assert service.get_project(project.id).current_state == "PLANNING_REQUIREMENTS"
-    await oc.tick(project.id)
 
     updated = service.get_project(project.id)
-    assert updated.current_state == "FAILED"
-    assert updated.status == "failed"
+    assert updated.current_state == "PLANNING_REQUIREMENTS_RECOVERY_PENDING"
+    assert updated.status == "active"
+    assert updated.context["last_agent_failure"]["agent"] == "planner"
     assert not service._running_tasks(project.id)
+
+    await service.transition_state(project.id, "retry", triggered_by="user")
+    retried = service.get_project(project.id)
+    assert retried.current_state == "PLANNING_REQUIREMENTS"
+    assert retried.context["retry_counts"]["PLANNING_REQUIREMENTS"] == 0
+    assert "last_agent_failure" not in retried.context
 
 
 @pytest.mark.asyncio
-async def test_quality_gate_retry_exhaustion_goes_to_failed(orchestrator):
-    """TESTING/REVIEW exhausted retries must transition to FAILED, not REWORK."""
+async def test_quality_gate_retry_exhaustion_offers_recovery(orchestrator):
+    """Runtime exhaustion is recoverable and is never confused with quality fail."""
     service, wm, renderer = orchestrator
     runtime = FakeRuntime({
         "tester": {
@@ -601,8 +607,83 @@ async def test_quality_gate_retry_exhaustion_goes_to_failed(orchestrator):
     await oc.tick(project.id)
 
     updated = service.get_project(project.id)
-    assert updated.current_state == "FAILED"
-    assert updated.status == "failed"
+    assert updated.current_state == "TESTING_RECOVERY_PENDING"
+    assert updated.status == "active"
+    assert set(StateMachine("feature").available_events(updated.current_state)) == {
+        "retry",
+        "choose_rework",
+        "cancel",
+    }
+
+
+@pytest.mark.asyncio
+async def test_quality_outputs_are_persisted_for_bounded_review(orchestrator, tmp_path):
+    service, wm, renderer = orchestrator
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer)
+    project = await service.create_project(
+        name="review-evidence",
+        task_type="feature",
+        description="persist compact quality evidence",
+        approval_mode="normal",
+    )
+    worktree = tmp_path / "review-evidence-worktree"
+    (worktree / ".mac").mkdir(parents=True)
+    tester_output = {
+        "success": True,
+        "next_state_event": "complete",
+        "passed": True,
+        "test_evidence": [],
+    }
+
+    oc._persist_stage_output(project, worktree, tester_output, "TESTING")
+
+    persisted = Path(project.workspace_path) / ".mac" / "TESTER_OUTPUT.json"
+    assert json.loads(persisted.read_text(encoding="utf-8")) == tester_output
+    context_names = {
+        path.name for path in oc._context_files_for_state(project, "REVIEW")
+    }
+    assert "TESTER_OUTPUT.json" in context_names
+
+
+@pytest.mark.asyncio
+async def test_acceptance_evaluator_can_ask_user_and_resume(orchestrator):
+    service, wm, renderer = orchestrator
+    runtime = FakeRuntime({
+        "acceptance_evaluator": {
+            "success": True,
+            "next_state_event": "ask_user",
+            "question_batch": {
+                "batch_key": "acceptance-business-check",
+                "questions": [{
+                    "question_id": "q_business_result",
+                    "kind": "blocking",
+                    "question": "实际业务结果是否符合预期？",
+                    "reason": "自动测试无法验证人工体验",
+                    "allow_free_text": True,
+                    "options": [],
+                    "affected_trace_ids": ["AC-001"],
+                }],
+            },
+        }
+    })
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="acceptance-question",
+        task_type="feature",
+        description="ask user at acceptance",
+        approval_mode="normal",
+    )
+    project.current_state = "ACCEPTANCE_PENDING"
+    service.session.commit()
+
+    await oc.tick(project.id)
+
+    updated = service.require_project(project.id)
+    assert updated.current_state == "ACCEPTANCE_INPUT_PENDING"
+    interaction = service.get_open_question_interaction(project.id)
+    assert interaction is not None
+    assert interaction.agent == "acceptance_evaluator"
+    assert interaction.resume_state == "ACCEPTANCE_PENDING"
 
 
 @pytest.mark.asyncio
@@ -1002,6 +1083,21 @@ async def test_pending_user_input_discards_planner_result(orchestrator):
     assert any(fb.kind == "correction" and fb.blocking for fb in open_feedback)
 
 
+def test_planner_artifact_validation_rejects_invalid_json(orchestrator, tmp_path):
+    service, wm, renderer = orchestrator
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer)
+    mac_dir = tmp_path / ".mac"
+    mac_dir.mkdir()
+    (mac_dir / "REQUIREMENTS.json").write_text(
+        '{"artifact_id":"requirements", invalid}', encoding="utf-8"
+    )
+
+    error = oc._planner_artifact_error(tmp_path, "PLANNING_REQUIREMENTS")
+
+    assert error is not None
+    assert "not valid JSON" in error
+
+
 @pytest.mark.asyncio
 async def test_pending_user_input_discards_coder_result(orchestrator):
     service, wm, renderer = orchestrator
@@ -1152,6 +1248,120 @@ async def test_question_batch_creates_interaction(orchestrator, tmp_path):
     assert len(questions) == 1
     assert questions[0].question_id == "q_scope"
     assert questions[0].recommended_option == "full"
+
+
+@pytest.mark.asyncio
+async def test_question_batch_suppresses_confirmed_decision_and_keeps_delta(
+    orchestrator, tmp_path
+):
+    service, wm, renderer = orchestrator
+    runtime = FakeRuntime({
+        "planner": {
+            "success": True,
+            "next_state_event": "ask_user",
+            "question_batch": {
+                "batch_key": "req_delta_1",
+                "questions": [
+                    {
+                        "question_id": "q_agent_scope",
+                        "decision_key": "agent.capability_scope",
+                        "kind": "blocking",
+                        "question": "Agent 是仅简历问答还是开放智能体？",
+                        "reason": "确定产品定位",
+                        "allow_free_text": False,
+                        "options": [
+                            {"key": "open", "label": "开放", "impact": "能力完整", "recommended": True}
+                        ],
+                        "affected_trace_ids": [],
+                    },
+                    {
+                        "question_id": "q_sandbox_language",
+                        "decision_key": "sandbox.languages",
+                        "kind": "decision",
+                        "question": "代码沙箱支持哪些语言？",
+                        "reason": "确定运行时范围",
+                        "allow_free_text": False,
+                        "options": [
+                            {"key": "python", "label": "Python", "impact": "实现简单", "recommended": True}
+                        ],
+                        "affected_trace_ids": [],
+                    },
+                ],
+            },
+        }
+    })
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="confirmed-brief",
+        task_type="feature",
+        description="个人数字分身，具备开放智能体能力",
+        approval_mode="normal",
+        initial_context={
+            "confirmed_brief": {
+                "decisions": [{
+                    "key": "agent.capability_scope",
+                    "question": "Agent 的能力范围是什么？",
+                    "answer": "个人数字分身，同时具备开放智能体能力",
+                    "status": "confirmed",
+                }]
+            }
+        },
+    )
+
+    await oc.tick(project.id)
+
+    updated = service.require_project(project.id)
+    assert updated.current_state == "REQUIREMENT_INPUT_PENDING"
+    interaction = service.get_open_question_interaction(project.id)
+    questions = service.get_questions_for_interaction(interaction.id)
+    assert [question.question_id for question in questions] == ["q_sandbox_language"]
+    task = service.session.exec(
+        select(Task).where(Task.project_id == project.id).order_by(Task.created_at.desc())
+    ).first()
+    assert len(task.output_data["question_batch"]["questions"]) == 1
+
+
+
+@pytest.mark.asyncio
+async def test_tick_recovers_completed_but_unapplied_question_batch(orchestrator, tmp_path):
+    service, wm, renderer = orchestrator
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer)
+    project = await service.create_project(
+        name="recover-unapplied", task_type="feature", description="test",
+        approval_mode="normal",
+    )
+    task = await service.create_task(
+        project.id, "planner", "PLANNING_REQUIREMENTS", {"description": "test"}, 1
+    )
+    worktree = tmp_path / "recover-worktree"
+    worktree.mkdir()
+    await service.start_task(task.id, str(worktree))
+    await service.complete_task(task.id, {
+        "success": True,
+        "next_state_event": "ask_user",
+        "question_batch": {
+            "batch_key": "recover_batch",
+            "questions": [{
+                "question_id": "q_recover", "kind": "blocking",
+                "question": "恢复后选择？", "reason": "验证崩溃恢复",
+                "allow_free_text": False,
+                "options": [
+                    {"key": "yes", "label": "继续", "impact": "继续", "recommended": True}
+                ],
+                "affected_trace_ids": [],
+            }],
+        },
+    }, None)
+
+    assert project.id in service.reconcile_project_invariants()
+    await oc.tick(project.id)
+
+    updated = service.require_project(project.id)
+    assert updated.current_state == "REQUIREMENT_INPUT_PENDING"
+    interaction = service.get_open_question_interaction(project.id)
+    assert interaction is not None
+    tasks = service.session.exec(select(Task).where(Task.project_id == project.id)).all()
+    assert len(tasks) == 1
 
 
 @pytest.mark.asyncio

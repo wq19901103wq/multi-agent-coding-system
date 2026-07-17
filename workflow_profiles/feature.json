@@ -21,7 +21,7 @@
       "stage": "architecture",
       "display": "方案设计中",
       "inputs": [{"state": "ARCHITECTURE_INPUT_PENDING", "display": "等待方案澄清", "default": true}],
-      "confirmation": {"state": "ARCHITECTURE_CONFIRM_PENDING", "display": "等待确认方案", "subject": "技术方案", "routes": {"select_option": "$stage:architecture"}}
+      "confirmation": {"state": "ARCHITECTURE_CONFIRM_PENDING", "display": "等待确认方案", "subject": "技术方案"}
     },
     {
       "id": "specs",

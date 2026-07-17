@@ -3,10 +3,17 @@ from pathlib import Path
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base
 
-from mac_system.database import _run_migrations
+from mac_system.database import _engine, _run_migrations
 
 
 Base = declarative_base()
+
+
+def test_sqlite_engine_waits_for_writes_and_uses_wal():
+    with _engine.connect() as conn:
+        assert conn.execute(text("PRAGMA busy_timeout")).scalar_one() == 30000
+        assert conn.execute(text("PRAGMA journal_mode")).scalar_one().lower() == "wal"
+        assert conn.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
 
 
 def test_migrations_add_missing_columns_and_tables(tmp_path: Path):
