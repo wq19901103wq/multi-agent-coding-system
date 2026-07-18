@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -26,6 +27,7 @@ class ButtonAction:
     chat_id: str | None = None
     chat_type: str = "p2p"
     message_id: str | None = None
+    created_at: datetime | None = None
 
 
 @dataclass
@@ -42,3 +44,4 @@ class TextMessage:
     sender_type: str = "user"
     is_at_bot: bool = False
     mentions: list[dict[str, Any]] = field(default_factory=list)
+    created_at: datetime | None = None

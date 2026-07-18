@@ -25,6 +25,8 @@ from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.database import session_scope
 from mac_system.feishu.bridge import FeishuBridge
+from datetime import datetime, timedelta, timezone
+
 from mac_system.feishu.handlers import (
     FeishuHandlerContext,
     handle_card_action,
@@ -86,6 +88,9 @@ class FeishuWebSocketClient:
         self.settings = get_settings()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Serialize handling of all events from the same user so that
+        # WebSocket messages/cards are processed in the order they were sent.
+        self._user_locks: dict[str, threading.Lock] = {}
 
     def start(self) -> None:
         if "PYTEST_CURRENT_TEST" in os.environ:
@@ -215,7 +220,33 @@ class FeishuWebSocketClient:
             logger.warning("Feishu WS disconnected, retrying in 5s...")
             time.sleep(5)
 
+    def _user_lock(self, open_id: str) -> threading.Lock:
+        """Return a lock that serializes all events from the same user."""
+        return self._user_locks.setdefault(open_id, threading.Lock())
+
+    def _is_stale_event(
+        self,
+        service: ProjectService,
+        chat_id: str | None,
+        open_id: str,
+        event_at: datetime | None,
+    ) -> bool:
+        """Return True if this event is older than the user's last handled event.
+
+        A small grace window allows for sub-second delivery jitter.
+        """
+        if event_at is None:
+            return False
+        watermark = service.get_last_event_at(chat_id or open_id, open_id)
+        if watermark is None:
+            return False
+        grace = 5  # seconds
+        watermark_naive = watermark.replace(tzinfo=None) if watermark.tzinfo else watermark
+        return event_at < watermark_naive - timedelta(seconds=grace)
+
     async def _handle_message(self, msg: TextMessage, event_id: str | None = None) -> None:
+        lock = self._user_lock(msg.open_id)
+        await asyncio.to_thread(lock.acquire)
         try:
             logger.info(
                 "[Feishu WS] raw message chat_type=%s chat_id=%s sender=%s mentions=%s text=%r",
@@ -249,24 +280,55 @@ class FeishuWebSocketClient:
                 if event_id and ctx.service.is_event_processed(event_id):
                     logger.info("[Feishu WS] skipping duplicate message event_id=%s", event_id)
                     return
-                if event_id:
-                    ctx.service.mark_event_processed(event_id, "message")
+                service = getattr(ctx, "service", None)
+                if service and self._is_stale_event(service, msg.chat_id, msg.open_id, msg.created_at):
+                    logger.info(
+                        "[Feishu WS] skipping stale message created_at=%s for %s",
+                        msg.created_at, msg.open_id,
+                    )
+                    return
+                if event_id and service:
+                    service.mark_event_processed(event_id, "message")
                 await handle_text_message(ctx, msg)
+                if msg.created_at and service:
+                    service.update_last_event_at(msg.chat_id or msg.open_id, msg.open_id, msg.created_at)
         except Exception:
             logger.exception("Failed to handle Feishu text message")
+        finally:
+            lock.release()
 
     async def _handle_card_action(self, action: ButtonAction, event_id: str | None = None) -> dict[str, Any] | None:
+        # Selection-only clicks update the card in-place and must return quickly
+        # to Feishu. They are idempotent, so skip the per-user serialization lock
+        # to avoid blocking the synchronous card response path.
+        use_lock = action.action != "select_question_option"
+        lock = self._user_lock(action.open_id) if use_lock else None
+        if lock:
+            await asyncio.to_thread(lock.acquire)
         try:
             async with self._handler_context() as ctx:
                 if event_id and ctx.service.is_event_processed(event_id):
                     logger.info("[Feishu WS] skipping duplicate card event_id=%s", event_id)
                     return None
-                if event_id:
-                    ctx.service.mark_event_processed(event_id, "card")
-                return await handle_card_action(ctx, action)
+                service = getattr(ctx, "service", None)
+                if service and self._is_stale_event(service, action.chat_id, action.open_id, action.created_at):
+                    logger.info(
+                        "[Feishu WS] skipping stale card action created_at=%s for %s",
+                        action.created_at, action.open_id,
+                    )
+                    return None
+                if event_id and service:
+                    service.mark_event_processed(event_id, "card")
+                result = await handle_card_action(ctx, action)
+                if action.created_at and service:
+                    service.update_last_event_at(action.chat_id or action.open_id, action.open_id, action.created_at)
+                return result
         except Exception:
             logger.exception("Failed to handle Feishu card action")
             return None
+        finally:
+            if lock:
+                lock.release()
 
     def _run_sync(self, coro: Any) -> Any:
         """Run an async coroutine synchronously in a fresh event loop/thread.
@@ -350,6 +412,20 @@ class _WsHandlerContext:
             self._scope.__exit__(exc_type, exc, tb)
 
 
+def _parse_feishu_create_time(raw: Any) -> datetime | None:
+    """Parse Feishu's millisecond/second create_time string to UTC datetime."""
+    if raw is None:
+        return None
+    try:
+        ts = int(raw)
+    except (TypeError, ValueError):
+        return None
+    # Feishu uses milliseconds since epoch.
+    if ts > 1_000_000_000_000:
+        ts = ts / 1000
+    return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+
+
 def _parse_text_message(event: Any) -> TextMessage:
     """Convert a P2ImMessageReceiveV1 event to TextMessage."""
     msg = event.event.message
@@ -391,6 +467,7 @@ def _parse_text_message(event: Any) -> TextMessage:
         chat_type=chat_type,
         sender_type=sender_type,
         mentions=mentions,
+        created_at=_parse_feishu_create_time(getattr(msg, "create_time", None)),
     )
 
 
@@ -419,6 +496,7 @@ def _parse_button_action(event: Any) -> ButtonAction:
         extras.update({k: v for k, v in form_value.items() if k not in extras})
     context = getattr(event.event, "context", None)
     message_id = getattr(context, "open_message_id", None) if context else None
+    action_obj = getattr(event.event, "action", None)
     return ButtonAction(
         open_id=open_id,
         approval_id=value.get("approval_id", ""),
@@ -430,4 +508,5 @@ def _parse_button_action(event: Any) -> ButtonAction:
         chat_id=value.get("chat_id"),
         chat_type=value.get("chat_type", "p2p") or "p2p",
         message_id=message_id,
+        created_at=_parse_feishu_create_time(getattr(action_obj, "create_time", None)),
     )

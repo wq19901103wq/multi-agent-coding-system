@@ -295,6 +295,7 @@ class ChatUserContext(SQLModel, table=True):
     selected_at: datetime = SQLField(default_factory=datetime.utcnow)
     expires_at: datetime | None = None
     updated_at: datetime = SQLField(default_factory=datetime.utcnow)
+    last_event_at: datetime | None = SQLField(default=None, nullable=True)
 
 
 class ChatDirectoryBinding(SQLModel, table=True):

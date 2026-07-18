@@ -838,6 +838,43 @@ class ProjectService:
             return None
         return project
 
+    def get_last_event_at(
+        self, chat_id: str, open_id: str
+    ) -> datetime | None:
+        """Return the create_time of the last processed event for a user in a chat."""
+        ctx = self.session.exec(
+            select(ChatUserContext).where(
+                ChatUserContext.chat_id == chat_id,
+                ChatUserContext.open_id == open_id,
+            )
+        ).first()
+        return ctx.last_event_at if ctx else None
+
+    def update_last_event_at(
+        self, chat_id: str, open_id: str, event_at: datetime
+    ) -> None:
+        """Update the watermark for the last processed event.
+
+        Only moves forward in time.
+        """
+        ctx = self.session.exec(
+            select(ChatUserContext).where(
+                ChatUserContext.chat_id == chat_id,
+                ChatUserContext.open_id == open_id,
+            )
+        ).first()
+        if ctx is None:
+            ctx = ChatUserContext(
+                chat_id=chat_id,
+                open_id=open_id,
+                last_event_at=event_at,
+            )
+            self.session.add(ctx)
+        elif ctx.last_event_at is None or event_at > ctx.last_event_at:
+            ctx.last_event_at = event_at
+            ctx.updated_at = _now()
+        self.session.commit()
+
     def list_projects_for_chat(self, chat_id: str) -> list[Project]:
         """Return active projects bound to a Feishu chat."""
         chats = self.session.exec(

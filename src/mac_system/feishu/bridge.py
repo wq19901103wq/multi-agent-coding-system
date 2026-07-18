@@ -337,6 +337,16 @@ class FeishuBridge:
         }
         extras = {k: v for k, v in value.items() if k not in reserved}
         extras.update({k: v for k, v in form_value.items() if k not in extras})
+        create_time = action.get("create_time")
+        created_at = None
+        if create_time:
+            try:
+                ts = int(create_time)
+                if ts > 1_000_000_000_000:
+                    ts = ts / 1000
+                created_at = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+            except (TypeError, ValueError):
+                pass
         return ButtonAction(
             open_id=open_id,
             approval_id=value.get("approval_id", ""),
@@ -348,6 +358,7 @@ class FeishuBridge:
             chat_id=value.get("chat_id"),
             chat_type=value.get("chat_type", "p2p") or "p2p",
             message_id=event.get("context", {}).get("open_message_id"),
+            created_at=created_at,
         )
 
     def parse_text_message(self, payload: dict[str, Any]) -> TextMessage:
@@ -363,6 +374,16 @@ class FeishuBridge:
         mentions = message.get("mentions", []) or []
         chat_id = message.get("chat_id")
         chat_type = message.get("chat_type", "p2p") or "p2p"
+        create_time = message.get("create_time")
+        created_at = None
+        if create_time:
+            try:
+                ts = int(create_time)
+                if ts > 1_000_000_000_000:
+                    ts = ts / 1000
+                created_at = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+            except (TypeError, ValueError):
+                pass
         return TextMessage(
             open_id=open_id,
             message_id=message_id,
@@ -373,6 +394,7 @@ class FeishuBridge:
             chat_type=chat_type,
             sender_type=sender.get("sender_type", "user") or "user",
             mentions=mentions,
+            created_at=created_at,
         )
 
     def verify_request(
