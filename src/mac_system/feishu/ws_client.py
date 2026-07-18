@@ -91,6 +91,9 @@ class FeishuWebSocketClient:
         # Serialize handling of all events from the same user so that
         # WebSocket messages/cards are processed in the order they were sent.
         self._user_locks: dict[str, threading.Lock] = {}
+        # Watermarks for rejecting buffered/old events after startup or reconnect.
+        self._started_at = datetime.utcnow()
+        self._last_disconnect_at: datetime | None = None
 
     def start(self) -> None:
         if "PYTEST_CURRENT_TEST" in os.environ:
@@ -202,6 +205,7 @@ class FeishuWebSocketClient:
 
         def _on_reconnecting() -> None:
             logger.warning("[Feishu WS] connection lost, SDK is reconnecting...")
+            self._last_disconnect_at = datetime.utcnow()
 
         def _on_reconnected() -> None:
             logger.info("[Feishu WS] SDK reconnected")
@@ -233,16 +237,51 @@ class FeishuWebSocketClient:
     ) -> bool:
         """Return True if this event is older than the user's last handled event.
 
+        Staleness is checked against:
+        - the per-chat watermark,
+        - a global per-user watermark (newer traffic in any chat blocks old events),
+        - the process start time and last disconnect time (buffered events from
+          before the bot started or before a reconnect are dropped).
+
         A small grace window allows for sub-second delivery jitter.
         """
         if event_at is None:
             return False
-        watermark = service.get_last_event_at(chat_id or open_id, open_id)
+
+        # Drop events created before the bot started or before the last disconnect.
+        # A small grace window avoids rejecting messages that were in flight.
+        oldest_allowed = self._started_at - timedelta(minutes=1)
+        if self._last_disconnect_at is not None:
+            oldest_allowed = max(
+                oldest_allowed, self._last_disconnect_at - timedelta(seconds=5)
+            )
+        if event_at < oldest_allowed:
+            return True
+
+        chat_watermark = service.get_last_event_at(chat_id or open_id, open_id)
+        global_watermark = service.get_last_event_at(open_id, open_id)
+        watermark = chat_watermark
+        if watermark is None:
+            watermark = global_watermark
+        elif global_watermark is not None and global_watermark > watermark:
+            watermark = global_watermark
+
         if watermark is None:
             return False
         grace = 5  # seconds
         watermark_naive = watermark.replace(tzinfo=None) if watermark.tzinfo else watermark
         return event_at < watermark_naive - timedelta(seconds=grace)
+
+    def _update_event_watermark(
+        self,
+        service: ProjectService,
+        chat_id: str,
+        open_id: str,
+        event_at: datetime,
+    ) -> None:
+        """Update both the chat-specific and global per-user last-event watermark."""
+        service.update_last_event_at(chat_id, open_id, event_at)
+        service.update_last_event_at(open_id, open_id, event_at)
 
     async def _handle_message(self, msg: TextMessage, event_id: str | None = None) -> None:
         lock = self._user_lock(msg.open_id)
@@ -291,7 +330,9 @@ class FeishuWebSocketClient:
                     service.mark_event_processed(event_id, "message")
                 await handle_text_message(ctx, msg)
                 if msg.created_at and service:
-                    service.update_last_event_at(msg.chat_id or msg.open_id, msg.open_id, msg.created_at)
+                    self._update_event_watermark(
+                        service, msg.chat_id or msg.open_id, msg.open_id, msg.created_at
+                    )
         except Exception:
             logger.exception("Failed to handle Feishu text message")
         finally:
@@ -321,7 +362,9 @@ class FeishuWebSocketClient:
                     service.mark_event_processed(event_id, "card")
                 result = await handle_card_action(ctx, action)
                 if action.created_at and service:
-                    service.update_last_event_at(action.chat_id or action.open_id, action.open_id, action.created_at)
+                    self._update_event_watermark(
+                        service, action.chat_id or action.open_id, action.open_id, action.created_at
+                    )
                 return result
         except Exception:
             logger.exception("Failed to handle Feishu card action")

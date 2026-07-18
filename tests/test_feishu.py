@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -3478,3 +3479,80 @@ async def test_create_bind_dir_action_without_pending_intent_recovers(
         for c in feishu_ctx.bridge.sent
         if c[0] == "text"
     )
+
+
+class _FakeWatermarkService:
+    """In-memory service stub for testing FeishuWebSocketClient staleness logic."""
+
+    def __init__(self):
+        self._watermarks: dict[tuple[str, str], datetime] = {}
+
+    def get_last_event_at(self, chat_id: str, open_id: str) -> datetime | None:
+        return self._watermarks.get((chat_id, open_id))
+
+    def update_last_event_at(self, chat_id: str, open_id: str, event_at: datetime) -> None:
+        key = (chat_id, open_id)
+        current = self._watermarks.get(key)
+        if current is None or event_at > current:
+            self._watermarks[key] = event_at
+
+
+def test_ws_client_staleness_uses_global_user_watermark():
+    """A newer event in one chat should block older events in another chat."""
+    from mac_system.feishu.ws_client import FeishuWebSocketClient
+
+    client = FeishuWebSocketClient()
+    service = _FakeWatermarkService()
+    open_id = "ou_global"
+    group_chat = "oc_group"
+    p2p_chat = open_id
+
+    now = datetime.utcnow()
+    # Newer message handled in group chat.
+    service.update_last_event_at(group_chat, open_id, now)
+    service.update_last_event_at(p2p_chat, open_id, now)
+
+    # Older p2p message is stale because of the global watermark.
+    old_event = now - timedelta(hours=1)
+    assert client._is_stale_event(service, p2p_chat, open_id, old_event)
+
+
+def test_ws_client_staleness_allows_fresh_event():
+    """An event newer than the watermark is not stale."""
+    from mac_system.feishu.ws_client import FeishuWebSocketClient
+
+    client = FeishuWebSocketClient()
+    service = _FakeWatermarkService()
+    open_id = "ou_fresh"
+    chat_id = open_id
+
+    now = datetime.utcnow()
+    service.update_last_event_at(chat_id, open_id, now - timedelta(seconds=1))
+    assert not client._is_stale_event(service, chat_id, open_id, now)
+
+
+def test_ws_client_staleness_rejects_pre_startup_events():
+    """Events created before the WS client started are dropped."""
+    from mac_system.feishu.ws_client import FeishuWebSocketClient
+
+    client = FeishuWebSocketClient()
+    service = _FakeWatermarkService()
+    open_id = "ou_startup"
+
+    # Event from long before the client started should be stale even with no watermark.
+    ancient = datetime.utcnow() - timedelta(days=1)
+    assert client._is_stale_event(service, open_id, open_id, ancient)
+
+
+def test_ws_client_staleness_rejects_pre_disconnect_events():
+    """Events created before the last disconnect are dropped on reconnect."""
+    from mac_system.feishu.ws_client import FeishuWebSocketClient
+
+    client = FeishuWebSocketClient()
+    service = _FakeWatermarkService()
+    open_id = "ou_reconnect"
+
+    # Simulate a disconnect 5 minutes ago.
+    client._last_disconnect_at = datetime.utcnow() - timedelta(minutes=5)
+    pre_disconnect = datetime.utcnow() - timedelta(minutes=6)
+    assert client._is_stale_event(service, open_id, open_id, pre_disconnect)
