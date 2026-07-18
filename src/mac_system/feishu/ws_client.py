@@ -283,6 +283,42 @@ class FeishuWebSocketClient:
         service.update_last_event_at(chat_id, open_id, event_at)
         service.update_last_event_at(open_id, open_id, event_at)
 
+    def _log_feishu_event(
+        self,
+        service: ProjectService | None,
+        *,
+        open_id: str,
+        chat_id: str | None,
+        chat_type: str,
+        event_type: str,
+        event_id: str | None,
+        message_id: str | None,
+        text: str | None,
+        action: str | None,
+        feishu_created_at: datetime | None,
+        status: str,
+        detail: str | None = None,
+    ) -> None:
+        """Persist an audit log of a Feishu event. Failures are swallowed."""
+        if service is None:
+            return
+        try:
+            service.log_feishu_event(
+                open_id=open_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                event_type=event_type,
+                event_id=event_id,
+                message_id=message_id,
+                text=text,
+                action=action,
+                feishu_created_at=feishu_created_at,
+                status=status,
+                detail=detail,
+            )
+        except Exception:
+            logger.exception("Failed to persist Feishu event log")
+
     async def _handle_message(self, msg: TextMessage, event_id: str | None = None) -> None:
         lock = self._user_lock(msg.open_id)
         await asyncio.to_thread(lock.acquire)
@@ -316,25 +352,91 @@ class FeishuWebSocketClient:
                 msg.is_command = msg.text.startswith("/")
 
             async with self._handler_context(msg) as ctx:
+                service = getattr(ctx, "service", None)
+                self._log_feishu_event(
+                    service,
+                    open_id=msg.open_id,
+                    chat_id=msg.chat_id,
+                    chat_type=msg.chat_type,
+                    event_type="message",
+                    event_id=event_id,
+                    message_id=msg.message_id,
+                    text=msg.text,
+                    action=None,
+                    feishu_created_at=msg.created_at,
+                    status="received",
+                )
                 if event_id and ctx.service.is_event_processed(event_id):
                     logger.info("[Feishu WS] skipping duplicate message event_id=%s", event_id)
+                    self._log_feishu_event(
+                        service,
+                        open_id=msg.open_id,
+                        chat_id=msg.chat_id,
+                        chat_type=msg.chat_type,
+                        event_type="message",
+                        event_id=event_id,
+                        message_id=msg.message_id,
+                        text=msg.text,
+                        action=None,
+                        feishu_created_at=msg.created_at,
+                        status="duplicate",
+                    )
                     return
-                service = getattr(ctx, "service", None)
                 if service and self._is_stale_event(service, msg.chat_id, msg.open_id, msg.created_at):
                     logger.info(
                         "[Feishu WS] skipping stale message created_at=%s for %s",
                         msg.created_at, msg.open_id,
                     )
+                    self._log_feishu_event(
+                        service,
+                        open_id=msg.open_id,
+                        chat_id=msg.chat_id,
+                        chat_type=msg.chat_type,
+                        event_type="message",
+                        event_id=event_id,
+                        message_id=msg.message_id,
+                        text=msg.text,
+                        action=None,
+                        feishu_created_at=msg.created_at,
+                        status="stale",
+                    )
                     return
                 if event_id and service:
                     service.mark_event_processed(event_id, "message")
                 await handle_text_message(ctx, msg)
+                self._log_feishu_event(
+                    service,
+                    open_id=msg.open_id,
+                    chat_id=msg.chat_id,
+                    chat_type=msg.chat_type,
+                    event_type="message",
+                    event_id=event_id,
+                    message_id=msg.message_id,
+                    text=msg.text,
+                    action=None,
+                    feishu_created_at=msg.created_at,
+                    status="processed",
+                )
                 if msg.created_at and service:
                     self._update_event_watermark(
                         service, msg.chat_id or msg.open_id, msg.open_id, msg.created_at
                     )
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to handle Feishu text message")
+            self._log_feishu_event(
+                None,
+                open_id=msg.open_id,
+                chat_id=msg.chat_id,
+                chat_type=msg.chat_type,
+                event_type="message",
+                event_id=event_id,
+                message_id=msg.message_id,
+                text=msg.text,
+                action=None,
+                feishu_created_at=msg.created_at,
+                status="error",
+                detail=str(exc)[:500],
+            )
         finally:
             lock.release()
 
@@ -348,26 +450,92 @@ class FeishuWebSocketClient:
             await asyncio.to_thread(lock.acquire)
         try:
             async with self._handler_context() as ctx:
+                service = getattr(ctx, "service", None)
+                self._log_feishu_event(
+                    service,
+                    open_id=action.open_id,
+                    chat_id=action.chat_id,
+                    chat_type=action.chat_type,
+                    event_type="card",
+                    event_id=event_id,
+                    message_id=action.message_id,
+                    text=None,
+                    action=action.action,
+                    feishu_created_at=action.created_at,
+                    status="received",
+                )
                 if event_id and ctx.service.is_event_processed(event_id):
                     logger.info("[Feishu WS] skipping duplicate card event_id=%s", event_id)
+                    self._log_feishu_event(
+                        service,
+                        open_id=action.open_id,
+                        chat_id=action.chat_id,
+                        chat_type=action.chat_type,
+                        event_type="card",
+                        event_id=event_id,
+                        message_id=action.message_id,
+                        text=None,
+                        action=action.action,
+                        feishu_created_at=action.created_at,
+                        status="duplicate",
+                    )
                     return None
-                service = getattr(ctx, "service", None)
                 if service and self._is_stale_event(service, action.chat_id, action.open_id, action.created_at):
                     logger.info(
                         "[Feishu WS] skipping stale card action created_at=%s for %s",
                         action.created_at, action.open_id,
                     )
+                    self._log_feishu_event(
+                        service,
+                        open_id=action.open_id,
+                        chat_id=action.chat_id,
+                        chat_type=action.chat_type,
+                        event_type="card",
+                        event_id=event_id,
+                        message_id=action.message_id,
+                        text=None,
+                        action=action.action,
+                        feishu_created_at=action.created_at,
+                        status="stale",
+                    )
                     return None
                 if event_id and service:
                     service.mark_event_processed(event_id, "card")
                 result = await handle_card_action(ctx, action)
+                self._log_feishu_event(
+                    service,
+                    open_id=action.open_id,
+                    chat_id=action.chat_id,
+                    chat_type=action.chat_type,
+                    event_type="card",
+                    event_id=event_id,
+                    message_id=action.message_id,
+                    text=None,
+                    action=action.action,
+                    feishu_created_at=action.created_at,
+                    status="processed",
+                )
                 if action.created_at and service:
                     self._update_event_watermark(
                         service, action.chat_id or action.open_id, action.open_id, action.created_at
                     )
                 return result
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to handle Feishu card action")
+            self._log_feishu_event(
+                None,
+                open_id=action.open_id,
+                chat_id=action.chat_id,
+                chat_type=action.chat_type,
+                event_type="card",
+                event_id=event_id,
+                message_id=action.message_id,
+                text=None,
+                action=action.action,
+                feishu_created_at=action.created_at,
+                status="error",
+                detail=str(exc)[:500],
+            )
             return None
         finally:
             if lock:

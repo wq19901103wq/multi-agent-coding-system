@@ -329,6 +329,24 @@ class ProcessedEvent(SQLModel, table=True):
     created_at: datetime = SQLField(default_factory=datetime.utcnow)
 
 
+class FeishuEventLog(SQLModel, table=True):
+    __tablename__ = "feishu_event_logs"
+
+    id: int | None = SQLField(default=None, primary_key=True)
+    open_id: str = SQLField(index=True)
+    chat_id: str | None = SQLField(default=None, nullable=True, index=True)
+    chat_type: str = SQLField(default="p2p")
+    event_type: str = SQLField(index=True)  # message | card
+    event_id: str | None = SQLField(default=None, nullable=True, index=True)
+    message_id: str | None = SQLField(default=None, nullable=True)
+    text: str | None = SQLField(default=None, nullable=True)
+    action: str | None = SQLField(default=None, nullable=True)
+    feishu_created_at: datetime | None = SQLField(default=None, nullable=True)
+    status: str = SQLField(default="received")  # received | duplicate | stale | processed | error
+    detail: str | None = SQLField(default=None, nullable=True)
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
 # Pydantic API schemas
 
 class ProjectCreate(BaseModel):

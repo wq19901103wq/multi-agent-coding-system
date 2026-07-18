@@ -52,7 +52,7 @@
 
 4. **只看 e2e 脚本 `COMPLETED` 不够**
    - 之前 full flow 到了 `COMPLETED`，但汇报卡片实际被吞。
-   - 结论：改完卡片/飞书交互后，必须检查 `server.log` 中是否存在 `Failed to send summary content card` 或 `NoneType` 警告，并在飞书侧确认两种卡片都收到。
+   - 结论：改完卡片/飞书交互后，必须检查最近的 `server_*.log` 中是否存在 `Failed to send summary content card` 或 `NoneType` 警告，并在飞书侧确认两种卡片都收到。
 
 5. **Prompt 里不要写相对 schema 路径**
    - `planner_*.md` 原提示把 schema 路径写成 `{{workspace_path}}/specs/schemas/xxx.json`，但项目 workspace 下并没有这个目录，导致 Agent 找 schema 耗时甚至失败/重试。
@@ -117,7 +117,7 @@
    - 若因 API 额度、网络、模型端点等外部原因失败，需如实记录失败原因并告知用户，不得隐瞒或宣称”已完成”。
    - 若修改的是状态机、卡片交互或飞书命令处理，`full_feature_flow` 必须能覆盖新增的质量确认关卡（`CODING_CONFIRM_PENDING` / `TESTING_CONFIRM_PENDING` / `REVIEW_CONFIRM_PENDING`）。
    - 修改 `scripts/feishu_e2e.py` 本身时，应确保 `full_feature_flow` 随新流程同步更新。
-   - **额外检查**：跑完后搜索 `server.log`，确认没有 `Failed to send summary content card` 或 `NoneType.*int` 警告。
+   - **额外检查**：跑完后搜索最近的 `server_*.log`，确认没有 `Failed to send summary content card` 或 `NoneType.*int` 警告。
 
 3. **服务重启确认**
 
@@ -156,14 +156,15 @@ cd /Users/yihanwang/multi-agent-coding-system
 ./scripts/start_server.sh
 ```
 
-日志通过 `logging.yaml` 自动追加到 `server.log` 并按 10 MB 轮转（保留 5 个备份），重启不会丢失。
+启动脚本会生成带时间戳的日志文件，例如 `server_20260718_152800.log`，并通过 `logging.yaml` 自动追加并按 10 MB 轮转（保留 5 个备份），重启不会覆盖上一会话的日志。
 
 启动后检查：
 
 ```bash
 cat uvicorn.pid
 lsof -Pi :18080 -sTCP:LISTEN
-tail -20 server.log
+ls -lt server_*.log | head -5
+tail -20 server_*.log
 ```
 
 ### 2. 停止服务
@@ -188,7 +189,7 @@ python scripts/feishu_e2e.py --scenario full_feature_flow
 ### 5. 检查汇报卡片是否发送成功
 
 ```bash
-grep -E "Failed to send summary content card|NoneType.*int" server.log
+grep -E "Failed to send summary content card|NoneType.*int" server_*.log
 ```
 
 无输出为正常。

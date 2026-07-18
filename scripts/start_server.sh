@@ -12,12 +12,14 @@ source .worktrees/feat-core/.venv/bin/activate
 set -a
 source .env
 set +a
-export FEISHU_TEST_MODE=1
 export PYTHONUNBUFFERED=1
 
-# Use logging.yaml for append + rotation; stdout/stderr can be discarded.
-nohup bash -c 'exec uvicorn mac_system.api.main:app --host 0.0.0.0 --port 18080 --log-config logging.yaml' >/dev/null 2>&1 &
+LOG_FILE="server_$(date +%Y%m%d_%H%M%S).log"
+
+# Use logging.yaml for mac_system logs and redirect uvicorn stdout/stderr to a
+# timestamped file so restarts do not overwrite the previous session's log.
+nohup bash -c "exec uvicorn mac_system.api.main:app --host 0.0.0.0 --port 18080 --log-config logging.yaml" >"$LOG_FILE" 2>&1 &
 echo $! > uvicorn.pid
 
 echo "Server started (PID $(cat uvicorn.pid))"
-echo "Logs: $(pwd)/server.log"
+echo "Logs: $(pwd)/$LOG_FILE"

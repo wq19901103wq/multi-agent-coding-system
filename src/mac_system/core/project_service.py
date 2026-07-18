@@ -21,6 +21,7 @@ from mac_system.models import (
     DefaultAuthorization,
     EventLog,
     FeedbackPacket,
+    FeishuEventLog,
     PendingIntent,
     PendingConversationAction,
     PendingUserInput,
@@ -2091,3 +2092,46 @@ class ProjectService:
         self.session.merge(
             ProcessedEvent(event_id=event_id, event_type=event_type, created_at=_now())
         )
+
+    def log_feishu_event(
+        self,
+        *,
+        open_id: str,
+        chat_id: str | None,
+        chat_type: str,
+        event_type: str,
+        event_id: str | None,
+        message_id: str | None,
+        text: str | None,
+        action: str | None,
+        feishu_created_at: datetime | None,
+        status: str,
+        detail: str | None = None,
+    ) -> None:
+        """Persist an incoming Feishu event for audit and debugging.
+
+        This is intentionally lightweight: it records metadata and a truncated
+        text payload so we can reconstruct what the bot saw and why an event
+        was dropped or processed.
+        """
+        MAX_TEXT_LEN = 2000
+        truncated_text = text[:MAX_TEXT_LEN] if text else None
+        log = FeishuEventLog(
+            open_id=open_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            event_type=event_type,
+            event_id=event_id,
+            message_id=message_id,
+            text=truncated_text,
+            action=action,
+            feishu_created_at=feishu_created_at,
+            status=status,
+            detail=detail,
+            created_at=_now(),
+        )
+        self.session.add(log)
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
