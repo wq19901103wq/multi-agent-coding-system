@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from datetime import datetime, timezone
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlmodel import select
 
@@ -110,6 +110,7 @@ async def lifespan(app: FastAPI):
     ):
         ws_client = FeishuWebSocketClient()
         ws_client.start()
+    app.state.ws_client = ws_client
     recovery_tasks = {
         asyncio.create_task(
             _resume_recovered_project(project_id),
@@ -127,6 +128,7 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(*recovery_tasks, return_exceptions=True)
         if ws_client is not None:
             ws_client.stop()
+        app.state.ws_client = None
 
 
 app = FastAPI(title="MAC System API", lifespan=lifespan)
@@ -488,6 +490,24 @@ async def submit_command(
     )
 
 
+def _parse_inject_created_at(raw: str | datetime | None) -> datetime | None:
+    """Parse an injected event timestamp from ISO 8601 or epoch (ms/s)."""
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.replace(tzinfo=None) if raw.tzinfo else raw
+    try:
+        # Numeric epoch timestamp (Feishu create_time is in milliseconds).
+        if raw.replace(".", "", 1).replace("-", "", 1).isdigit():
+            ts = float(raw)
+            if ts > 1_000_000_000_000:
+                ts = ts / 1000
+            return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
 class InjectCardActionRequest(BaseModel):
     open_id: str
     approval_id: str
@@ -498,6 +518,8 @@ class InjectCardActionRequest(BaseModel):
     chat_id: str | None = None
     chat_type: str = "p2p"
     extras: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | datetime | None = None
+    event_id: str | None = None
 
 
 async def _run_inject_card_action(action: ButtonAction) -> None:
@@ -524,6 +546,7 @@ async def _run_inject_card_action(action: ButtonAction) -> None:
 @app.post("/test/inject_card_action")
 async def inject_card_action(
     req: InjectCardActionRequest,
+    request: Request,
     _auth: None = Depends(require_control_api_token),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> dict[str, Any]:
@@ -552,6 +575,7 @@ async def inject_card_action(
         extras=req.extras,
         chat_id=req.chat_id,
         chat_type=req.chat_type,
+        created_at=_parse_inject_created_at(req.created_at),
     )
 
     if isinstance(orchestrator.runtime, FakeRuntime):
@@ -569,7 +593,14 @@ async def inject_card_action(
             raise HTTPException(status_code=500, detail=f"inject_card_action failed: {exc}")
         return {"status": "ok"}
 
-    # Real runtimes: kick off the action in the background and return immediately.
+    # Real runtimes: route through the WS client so the injected action follows
+    # the same staleness/deduplication/serialization path as live Feishu events.
+    ws_client = getattr(request.app.state, "ws_client", None)
+    if ws_client is not None:
+        asyncio.create_task(ws_client.inject_card_action(action, req.event_id))
+        return {"status": "ok"}
+
+    # Fallback if the WS client is not available.
     asyncio.create_task(_run_inject_card_action(action))
     return {"status": "ok"}
 
@@ -579,12 +610,16 @@ class InjectTextMessageRequest(BaseModel):
     text: str
     chat_id: str | None = None
     chat_type: str = "p2p"
+    message_id: str = "msg_test"
+    created_at: str | datetime | None = None
+    event_id: str | None = None
 
 
 class SeedFeishuInteractionRequest(BaseModel):
     kind: Literal[
         "planning_rejection",
         "architecture_confirmation",
+        "requirement_confirmation",
         "acceptance_question",
         "runtime_recovery",
     ]
@@ -596,6 +631,7 @@ class SeedFeishuInteractionRequest(BaseModel):
 @app.post("/test/inject_text_message")
 async def inject_text_message(
     req: InjectTextMessageRequest,
+    request: Request,
     _auth: None = Depends(require_control_api_token),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> dict[str, Any]:
@@ -604,20 +640,47 @@ async def inject_text_message(
     if not settings.feishu_test_mode:
         raise HTTPException(status_code=404, detail="NOT_FOUND")
 
+    msg = TextMessage(
+        open_id=req.open_id,
+        message_id=req.message_id,
+        text=req.text,
+        is_command=req.text.startswith("/"),
+        chat_id=req.chat_id,
+        chat_type=req.chat_type or "p2p",
+        created_at=_parse_inject_created_at(req.created_at),
+    )
+
+    if isinstance(orchestrator.runtime, FakeRuntime):
+        ctx = FeishuHandlerContext(
+            bridge=orchestrator.feishu_bridge or NullFeishuBridge(),
+            service=orchestrator.project_service,
+            orchestrator=orchestrator,
+            chat_id=req.chat_id,
+            chat_type=req.chat_type,
+        )
+        try:
+            await handle_text_message(ctx, msg)
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).exception("inject_text_message failed: %s", exc)
+            raise HTTPException(status_code=500, detail=f"inject_text_message failed: {exc}")
+        return {"status": "ok"}
+
+    # Real runtimes: route through the WS client so the injected message follows
+    # the same staleness/deduplication/serialization path as live Feishu events.
+    ws_client = getattr(request.app.state, "ws_client", None)
+    if ws_client is not None:
+        asyncio.create_task(ws_client.inject_text_message(msg, req.event_id))
+        return {"status": "ok"}
+
+    # Fallback if the WS client is not available.
     ctx = FeishuHandlerContext(
         bridge=orchestrator.feishu_bridge or NullFeishuBridge(),
         service=orchestrator.project_service,
         orchestrator=orchestrator,
         chat_id=req.chat_id,
         chat_type=req.chat_type,
-    )
-    msg = TextMessage(
-        open_id=req.open_id,
-        message_id="msg_test",
-        text=req.text,
-        is_command=req.text.startswith("/"),
-        chat_id=req.chat_id,
-        chat_type=req.chat_type or "p2p",
     )
     try:
         await handle_text_message(ctx, msg)
@@ -652,7 +715,7 @@ async def seed_feishu_interaction(
     )
 
     interaction_id = None
-    if req.kind == "planning_rejection":
+    if req.kind in ("planning_rejection", "requirement_confirmation"):
         project.current_state = "REQUIREMENT_CONFIRM_PENDING"
     elif req.kind == "architecture_confirmation":
         project.current_state = "ARCHITECTURE_CONFIRM_PENDING"

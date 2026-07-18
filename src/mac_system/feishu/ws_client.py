@@ -353,6 +353,23 @@ class FeishuWebSocketClient:
         """Return an async context manager that builds handler dependencies."""
         return _WsHandlerContext(self.settings, msg)
 
+    async def inject_text_message(
+        self, msg: TextMessage, event_id: str | None = None
+    ) -> None:
+        """Process a text message through the same path as a real WS event.
+
+        Used by test endpoints so that injected messages respect the same
+        staleness, deduplication and per-user serialization logic as live
+        Feishu traffic.
+        """
+        await self._handle_message(msg, event_id)
+
+    async def inject_card_action(
+        self, action: ButtonAction, event_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Process a card action through the same path as a real WS event."""
+        return await self._handle_card_action(action, event_id)
+
 
 class _WsHandlerContext:
     """Async context manager that creates a fresh handler context per event."""

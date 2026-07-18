@@ -28,6 +28,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -269,6 +270,16 @@ class MacApiClient:
             return {"status": "ok"}
         resp = await self._client.post(
             f"{self.base_url}/test/inject_card_action",
+            json=fields,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def inject_text_message(self, **fields: Any) -> dict[str, Any]:
+        if self.dry_run:
+            return {"status": "ok"}
+        resp = await self._client.post(
+            f"{self.base_url}/test/inject_text_message",
             json=fields,
         )
         resp.raise_for_status()
@@ -1713,6 +1724,226 @@ async def scenario_runtime_recovery_card(ctx: ScenarioContext) -> None:
     raise RuntimeError("Runtime recovery cancel did not terminate the project")
 
 
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _iso_hours_ago(hours: float = 1.0) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+
+def _chat_id_for_inject(ctx: ScenarioContext) -> str:
+    return ctx.args.chat_id or f"p2p:{ctx.args.open_id}"
+
+
+def _chat_type_for_inject(ctx: ScenarioContext) -> str:
+    return "group" if ctx.args.chat_id else "p2p"
+
+
+async def _seed_requirement_confirmation(
+    ctx: ScenarioContext,
+) -> tuple[str, str, FeishuMessage]:
+    """Seed a project in REQUIREMENT_CONFIRM_PENDING and return project_id/approval/card."""
+    if ctx.dry_run:
+        return "proj_dryrun", "appr_dryrun", FeishuMessage("", "", "")
+    assert ctx.sim is not None
+    anchor = await _seed_card_anchor(ctx)
+    seeded = await ctx.mac.seed_feishu_interaction(
+        kind="requirement_confirmation",
+        open_id=ctx.args.open_id,
+        chat_id=ctx.args.chat_id or f"p2p:{ctx.args.open_id}",
+        chat_type="group" if ctx.args.chat_id else "p2p",
+    )
+    approval_id = seeded["approval_id"]
+    card = await ctx.sim.wait_for_reply(
+        pattern=rf"审批ID.*{re.escape(approval_id)}",
+        after_message_id=anchor,
+        timeout=120.0,
+    )
+    if card is None:
+        raise RuntimeError("Requirement confirmation card was not rendered")
+    return seeded["project_id"], approval_id, card
+
+
+async def scenario_stale_text_message_ignored(ctx: ScenarioContext) -> None:
+    """A /cancel with an old timestamp must not cancel the current project."""
+    eprint("Scenario: stale_text_message_ignored")
+    if ctx.dry_run:
+        return
+    project_id, _approval_id, _card = await _seed_requirement_confirmation(ctx)
+
+    # Establish a fresh watermark with a real Feishu message.
+    msg_id = await send_feishu_text(ctx, f"/status {project_id}")
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"项目状态",
+        after_message_id=msg_id,
+        timeout=60.0,
+    )
+    if reply is None:
+        raise RuntimeError("Bot did not respond to fresh /status")
+
+    # Inject a stale /cancel from one hour ago through the same WS path.
+    await ctx.mac.inject_text_message(
+        open_id=ctx.args.open_id,
+        text=f"/cancel {project_id}",
+        chat_id=_chat_id_for_inject(ctx),
+        chat_type=_chat_type_for_inject(ctx),
+        message_id="msg_stale_cancel_text",
+        created_at=_iso_hours_ago(1.0),
+        event_id="evt_stale_cancel_text",
+    )
+    await asyncio.sleep(5.0)
+
+    status = await ctx.mac.get_status(project_id)
+    if status.get("status") == "cancelled":
+        raise RuntimeError("Stale /cancel text message was processed")
+    eprint(f"  stale /cancel ignored (status={status.get('status')})")
+
+    # Confirm the bot is still responsive to fresh traffic.
+    msg_id = await send_feishu_text(ctx, f"/status {project_id}")
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"项目状态",
+        after_message_id=msg_id,
+        timeout=60.0,
+    )
+    if reply is None:
+        raise RuntimeError("Bot did not respond to fresh /status after stale message")
+    eprint("  fresh /status handled normally")
+
+
+async def scenario_stale_card_action_ignored(ctx: ScenarioContext) -> None:
+    """A stale card reject must not advance/change the project state."""
+    eprint("Scenario: stale_card_action_ignored")
+    if ctx.dry_run:
+        return
+    project_id, approval_id, _card = await _seed_requirement_confirmation(ctx)
+    eprint(f"  requirement approval {approval_id}")
+
+    # Establish a fresh watermark with a real Feishu message.
+    msg_id = await send_feishu_text(ctx, f"/status {project_id}")
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"项目状态",
+        after_message_id=msg_id,
+        timeout=60.0,
+    )
+    if reply is None:
+        raise RuntimeError("Bot did not respond to fresh /status")
+
+    # Reject from one hour ago should be dropped.
+    await ctx.mac.inject_card_action(
+        open_id=ctx.args.open_id,
+        approval_id=approval_id,
+        action="reject_without_feedback",
+        state="REQUIREMENT_CONFIRM_PENDING",
+        chat_id=_chat_id_for_inject(ctx),
+        chat_type=_chat_type_for_inject(ctx),
+        created_at=_iso_hours_ago(1.0),
+        event_id="evt_stale_reject_card",
+    )
+    await asyncio.sleep(5.0)
+
+    status = await ctx.mac.get_status(project_id)
+    if status["current_state"] != "REQUIREMENT_CONFIRM_PENDING":
+        raise RuntimeError(
+            f"Stale reject changed state to {status['current_state']}"
+        )
+    if status.get("status") == "cancelled":
+        raise RuntimeError("Stale reject cancelled the project")
+    eprint("  stale reject ignored")
+
+    # Confirm the bot is still responsive to fresh traffic.
+    msg_id = await send_feishu_text(ctx, f"/status {project_id}")
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"项目状态",
+        after_message_id=msg_id,
+        timeout=60.0,
+    )
+    if reply is None:
+        raise RuntimeError("Bot did not respond to fresh /status after stale reject")
+    eprint("  fresh /status handled normally")
+
+
+async def scenario_out_of_order_text_message_ignored(ctx: ScenarioContext) -> None:
+    """A newer /status sets the watermark; an older /confirm is dropped."""
+    eprint("Scenario: out_of_order_text_message_ignored")
+    if ctx.dry_run:
+        return
+    project_id, approval_id, _card = await _seed_requirement_confirmation(ctx)
+
+    # Send a fresh /status to advance the watermark.
+    msg_id = await send_feishu_text(ctx, f"/status {project_id}")
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"项目状态",
+        after_message_id=msg_id,
+        timeout=60.0,
+    )
+    if reply is None:
+        raise RuntimeError("Bot did not respond to /status")
+
+    # Now inject an older /confirm (timestamp before the /status reply).
+    await ctx.mac.inject_text_message(
+        open_id=ctx.args.open_id,
+        text=f"/confirm {approval_id}",
+        chat_id=_chat_id_for_inject(ctx),
+        chat_type=_chat_type_for_inject(ctx),
+        message_id="msg_old_confirm_text",
+        created_at=_iso_hours_ago(1.0),
+        event_id="evt_old_confirm_text",
+    )
+    await asyncio.sleep(5.0)
+
+    status = await ctx.mac.get_status(project_id)
+    if status["current_state"] != "REQUIREMENT_CONFIRM_PENDING":
+        raise RuntimeError(
+            f"Out-of-order /confirm advanced state to {status['current_state']}"
+        )
+    eprint("  out-of-order /confirm ignored")
+
+    # Confirm the bot is still responsive to fresh traffic.
+    msg_id = await send_feishu_text(ctx, f"/status {project_id}")
+    assert ctx.sim is not None
+    reply = await ctx.sim.wait_for_reply(
+        pattern=r"项目状态",
+        after_message_id=msg_id,
+        timeout=60.0,
+    )
+    if reply is None:
+        raise RuntimeError("Bot did not respond to fresh /status after out-of-order event")
+    eprint("  fresh /status handled normally")
+
+
+async def scenario_duplicate_event_idempotent(ctx: ScenarioContext) -> None:
+    """The same event_id must only be processed once."""
+    eprint("Scenario: duplicate_event_idempotent")
+    if ctx.dry_run:
+        return
+    project_id, approval_id, _card = await _seed_requirement_confirmation(ctx)
+
+    event_id = f"evt_duplicate_{int(time.time())}"
+    for _ in range(2):
+        await ctx.mac.inject_card_action(
+            open_id=ctx.args.open_id,
+            approval_id=approval_id,
+            action="confirm",
+            state="REQUIREMENT_CONFIRM_PENDING",
+            chat_id=_chat_id_for_inject(ctx),
+            chat_type=_chat_type_for_inject(ctx),
+            event_id=event_id,
+        )
+        await asyncio.sleep(2.0)
+
+    status = await wait_for_state(
+        ctx, project_id, "PLANNING_ARCHITECTURE", timeout=60.0
+    )
+    if status is None:
+        raise RuntimeError("Confirm did not advance state")
+    eprint(f"  duplicate confirm idempotent, reached {status['current_state']}")
+
+
 SCENARIOS: dict[str, Any] = {
     "p2p_create": scenario_p2p_create,
     "p2p_create_with_type": scenario_p2p_create_with_type,
@@ -1722,6 +1953,10 @@ SCENARIOS: dict[str, Any] = {
     "architecture_confirmation": scenario_architecture_confirmation,
     "acceptance_question_card": scenario_acceptance_question_card,
     "runtime_recovery_card": scenario_runtime_recovery_card,
+    "stale_text_message_ignored": scenario_stale_text_message_ignored,
+    "stale_card_action_ignored": scenario_stale_card_action_ignored,
+    "out_of_order_text_message_ignored": scenario_out_of_order_text_message_ignored,
+    "duplicate_event_idempotent": scenario_duplicate_event_idempotent,
     "group_create_at_mention": scenario_group_create_at_mention,
     "group_create_menu": scenario_group_create_menu,
     "intent_confirm_override": scenario_intent_confirm_override,
