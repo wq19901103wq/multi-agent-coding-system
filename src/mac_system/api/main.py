@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import select
 
 from mac_system.agents.orchestrator import AgentOrchestrator
-from mac_system.agents.runtime import FakeRuntime
+from mac_system.agents.runtime import ClaudeCodeRuntime, FakeRuntime
 from mac_system.config import get_settings
 from mac_system.core.project_service import (
     ApprovalNotFoundError,
@@ -620,8 +620,10 @@ class SeedFeishuInteractionRequest(BaseModel):
         "planning_rejection",
         "architecture_confirmation",
         "requirement_confirmation",
+        "requirement_custom_question",
         "acceptance_question",
         "runtime_recovery",
+        "active_task_cancel",
     ]
     open_id: str
     chat_id: str
@@ -729,37 +731,81 @@ async def seed_feishu_interaction(
                 "retry_count": 2,
             },
         }
+    elif req.kind == "active_task_cancel":
+        project.current_state = "PLANNING_REQUIREMENTS"
     else:
-        project.current_state = "ACCEPTANCE_INPUT_PENDING"
+        is_requirement_custom = req.kind == "requirement_custom_question"
+        project.current_state = (
+            "REQUIREMENT_INPUT_PENDING"
+            if is_requirement_custom
+            else "ACCEPTANCE_INPUT_PENDING"
+        )
         interaction = await service.create_question_interaction(
             project_id=project.id,
             origin_task_id=None,
             origin_round=1,
-            resume_state="ACCEPTANCE_PENDING",
-            agent="acceptance_evaluator",
-            stage="acceptance",
-            batch_key=f"e2e_acceptance_{project.id}",
+            resume_state=(
+                "PLANNING_REQUIREMENTS"
+                if is_requirement_custom
+                else "ACCEPTANCE_PENDING"
+            ),
+            agent="planner" if is_requirement_custom else "acceptance_evaluator",
+            stage="requirements" if is_requirement_custom else "acceptance",
+            batch_key=(
+                f"e2e_requirement_custom_{project.id}"
+                if is_requirement_custom
+                else f"e2e_acceptance_{project.id}"
+            ),
             questions=[
                 {
-                    "question_id": "q_acceptance_mode",
+                    "question_id": (
+                        "q_requirement_scope"
+                        if is_requirement_custom
+                        else "q_acceptance_mode"
+                    ),
                     "kind": "blocking",
-                    "question": "最终验收采用哪种确认方式？",
-                    "reason": "用于验证 Acceptance ask_user 卡片和恢复流转",
-                    "allow_free_text": False,
-                    "options": [
-                        {
-                            "key": "strict",
-                            "label": "严格验收",
-                            "impact": "所有验收证据必须完整",
-                            "recommended": True,
-                        },
-                        {
-                            "key": "manual",
-                            "label": "人工复核",
-                            "impact": "保留人工最终判断",
-                            "recommended": False,
-                        },
-                    ],
+                    "question": (
+                        "是否接受默认只支持移动端？"
+                        if is_requirement_custom
+                        else "最终验收采用哪种确认方式？"
+                    ),
+                    "reason": (
+                        "用于验证选择修改后继续收集具体要求"
+                        if is_requirement_custom
+                        else "用于验证 Acceptance ask_user 卡片和恢复流转"
+                    ),
+                    "allow_free_text": is_requirement_custom,
+                    "options": (
+                        [
+                            {
+                                "key": "accept_default",
+                                "label": "接受默认：只支持移动端",
+                                "impact": "按默认范围继续",
+                                "recommended": True,
+                            },
+                            {
+                                "key": "provide_custom",
+                                "label": "我要修改",
+                                "impact": "继续填写具体要求",
+                                "recommended": False,
+                            },
+                        ]
+                        if is_requirement_custom
+                        else [
+                            {
+                                "key": "strict",
+                                "label": "严格验收",
+                                "impact": "所有验收证据必须完整",
+                                "recommended": True,
+                            },
+                            {
+                                "key": "manual",
+                                "label": "人工复核",
+                                "impact": "保留人工最终判断",
+                                "recommended": False,
+                            },
+                        ]
+                    ),
                     "affected_trace_ids": ["AC-E2E-001"],
                 }
             ],
@@ -771,7 +817,8 @@ async def seed_feishu_interaction(
         }
     service.session.commit()
 
-    await orchestrator.tick(project.id)
+    if req.kind != "active_task_cancel":
+        await orchestrator.tick(project.id)
     approval = service.session.exec(
         select(Approval)
         .where(Approval.project_id == project.id, Approval.status == "pending")
@@ -798,6 +845,25 @@ async def test_tick(
 
     await orchestrator.tick(project_id)
     return {"status": "ok"}
+
+
+@app.get("/test/projects/{project_id}/runtime")
+def test_project_runtime(
+    project_id: str,
+    _auth: None = Depends(require_control_api_token),
+    service: ProjectService = Depends(get_project_service),
+) -> dict[str, Any]:
+    """Expose DB/runtime activity for true cancellation E2E assertions."""
+    settings = get_settings()
+    if not settings.feishu_test_mode:
+        raise HTTPException(status_code=404, detail="NOT_FOUND")
+    service.require_project(project_id)
+    db_task_ids = [task.id for task in service._running_tasks(project_id)]
+    active_ids = set(ClaudeCodeRuntime.active_task_ids())
+    return {
+        "db_running_task_ids": db_task_ids,
+        "process_task_ids": [task_id for task_id in db_task_ids if task_id in active_ids],
+    }
 
 
 @app.post("/test/clear_pending_intent/{open_id}")

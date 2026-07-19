@@ -331,6 +331,25 @@ class MacApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def cancel_project(self, project_id: str) -> dict[str, Any]:
+        if self.dry_run:
+            return {"status": "cancelled"}
+        resp = await self._client.post(
+            f"{self.base_url}/projects/{project_id}/commands",
+            json={"command": "cancel"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_runtime_activity(self, project_id: str) -> dict[str, Any]:
+        if self.dry_run:
+            return {"db_running_task_ids": [], "process_task_ids": []}
+        resp = await self._client.get(
+            f"{self.base_url}/test/projects/{project_id}/runtime"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
 
 @dataclass
 class ScenarioContext:
@@ -1149,6 +1168,59 @@ async def wait_for_approval_at_state(
     actual_state = status.get("current_state")
     pending = status.get("pending_approval") or {}
     if (
+        actual_state != expected_state
+        and (
+            str(actual_state).endswith("_INPUT_PENDING")
+            or actual_state == "CLARIFICATION_PENDING"
+        )
+        and recovery_depth < 8
+    ):
+        # Planning/quality agents may legitimately ask questions before the
+        # confirmation state. Submit the card's recommended choices first;
+        # the handler resolves the linked QuestionInteraction from approval
+        # payload, so the test does not need a private interaction id.
+        eprint(
+            f"  agent requested input in {actual_state}; "
+            "auto-submit recommended choices"
+        )
+        await inject_action(
+            ctx,
+            open_id=ctx.args.open_id,
+            approval_id=approval_id,
+            action="submit_selected_options",
+            state=str(actual_state),
+        )
+        await asyncio.sleep(1.0)
+        anchor_message_id = reply.message_id
+        # Pure free-text batches have no recommended choice. Answer one
+        # question at a time through the public command path until the same
+        # interaction actually advances; intermediate answers do not create a
+        # new Approval card.
+        for _ in range(12):
+            refreshed = await ctx.mac.get_status(project_id)
+            refreshed_pending = refreshed.get("pending_approval") or {}
+            if (
+                refreshed.get("current_state") != actual_state
+                or refreshed_pending.get("approval_id") != approval_id
+            ):
+                break
+            anchor_message_id = await send_feishu_text(
+                ctx, f"/input {approval_id} 按推荐方案处理"
+            ) or anchor_message_id
+            await asyncio.sleep(2.0)
+        else:
+            raise RuntimeError(
+                f"Input interaction {approval_id} did not advance after 12 answers"
+            )
+        return await wait_for_approval_at_state(
+            ctx,
+            project_id,
+            expected_state,
+            after_message_id=anchor_message_id,
+            timeout=timeout,
+            recovery_depth=recovery_depth + 1,
+        )
+    if (
         actual_state == "REWORK"
         and expected_state in {
             "CODING_CONFIRM_PENDING",
@@ -1230,56 +1302,34 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
     - Acceptance:   reject → REWORK → to_requirements → full replay → COMPLETED
     """
     eprint("Scenario 14: full_feature_flow (with full branch coverage)")
-    msg_id = await send_feishu_text(
-        ctx,
-        "/create --type=feature 实现最小 Todo CLI：只支持 add <文本> 和 list 两个命令；"
-        "进程内存储；不做编辑、删除、权限、持久化和网络功能",
-    )
     if ctx.dry_run:
         return
     assert ctx.sim is not None
-    reply = await ctx.sim.wait_for_reply(
-        pattern=(
-            r"正在根据需求描述生成候选目录名|正在根据需求描述查找|"
-            r"选择目录|跳过|自动创建并初始化|已创建项目"
-        ),
-        after_message_id=msg_id,
-        timeout=120.0,
-    )
-    if reply is None:
-        raise RuntimeError("MAC bot did not start project creation")
-    if "正在根据需求描述生成候选目录名" in reply.text or "正在根据需求描述查找" in reply.text:
-        reply = await ctx.sim.wait_for_reply(
-            pattern=r"选择目录|跳过|自动创建并初始化|已创建项目",
-            after_message_id=reply.message_id,
-            timeout=300.0,
-        )
-        if reply is None:
-            raise RuntimeError("MAC bot did not send directory selection card")
-    if "已创建项目" not in reply.text:
-        await inject_action(
+    # Create through the control plane so this exhaustive workflow remains
+    # isolated from unrelated active projects in the shared E2E chat. Separate
+    # scenarios cover Feishu /create and bind-dir interactions.
+    anchor_message_id = await _seed_card_anchor(ctx)
+    project = await ctx.mac.create_project(
+        **_project_create_kwargs(
             ctx,
-            open_id=ctx.args.open_id,
-            approval_id="",
-            action="menu",
-            option_key="bind_dir_for_create_skip",
+            name="full-feature-flow",
+            task_type="feature",
+            description=(
+                "实现最小 Todo CLI：只支持 add <文本> 和 list 两个命令；"
+                "进程内存储；不做编辑、删除、权限、持久化和网络功能"
+            ),
+            approval_mode="normal",
         )
-        reply = await ctx.sim.wait_for_reply(
-            pattern=r"已创建项目",
-            after_message_id=reply.message_id,
-            timeout=120.0,
-        )
-        if reply is None:
-            raise RuntimeError("MAC bot did not create project after directory skip")
-    project_id = extract_project_id(reply.text)
-    if not project_id:
-        raise RuntimeError(f"Could not extract project_id from reply: {reply.text!r}")
-    eprint(f"  created project {project_id}")
+    )
+    project_id = project["id"]
+    first_tick = asyncio.create_task(ctx.mac.tick(project_id))
+    eprint(f"  created isolated project {project_id}")
 
     # ── 1. Requirements: reject then confirm ──────────────────────────────
     approval_id, reply = await wait_for_approval_at_state(
-        ctx, project_id, "REQUIREMENT_CONFIRM_PENDING", after_message_id=reply.message_id
+        ctx, project_id, "REQUIREMENT_CONFIRM_PENDING", after_message_id=anchor_message_id
     )
+    await first_tick
     eprint(f"  requirement approval {approval_id} (will reject)")
     msg_id = await send_feishu_text(
         ctx,
@@ -1544,7 +1594,11 @@ async def _seed_card_anchor(ctx: ScenarioContext) -> str:
 
 async def _cancel_seeded_project(ctx: ScenarioContext, project_id: str) -> None:
     """Cancel a seeded project and wait until it can no longer leak work/cards."""
-    await send_feishu_text(ctx, f"/cancel {project_id}")
+    # Use the Control API so cancellation can interrupt an Agent currently
+    # occupying the serialized Feishu handler. Sending /cancel into the same
+    # chat would queue behind that handler and let cards leak into the next
+    # scenario.
+    await ctx.mac.cancel_project(project_id)
     deadline = time.monotonic() + 60.0
     while time.monotonic() < deadline:
         status = await ctx.mac.get_status(project_id)
@@ -1688,6 +1742,66 @@ async def scenario_acceptance_question_card(ctx: ScenarioContext) -> None:
     await _cancel_seeded_project(ctx, seeded["project_id"])
 
 
+async def scenario_requirement_custom_question(ctx: ScenarioContext) -> None:
+    """Select "我要修改", collect text, and resume the originating Agent."""
+    eprint("Scenario: requirement_custom_question")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    anchor = await _seed_card_anchor(ctx)
+    seeded = await ctx.mac.seed_feishu_interaction(
+        kind="requirement_custom_question",
+        open_id=ctx.args.open_id,
+        chat_id=ctx.args.chat_id or f"p2p:{ctx.args.open_id}",
+        chat_type="group" if ctx.args.chat_id else "p2p",
+    )
+    card = await ctx.sim.wait_for_reply(
+        pattern=r"是否接受默认只支持移动端|我要修改",
+        after_message_id=anchor,
+        timeout=120.0,
+    )
+    if card is None:
+        raise RuntimeError("Requirement custom-choice card was not rendered")
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        seeded["approval_id"],
+        "select_question_option",
+        option_key="provide_custom",
+        state="REQUIREMENT_INPUT_PENDING",
+        extras={
+            "interaction_id": seeded["interaction_id"],
+            "question_id": "q_requirement_scope",
+        },
+    )
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        seeded["approval_id"],
+        "submit_selected_options",
+        state="REQUIREMENT_INPUT_PENDING",
+        extras={"interaction_id": seeded["interaction_id"]},
+    )
+    input_card = await ctx.sim.wait_for_reply(
+        pattern=r"请直接回复此消息作答",
+        after_message_id=card.message_id,
+        timeout=120.0,
+    )
+    if input_card is None:
+        raise RuntimeError("Selecting custom answer did not render a text-input card")
+    await send_feishu_text(
+        ctx,
+        f"/input {seeded['approval_id']} 改为同时支持移动端和桌面端",
+    )
+    status = await wait_for_state(
+        ctx, seeded["project_id"], "PLANNING_REQUIREMENTS", timeout=60.0
+    )
+    if status is None:
+        raise RuntimeError("Custom text answer did not resume the requirements Agent")
+    eprint("  custom choice collected text and resumed requirements")
+    await _cancel_seeded_project(ctx, seeded["project_id"])
+
+
 async def scenario_runtime_recovery_card(ctx: ScenarioContext) -> None:
     """Render a runtime recovery card and terminate through its callback."""
     eprint("Scenario: runtime_recovery_card")
@@ -1722,6 +1836,59 @@ async def scenario_runtime_recovery_card(ctx: ScenarioContext) -> None:
             return
         await asyncio.sleep(2.0)
     raise RuntimeError("Runtime recovery cancel did not terminate the project")
+
+
+async def scenario_active_task_cancel(ctx: ScenarioContext) -> None:
+    """Cancel a project through Feishu while its planning CLI is still running."""
+    eprint("Scenario: active_task_cancel")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    seeded = await ctx.mac.seed_feishu_interaction(
+        kind="active_task_cancel",
+        open_id=ctx.args.open_id,
+        chat_id=ctx.args.chat_id or f"p2p:{ctx.args.open_id}",
+        chat_type="group" if ctx.args.chat_id else "p2p",
+    )
+    project_id = seeded["project_id"]
+    eprint(f"  seeded project {project_id}")
+
+    tick_task = asyncio.create_task(ctx.mac.tick(project_id))
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        activity = await ctx.mac.get_runtime_activity(project_id)
+        if activity["process_task_ids"]:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        tick_task.cancel()
+        raise RuntimeError("Planner process did not start before cancellation")
+
+    started_at = time.monotonic()
+    cancel_message_id = await send_feishu_text(ctx, f"/cancel {project_id}")
+    reply = await ctx.sim.wait_for_reply(
+        pattern=rf"项目 {re.escape(project_id)} 已终止",
+        after_message_id=cancel_message_id,
+        timeout=20.0,
+    )
+    if reply is None:
+        raise RuntimeError("Feishu /cancel was blocked behind the active Agent task")
+
+    status = await ctx.mac.get_status(project_id)
+    if status.get("status") != "cancelled":
+        raise RuntimeError(f"Project remained {status.get('status')} after /cancel")
+    deadline = time.monotonic() + 10.0
+    activity: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        activity = await ctx.mac.get_runtime_activity(project_id)
+        if not activity["db_running_task_ids"] and not activity["process_task_ids"]:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        raise RuntimeError(f"Cancelled project still has runtime activity: {activity}")
+    await asyncio.wait_for(tick_task, timeout=10.0)
+    elapsed = time.monotonic() - started_at
+    eprint(f"  active task cancelled through Feishu in {elapsed:.1f}s")
 
 
 def _iso_now() -> str:
@@ -1952,7 +2119,9 @@ SCENARIOS: dict[str, Any] = {
     "planning_rejection_form": scenario_planning_rejection_form,
     "architecture_confirmation": scenario_architecture_confirmation,
     "acceptance_question_card": scenario_acceptance_question_card,
+    "requirement_custom_question": scenario_requirement_custom_question,
     "runtime_recovery_card": scenario_runtime_recovery_card,
+    "active_task_cancel": scenario_active_task_cancel,
     "stale_text_message_ignored": scenario_stale_text_message_ignored,
     "stale_card_action_ignored": scenario_stale_card_action_ignored,
     "out_of_order_text_message_ignored": scenario_out_of_order_text_message_ignored,

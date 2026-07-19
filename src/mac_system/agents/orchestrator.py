@@ -112,17 +112,22 @@ class AgentOrchestrator:
     async def cancel_project(self, project_id: str, reason: str = "") -> None:
         """Cancel a project, fail running tasks, and notify the chat/user."""
         project = self.project_service.require_project(project_id)
-        if project.status == "cancelled":
-            return
+        running_task_ids = [
+            task.id for task in self.project_service._running_tasks(project_id)
+        ]
 
-        # Best-effort kill any running agent subprocess.
-        for task in self.project_service._running_tasks(project_id):
+        # Persist cancellation before killing the process.  The interrupted
+        # handler may wake up immediately and attempt a technical retry; it
+        # must observe cancelled state before that can happen.
+        await self.project_service.cancel_project(project_id, reason=reason, triggered_by="user")
+
+        # Best-effort kill any running agent subprocess after the durable
+        # cancellation marker is visible to other DB sessions.
+        for task_id in running_task_ids:
             try:
-                self.runtime.cancel(task.id)
+                self.runtime.cancel(task_id)
             except Exception:
                 pass
-
-        await self.project_service.cancel_project(project_id, reason=reason, triggered_by="user")
 
         if self.feishu_bridge is None:
             return
@@ -682,7 +687,7 @@ class AgentOrchestrator:
                 if agent_type == "conversation_coordinator" and owns_worktree:
                     # Ordinary chat turns do not need filesystem tools. Keeping
                     # the tool surface empty reduces CLI startup/planning work;
-                    # workspace inspections still receive Read explicitly.
+                    # explicit workspace inspections receive Read separately.
                     allowed_tools = []
             except Exception as e:
                 logger.error(
@@ -1244,19 +1249,32 @@ class AgentOrchestrator:
             suffix = item.get("id_suffix") or f"q_{idx}"
             default_assumption = item.get("default_assumption")
             question_text = item["question"]
+            options: list[dict[str, Any]] = []
+            allow_free_text = True
             if default_assumption:
-                question_text += (
-                    f"\n\n（当前默认假设：{default_assumption}，"
-                    "如果同意可回复「确认」，否则请说明你的选择。）"
-                )
+                question_text += f"\n\n当前默认假设：{default_assumption}"
+                options = [
+                    {
+                        "key": "accept_default",
+                        "label": f"接受默认：{default_assumption}",
+                        "impact": "按当前默认假设继续",
+                        "recommended": True,
+                    },
+                    {
+                        "key": "provide_custom",
+                        "label": "我要修改",
+                        "impact": "选择后继续填写具体要求",
+                        "recommended": False,
+                    },
+                ]
             questions.append({
                 "question_id": f"q_{suffix}",
                 "decision_key": f"artifact.{suffix}",
                 "kind": "blocking",
                 "question": question_text,
                 "reason": item.get("impact") or "产物中存在未澄清项，必须明确后才能进入确认阶段",
-                "allow_free_text": True,
-                "options": [],
+                "allow_free_text": allow_free_text,
+                "options": options,
                 "affected_trace_ids": [],
                 "default_assumption": default_assumption,
             })

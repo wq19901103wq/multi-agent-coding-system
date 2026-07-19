@@ -71,6 +71,7 @@ def test_health(client):
     ("kind", "expected_state", "has_interaction"),
     [
         ("planning_rejection", "REQUIREMENT_CONFIRM_PENDING", False),
+        ("requirement_custom_question", "REQUIREMENT_INPUT_PENDING", True),
         ("acceptance_question", "ACCEPTANCE_INPUT_PENDING", True),
         ("runtime_recovery", "CODING_RECOVERY_PENDING", False),
     ],
@@ -95,6 +96,25 @@ def test_seed_feishu_interaction(
     assert payload["state"] == expected_state
     assert payload["approval_id"].startswith("appr_")
     assert bool(payload["interaction_id"]) is has_interaction
+
+
+def test_seed_active_task_cancel_without_starting_agent(client, monkeypatch):
+    monkeypatch.setattr(get_settings(), "feishu_test_mode", True)
+
+    response = client.post(
+        "/test/seed_feishu_interaction",
+        json={
+            "kind": "active_task_cancel",
+            "open_id": "ou_cancel_seed",
+            "chat_id": "oc_cancel_seed",
+            "chat_type": "group",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["state"] == "PLANNING_REQUIREMENTS"
+    assert payload["approval_id"] is None
 
 
 def test_control_api_rejects_missing_token(client):
@@ -377,6 +397,23 @@ def test_admin_cancel_project(client):
 
     status_resp = client.get(f"/projects/{project_id}/status")
     assert status_resp.json()["status"] == "cancelled"
+
+
+def test_runtime_activity_endpoint_disabled_by_default(client):
+    create_resp = client.post(
+        "/projects",
+        json={
+            "name": "runtime-activity-disabled",
+            "task_type": "feature",
+            "description": "test",
+            "approval_mode": "normal",
+        },
+    )
+    project_id = create_resp.json()["id"]
+
+    response = client.get(f"/test/projects/{project_id}/runtime")
+
+    assert response.status_code == 404
 
 
 def test_admin_rollback_project(client):

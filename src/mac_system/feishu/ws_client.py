@@ -320,8 +320,15 @@ class FeishuWebSocketClient:
             logger.exception("Failed to persist Feishu event log")
 
     async def _handle_message(self, msg: TextMessage, event_id: str | None = None) -> None:
-        lock = self._user_lock(msg.open_id)
-        await asyncio.to_thread(lock.acquire)
+        # A cancellation command must be able to interrupt a long-running
+        # handler from the same user. Other messages remain strictly ordered.
+        normalized_text = _strip_mention_placeholders(msg.text or "")
+        is_priority_cancel = normalized_text == "/cancel" or normalized_text.startswith(
+            "/cancel "
+        )
+        lock = None if is_priority_cancel else self._user_lock(msg.open_id)
+        if lock:
+            await asyncio.to_thread(lock.acquire)
         try:
             logger.info(
                 "[Feishu WS] raw message chat_type=%s chat_id=%s sender=%s mentions=%s text=%r",
@@ -438,7 +445,8 @@ class FeishuWebSocketClient:
                 detail=str(exc)[:500],
             )
         finally:
-            lock.release()
+            if lock:
+                lock.release()
 
     async def _handle_card_action(self, action: ButtonAction, event_id: str | None = None) -> dict[str, Any] | None:
         # Selection-only clicks update the card in-place and must return quickly

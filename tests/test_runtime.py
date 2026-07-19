@@ -1,9 +1,53 @@
 import json
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from mac_system.agents.runtime import ClaudeCodeRuntime, FakeRuntime
+
+
+@pytest.mark.asyncio
+async def test_cancel_from_another_runtime_instance_stops_running_process(tmp_path):
+    fake_cli = tmp_path / "fake-claude"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, time\n"
+        "sys.stdin.readline()\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+    running_runtime = ClaudeCodeRuntime(fake_cli)
+    cancelling_runtime = ClaudeCodeRuntime(fake_cli)
+
+    execution = asyncio.create_task(
+        running_runtime.execute(
+            agent_type="planner",
+            task_prompt="test",
+            system_prompt="system",
+            workspace=tmp_path,
+            worktree=tmp_path,
+            context_files=[],
+            output_schema=tmp_path / "schema.json",
+            allowed_tools=[],
+            readonly_dirs=[],
+            timeout_seconds=60,
+            task_id="task_cross_runtime_cancel",
+        )
+    )
+    for _ in range(100):
+        if "task_cross_runtime_cancel" in running_runtime._processes:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("runtime subprocess did not start")
+
+    cancelling_runtime.cancel("task_cross_runtime_cancel")
+    result = await asyncio.wait_for(execution, timeout=3)
+
+    assert result.success is False
+    assert "task_cross_runtime_cancel" not in running_runtime._processes
 
 
 def test_build_claude_command():
@@ -27,6 +71,8 @@ def test_build_claude_command():
     assert "Read,Edit" in cmd
     assert "--dangerously-skip-permissions" in cmd
     assert "--bare" in cmd
+    setting_sources_index = cmd.index("--setting-sources")
+    assert cmd[setting_sources_index + 1] == ""
     assert "--model" in cmd
     assert "kimi-for-coding" in cmd
     assert "--add-dir" in cmd
@@ -46,6 +92,23 @@ def test_stream_command_empty_allowed_tools_disables_tools():
     assert "--allowedTools" not in cmd
     assert "--bare" in cmd
     assert "--strict-mcp-config" in cmd
+    setting_sources_index = cmd.index("--setting-sources")
+    assert cmd[setting_sources_index + 1] == ""
+
+
+def test_stream_command_with_tools_still_ignores_user_settings():
+    runtime = ClaudeCodeRuntime(Path("/usr/bin/claude"))
+    cmd = runtime._build_command(
+        system_prompt_file=Path("/tmp/sys.md"),
+        allowed_tools=["Read", "Write"],
+        readonly_dirs=[Path("/tmp/ref")],
+    )
+
+    assert "--allowedTools" in cmd
+    assert "Read,Write" in cmd
+    assert "--bare" in cmd
+    setting_sources_index = cmd.index("--setting-sources")
+    assert cmd[setting_sources_index + 1] == ""
 
 
 def test_parse_json_output_single():

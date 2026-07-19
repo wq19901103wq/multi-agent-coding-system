@@ -2,12 +2,13 @@
 
 ## P0：当前承诺闭环
 
-- [x] 完整单元测试与 lint 全绿（246 passed，2026-07-17；历史文件格式化债务另计）。
+- [x] 完整单元测试与 lint 全绿（283 passed，2026-07-19；历史文件格式化债务另计）。
 - [x] 真实飞书 `conversation_delivery`：讨论 → 执行确认 → 单次创建 → 重复点击回执。
 - [x] 真实飞书规划驳回输入卡、统一 ask_user、Acceptance ask_user 和恢复卡渲染验证（2026-07-16/17，四个场景均通过）。
-- [x] 同一真实飞书 full-flow 项目覆盖全回退分支并到 `COMPLETED`（2026-07-17，`proj_20260717_013549_7aed`）。
+- [x] 同一真实飞书 full-flow 项目覆盖全回退分支并到 `COMPLETED`（最新复验：2026-07-19，`proj_20260719_020155_d373`）。
 - [x] `full_feature_flow` 脚本自动处理质量 Agent 主动 fail 的 REWORK（已实现并有单测；真实运行中尚未自然触发 Agent 主动 fail，后续运行顺带观察即可）。
 - [ ] SQLite WAL/busy-timeout 并发保护的压力验证。
+- [ ] 让项目取消/终止信号主动中断已启动的 Claude CLI 子进程，并验证不会阻塞后续飞书消息。
 
 ## P1：移动端产品体验
 

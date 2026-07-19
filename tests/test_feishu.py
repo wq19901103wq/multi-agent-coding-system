@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timedelta
 from typing import Any
@@ -111,6 +112,45 @@ async def test_ws_group_mention_sets_shared_handler_flag(monkeypatch):
 
     assert received and received[0].is_at_bot is True
     assert received[0].text == "帮我分析"
+
+
+@pytest.mark.asyncio
+async def test_ws_cancel_bypasses_busy_user_lock(monkeypatch):
+    from mac_system.feishu import ws_client
+
+    received: list[str] = []
+
+    async def fake_handle_text_message(ctx, msg):
+        received.append(msg.text)
+
+    class HandlerScope:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    client = ws_client.FeishuWebSocketClient()
+    monkeypatch.setattr(ws_client, "handle_text_message", fake_handle_text_message)
+    monkeypatch.setattr(client, "_handler_context", lambda msg=None: HandlerScope())
+    busy_lock = client._user_lock("ou_user")
+    busy_lock.acquire()
+    try:
+        await asyncio.wait_for(
+            client._handle_message(
+                TextMessage(
+                    open_id="ou_user",
+                    message_id="om_cancel",
+                    text="/cancel proj_running",
+                    is_command=True,
+                )
+            ),
+            timeout=1,
+        )
+    finally:
+        busy_lock.release()
+
+    assert received == ["/cancel proj_running"]
 
 
 @pytest.fixture
@@ -377,6 +417,32 @@ def test_build_question_batch_card_submitted_state_disables_buttons():
     assert "skip_remaining" not in action_values
 
 
+def test_build_question_batch_card_waiting_for_custom_text_receipt():
+    from mac_system.feishu.card import build_question_batch_card
+
+    card = build_question_batch_card(
+        approval_id="appr_1",
+        interaction_id="qi_1",
+        questions=[{
+            "question_id": "q_1",
+            "kind": "blocking",
+            "question": "是否接受默认？",
+            "options": [
+                {"key": "accept_default", "label": "接受默认", "recommended": True},
+                {"key": "provide_custom", "label": "我要修改"},
+            ],
+        }],
+        agent="planner",
+        stage="requirements",
+        submitted_answers={"q_1": "provide_custom"},
+        awaiting_free_text=True,
+    )
+
+    assert "等待补充说明" in card["header"]["title"]["content"]
+    assert "接下来的输入卡" in str(card)
+    assert "Agent 继续执行" not in str(card)
+
+
 def test_build_status_card():
     card = build_status_card(
         title="状态",
@@ -610,6 +676,46 @@ async def test_confirmation_free_text_is_not_queued_forever(feishu_ctx):
     assert f"/confirm {approval.id}" in sent_text
 
 
+async def test_late_input_for_resolved_approval_returns_idempotent_receipt(feishu_ctx):
+    from mac_system.feishu.handlers import handle_text_message
+
+    project = await feishu_ctx.service.create_project(
+        name="resolved-input",
+        task_type="feature",
+        description="Test",
+        creator_open_id="ou_1",
+    )
+    project.current_state = "REQUIREMENT_INPUT_PENDING"
+    feishu_ctx.service.session.commit()
+    approval = await feishu_ctx.service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="REQUIREMENT_INPUT_PENDING",
+        approval_type="input",
+        question="范围是什么？",
+        options=[],
+    )
+    await feishu_ctx.service.respond_approval(
+        approval.id, "answer", "ou_1"
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_late_input",
+            text=f"/input {approval.id} 迟到的回答",
+            is_command=True,
+        ),
+    )
+
+    assert any(
+        "已处理，无需重复提交" in str(item[2])
+        for item in feishu_ctx.bridge.sent
+        if item[0] == "text"
+    )
+
+
 async def test_reply_to_question_card_routes_by_parent_message(feishu_ctx):
     from mac_system.feishu.handlers import handle_text_message
 
@@ -807,6 +913,102 @@ async def test_question_card_action_rejects_unauthorized_user(feishu_ctx):
     assert question.status == "pending"
     assert feishu_ctx.service.get_approval(approval.id).status == "pending"
     assert "没有权限" in feishu_ctx.bridge.sent[-1][2]
+
+
+async def test_custom_choice_collects_text_before_resuming_agent(feishu_ctx):
+    from mac_system.feishu.handlers import handle_card_action, handle_text_message
+
+    project = await feishu_ctx.service.create_project(
+        name="custom-answer",
+        task_type="feature",
+        description="test",
+        creator_open_id="ou_1",
+    )
+    project.current_state = "REQUIREMENT_INPUT_PENDING"
+    feishu_ctx.service.session.commit()
+    interaction = await feishu_ctx.service.create_question_interaction(
+        project.id,
+        "task_origin",
+        1,
+        "PLANNING_REQUIREMENTS",
+        "planner",
+        "requirements",
+        "custom_batch",
+        [{
+            "question_id": "q_scope",
+            "decision_key": "requirements.scope",
+            "kind": "decision",
+            "question": "是否接受默认范围？",
+            "allow_free_text": True,
+            "options": [
+                {
+                    "key": "accept_default",
+                    "label": "接受默认范围",
+                    "recommended": True,
+                },
+                {"key": "provide_custom", "label": "我要修改"},
+            ],
+        }],
+    )
+    approval = await feishu_ctx.service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="REQUIREMENT_INPUT_PENDING",
+        approval_type="input",
+        question="是否接受默认范围？",
+        options=[],
+        payload={
+            "question_interaction_id": interaction.id,
+            "question_batch_message_id": "om_batch",
+            "selected_options": {"q_scope": "provide_custom"},
+        },
+    )
+    interaction.approval_id = approval.id
+    feishu_ctx.service.session.commit()
+
+    await handle_card_action(
+        feishu_ctx,
+        ButtonAction(
+            open_id="ou_1",
+            approval_id=approval.id,
+            action="submit_selected_options",
+            state="REQUIREMENT_INPUT_PENDING",
+            option_key=None,
+            decision_id=None,
+            extras={"interaction_id": interaction.id},
+            message_id="om_batch",
+        ),
+    )
+
+    question = feishu_ctx.service.get_questions_for_interaction(interaction.id)[0]
+    assert question.status == "pending"
+    assert feishu_ctx.service.get_question_answer(question.id) is None
+    refreshed_approval = feishu_ctx.service.get_approval(approval.id)
+    assert refreshed_approval.payload["custom_answer_question_ids"] == ["q_scope"]
+    assert refreshed_approval.payload["reply_message_to_question"]["msg_1"] == "q_scope"
+    assert any(
+        message_id == "om_batch" and "等待补充说明" in str(card)
+        for message_id, card in feishu_ctx.bridge.updated
+    )
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_custom_reply",
+            parent_id="msg_1",
+            text="改为只支持移动端",
+            is_command=False,
+        ),
+    )
+
+    answer = feishu_ctx.service.get_question_answer(question.id)
+    assert answer is not None
+    assert answer.answer == "改为只支持移动端"
+    assert feishu_ctx.service.require_project(project.id).current_state == "PLANNING_REQUIREMENTS"
+    final_cards = [card for message_id, card in feishu_ctx.bridge.updated if message_id == "om_batch"]
+    assert "已提交" in str(final_cards[-1])
+    assert "改为只支持移动端" in str(final_cards[-1])
 
 
 def test_parse_text_message_bot_sender():
@@ -1416,6 +1618,7 @@ class _FakeOrchestratorWithBindDir:
             "stage": stage,
             "input_data": input_data,
             "extra_variables": extra_variables,
+            "worktree": worktree,
             "progress_callback": progress_callback,
         })
         return self.agent_output
@@ -1483,6 +1686,148 @@ async def test_conversation_coordinator_answers_without_creating_project(feishu_
         ("add", "om_discuss", "OnIt"),
         ("remove", "om_discuss", "reaction_1"),
     ]
+
+
+async def test_conversation_ignores_cancelled_project_reference(feishu_ctx):
+    """A stale conversation active_project_id pointing to a cancelled project
+    must not make the coordinator offer confirm/cancel options again.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_cancelled_ref"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+
+    project = await feishu_ctx.service.create_project(
+        name="stale", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    await feishu_ctx.service.cancel_project(project.id)
+
+    # Simulate a conversation session that still references the dead project.
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目仍处于悬空状态",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    fake = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "当前没有活跃项目，可以重新开始。",
+        "intent": "answer",
+        "effect": "none",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {"type": "answer"},
+        "updated_summary": "用户询问状态，已告知无活跃项目",
+    })
+    feishu_ctx.orchestrator = fake
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_status",
+            text="现在是啥情况",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    call = fake.agent_calls[0]
+    assert json.loads(call["extra_variables"]["active_project"]) is None
+    assert json.loads(call["extra_variables"]["pending_actions"]) == []
+
+    refreshed = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    assert refreshed.active_project_id is None
+    assert refreshed.summary != "项目仍处于悬空状态"
+
+
+async def test_conversation_resolves_unbound_workspace_from_repo_mention(
+    feishu_ctx, tmp_path, monkeypatch
+):
+    """When the chat is unbound and the user mentions a local repo, the
+    coordinator should receive that repo as its workspace so it can read it.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+    import mac_system.config as cfg_module
+
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    repo = allowed_root / "wechat-mac-rpa"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    monkeypatch.setattr(cfg_module, "get_allowed_bind_roots", lambda: [allowed_root])
+
+    chat_id = "oc_repo_mention"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    fake = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "已找到并读取参考项目。",
+        "intent": "research",
+        "effect": "read_only",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {"type": "answer"},
+        "updated_summary": "用户参考 mac-rpa 项目",
+    })
+    feishu_ctx.orchestrator = fake
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_repo",
+            text="参考mac-rpa项目的个人agent实现",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    call = fake.agent_calls[0]
+    assert call["worktree"] == repo
+    extra = call["extra_variables"]
+    assert extra["workspace_path"] == str(repo)
+    repos = json.loads(extra["available_repositories"])
+    assert any(r["name"] == "wechat-mac-rpa" for r in repos)
+
+
+def test_match_repository_mention_prefers_exact_and_non_backup():
+    from mac_system.feishu.handlers import _match_repository_mention
+
+    candidates = [
+        {"name": "wechat-mac-rpa", "path": "/a/wechat-mac-rpa"},
+        {"name": "wechat-mac-rpa-backup", "path": "/a/backup"},
+        {"name": "other", "path": "/a/other"},
+    ]
+    assert _match_repository_mention("mac-rpa", candidates)["name"] == "wechat-mac-rpa"
+    assert _match_repository_mention("wechat-mac-rpa", candidates)["name"] == "wechat-mac-rpa"
+    assert _match_repository_mention("备份", candidates) is None
+
+
+def test_match_repository_mention_prefers_exact_match_when_possible():
+    from mac_system.feishu.handlers import _match_repository_mention
+
+    candidates = [
+        {"name": "wechat-mac-rpa", "path": "/a/wechat-mac-rpa"},
+        {"name": "mac-rpa", "path": "/a/mac-rpa"},
+    ]
+    # Exact token wins over substring match.
+    assert _match_repository_mention("mac-rpa", candidates)["name"] == "mac-rpa"
+
+
+def test_match_repository_mention_returns_none_when_ambiguous():
+    from mac_system.feishu.handlers import _match_repository_mention
+
+    candidates = [
+        {"name": "wechat-mac-rpa", "path": "/a/wechat-mac-rpa"},
+        {"name": "project-mac-rpa", "path": "/a/project-mac-rpa"},
+    ]
+    # Both contain the same token with the same score; should not guess.
+    assert _match_repository_mention("mac-rpa", candidates) is None
 
 
 async def test_conversation_coordinator_updates_progress_to_markdown_card(feishu_ctx):
@@ -1586,11 +1931,61 @@ async def test_conversation_clarification_uses_choice_card_and_resumes(feishu_ct
     conversation = feishu_ctx.service.get_or_create_conversation_session("oc_clarification")
     assert any("FastAPI" in turn["content"] for turn in conversation.recent_turns)
     assert not any(item[0] == "text" for item in feishu_ctx.bridge.sent)
-    assert any(
-        message_id == "msg_2" and "已完成选择" in str(card)
-        for message_id, card in feishu_ctx.bridge.updated
+    updated_card = next(
+        card for message_id, card in feishu_ctx.bridge.updated if message_id == "msg_2"
     )
+    assert "已完成选择" in str(updated_card)
+    assert "FastAPI" in str(updated_card)
+    assert "Node.js" in str(updated_card)
+    assert "✅" in str(updated_card)
     assert "已按 FastAPI" in str(feishu_ctx.bridge.sent[-1][2])
+
+
+async def test_request_clarification_action_renders_choice_card_even_without_flag(
+    feishu_ctx,
+):
+    """The coordinator may set proposed_action.type=request_clarification without
+    needs_clarification=true; the handler should still render a choice card.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    feishu_ctx.chat_id = "oc_clarification2"
+    feishu_ctx.chat_type = "group"
+    fake = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "请确认方案",
+        "intent": "compare",
+        "effect": "none",
+        "commitment": "considering",
+        "needs_clarification": False,
+        "clarification": {
+            "question": "是否采用该方案？",
+            "reason": "需要你的确认",
+            "options": [
+                {"key": "yes", "label": "确认", "recommended": True},
+                {"key": "no", "label": "再改改", "recommended": False},
+            ],
+            "allow_free_text": True,
+        },
+        "proposed_action": {"type": "request_clarification"},
+        "updated_summary": "等待用户确认方案",
+    })
+    feishu_ctx.orchestrator = fake
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_choose2", text="这个方案可以吗",
+            is_command=False, is_at_bot=True,
+            chat_id="oc_clarification2", chat_type="group",
+        ),
+    )
+
+    pending = feishu_ctx.service.session.exec(select(PendingConversationAction)).one()
+    assert pending.action_type == "clarification"
+    assert any("conversation_clarification" in str(item[2]) for item in feishu_ctx.bridge.sent)
+    assert not any(item[0] == "text" for item in feishu_ctx.bridge.sent)
 
 
 async def test_conversation_coordinator_limits_recent_turn_context(feishu_ctx):

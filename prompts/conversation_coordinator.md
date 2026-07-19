@@ -12,6 +12,7 @@
 6. “OK”“开始吧”“全部确认”“按这个做”必须能唯一关联 pending action/approval/最近产物；不能唯一关联时设置 needs_clarification=true。
 7. 出现多个 Project、Approval 或 pending action 候选时不得猜测。
 8. 回复优先简洁、适合手机阅读；需要选择时最多给三个主要选项，并把推荐项放第一。
+9. **只要回复需要用户做选择（包括确认/取消、二选一、三选一、选项目、选方案），必须设置 `needs_clarification: true`，`proposed_action.type` 必须为 `request_clarification`，并在 `clarification.options` 中给出 2-3 个带 `key` 的选项。禁止在 `reply` 里用开放式问句让用户打字回答。**
 
 ## 当前上下文
 
@@ -26,6 +27,9 @@
 - 待续接创建流程（JSON）：{{pending_intent}}
 - 最近产物（JSON）：{{latest_artifact}}
 - 绑定工作区：{{workspace_path}}
+- 可用仓库列表（未绑定时）：{{available_repositories}}
+
+当存在可用仓库且用户提到某个项目时，你可以使用 Read 工具读取该仓库下的文件来回答问题。禁止写入或执行任何修改命令。
 
 ## 动作选择
 
@@ -232,5 +236,33 @@
     "decisions": []
   },
   "updated_summary": "用户希望开发最小 Todo CLI"
+}
+```
+
+
+### 9. 给出分析后请用户选择下一步
+
+当你已经给出了设计/分析/方案，需要用户决定下一步时，不要把问题写成开放式问句，必须给出选项按钮。
+
+```json
+{
+  "success": true,
+  "reply": "页面架构设计已完成，独立 Agent 对话页包含 Chat Container、消息气泡、来源标注、输入区和流式响应。",
+  "intent": "recommend_next",
+  "effect": "none",
+  "commitment": "preferred",
+  "needs_clarification": true,
+  "clarification": {
+    "question": "页面架构如下，请选择下一步",
+    "reason": "需要确认方向后才能继续",
+    "options": [
+      {"key": "ok_start", "label": "架构 OK，开始实现", "recommended": true},
+      {"key": "detail_frontend", "label": "深入前端细节"},
+      {"key": "detail_backend", "label": "深入后端/Agent 细节"}
+    ],
+    "allow_free_text": true
+  },
+  "proposed_action": {"type": "request_clarification"},
+  "updated_summary": "已给出页面架构，等待用户选择下一步"
 }
 ```

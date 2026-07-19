@@ -580,23 +580,52 @@ class ProjectService:
     ) -> Project:
         """Cancel a project and clean up its running tasks, approvals and worktrees.
 
-        Idempotent: calling it again on an already cancelled project is a no-op.
+        Idempotent: repeated calls preserve cancelled state and also clean up
+        any late task that raced with the original cancellation.
         """
         project = self.require_project(project_id)
-        if project.status == "cancelled":
+        was_cancelled = project.status == "cancelled"
+
+        # Always clean up newly observed running tasks. This closes a race
+        # where an already in-flight handler created a retry just as the first
+        # cancellation transaction committed.
+        running_tasks = self._running_tasks(project_id)
+        for task in running_tasks:
+            task.status = "failed"
+            task.error_message = reason or "Project cancelled"
+        if was_cancelled:
+            self.session.commit()
             return project
 
         # Mark running tasks as failed so they are not recovered later.
-        for task in self._running_tasks(project_id):
-            task.status = "failed"
-            task.error_message = reason or "Project cancelled"
-
         # Expire pending approvals.
         for approval in self._pending_approvals(project_id):
             approval.status = "expired"
 
         project.status = "cancelled"
         project.updated_at = _now()
+
+        # Clear conversation sessions still pointing to this project so the
+        # coordinator no longer treats a cancelled project as active.
+        for conv in self.session.exec(
+            select(ConversationSession).where(
+                ConversationSession.active_project_id == project_id
+            )
+        ).all():
+            conv.active_project_id = None
+            conv.pending_action_id = None
+            self.session.add(conv)
+
+        # Expire any pending conversation actions tied to this project.
+        for action in self.session.exec(
+            select(PendingConversationAction).where(
+                PendingConversationAction.target_project_id == project_id,
+                PendingConversationAction.status == "pending",
+            )
+        ).all():
+            action.status = "expired"
+            action.resolved_at = _now()
+            self.session.add(action)
 
         # Remove any lingering worktrees for the project.
         try:

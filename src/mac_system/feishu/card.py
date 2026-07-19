@@ -110,43 +110,64 @@ def build_conversation_clarification_card(
     reason: str = "",
     chat_id: str | None = None,
     chat_type: str = "p2p",
+    selected_key: str | None = None,
 ) -> dict[str, Any]:
-    """Build a chat-scoped multiple-choice card for the Coordinator."""
+    """Build a chat-scoped multiple-choice card for the Coordinator.
+
+    When ``selected_key`` is provided, the card is rendered in a read-only
+    completed state: options remain visible and the selected one is marked.
+    """
     elements: list[dict[str, Any]] = [
         {"tag": "div", "text": _lark_md(f"**{question}**")},
     ]
     if reason:
         elements.append({"tag": "div", "text": _lark_md(reason)})
     actions: list[dict[str, Any]] = []
+    selected_label = ""
     for option in options[:3]:
         label = str(option.get("label") or option.get("key") or "选择")
         description = str(option.get("description") or "").strip()
+        is_selected = str(option.get("key") or "") == str(selected_key or "")
+        if is_selected:
+            selected_label = label
+        marker = " ✅" if is_selected else ""
+        name_md = f"**{label}{marker}**" if is_selected else f"{label}{marker}"
         if description:
             elements.append(
-                {"tag": "div", "text": _lark_md(f"**{label}**：{description}")}
+                {"tag": "div", "text": _lark_md(f"{name_md}：{description}")}
             )
-        actions.append(
-            {
-                "tag": "button",
-                "text": _plain_text(
-                    f"{label}{'（推荐）' if option.get('recommended') else ''}"
-                ),
-                "type": "primary" if option.get("recommended") else "default",
-                "value": {
-                    "approval_id": "",
-                    "action": "conversation_clarification",
-                    "pending_action_id": action_id,
-                    "option_key": str(option.get("key") or ""),
-                    "option_label": label,
-                    "chat_id": chat_id,
-                    "chat_type": chat_type,
-                },
-            }
+        else:
+            elements.append({"tag": "div", "text": _lark_md(name_md)})
+        if selected_key is None:
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": _plain_text(
+                        f"{label}{'（推荐）' if option.get('recommended') else ''}"
+                    ),
+                    "type": "primary" if option.get("recommended") else "default",
+                    "value": {
+                        "approval_id": "",
+                        "action": "conversation_clarification",
+                        "pending_action_id": action_id,
+                        "option_key": str(option.get("key") or ""),
+                        "option_label": label,
+                        "chat_id": chat_id,
+                        "chat_type": chat_type,
+                    },
+                }
+            )
+    if actions:
+        elements.append({"tag": "action", "actions": actions})
+    if selected_key is not None:
+        elements.append(
+            {"tag": "div", "text": _lark_md(f"---\n✅ 已选择：**{selected_label or selected_key}**")}
         )
-    elements.append({"tag": "action", "actions": actions})
+    header_title = "请选择一个方向" if selected_key is None else "已完成选择"
+    header_color = "blue" if selected_key is None else "green"
     return {
         "config": {"wide_screen_mode": True},
-        "header": _header("请选择一个方向", "blue"),
+        "header": _header(header_title, header_color),
         "elements": elements,
     }
 
@@ -488,14 +509,14 @@ def build_status_card(
 def build_question_batch_card(
     approval_id, interaction_id, questions, agent, stage, impact=None,
     state="", project_name="", chat_id=None, chat_type="p2p",
-    selected_options=None, submitted_answers=None,
+    selected_options=None, submitted_answers=None, awaiting_free_text=False,
 ):
     """Build a Feishu card that presents a batch of choice questions as buttons.
 
     Individual option clicks only change the selection state on the card. The
     user must click the "提交答案" button to submit all selected answers.
 
-    When ``submitted_answers`` is provided, render a read-only "已提交" receipt
+    When ``submitted_answers`` is provided, render a read-only receipt
     state: option buttons are disabled, final answers are highlighted, action
     buttons are hidden, and a status line is appended.
     """
@@ -571,7 +592,12 @@ def build_question_batch_card(
     elements.append({"tag": "hr"})
     elements.append({"tag": "div", "text": _lark_md(f"审批ID：{approval_id}")})
     if is_submitted:
-        elements.append({"tag": "div", "text": _lark_md("✅ 已提交，Agent 继续执行")})
+        status = (
+            "✏️ 选择已提交，请在接下来的输入卡补充具体要求"
+            if awaiting_free_text
+            else "✅ 已提交，Agent 继续执行"
+        )
+        elements.append({"tag": "div", "text": _lark_md(status)})
     else:
         has_non_blocking = any(q.get("kind") == "non_blocking" for q in questions)
         actions = [
@@ -589,7 +615,11 @@ def build_question_batch_card(
             )
         elements.append({"tag": "action", "actions": actions})
     stage_label = stage or agent
-    title = "已提交" if is_submitted else f"需要确认 {len(questions)} 个问题"
+    title = (
+        "等待补充说明"
+        if is_submitted and awaiting_free_text
+        else ("已提交" if is_submitted else f"需要确认 {len(questions)} 个问题")
+    )
     prefix = f"[{project_name}] " if project_name else ""
     header_color = "green" if is_submitted else "orange"
     return {"config": {"wide_screen_mode": True},

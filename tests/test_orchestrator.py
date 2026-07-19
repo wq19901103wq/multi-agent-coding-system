@@ -1667,6 +1667,57 @@ async def test_cancel_project_fails_auxiliary_running_tasks(orchestrator, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_cancel_persists_project_state_before_killing_runtime(orchestrator):
+    """Interrupted handlers must see cancelled state before their process exits."""
+    service, wm, renderer = orchestrator
+
+    class ObservingRuntime(FakeRuntime):
+        def __init__(self):
+            super().__init__({})
+            self.cancelled_statuses: list[str] = []
+
+        def cancel(self, task_id: str) -> None:
+            task = service.session.get(Task, task_id)
+            project = service.require_project(task.project_id)
+            self.cancelled_statuses.append(project.status)
+
+    runtime = ObservingRuntime()
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="cancel-order", task_type="feature", description="test",
+        approval_mode="normal",
+    )
+    task = await service.create_task(
+        project_id=project.id, agent_type="planner",
+        state="PLANNING_REQUIREMENTS", input_data={},
+    )
+    await service.start_task(task.id, "/tmp/fake")
+
+    await oc.cancel_project(project.id, reason="cancel race")
+
+    assert runtime.cancelled_statuses == ["cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_cleans_late_running_task(orchestrator):
+    service, _, _ = orchestrator
+    project = await service.create_project(
+        name="late-retry", task_type="feature", description="test",
+        approval_mode="normal",
+    )
+    await service.cancel_project(project.id, reason="first cancel")
+    late_task = await service.create_task(
+        project_id=project.id, agent_type="planner",
+        state="PLANNING_REQUIREMENTS", input_data={},
+    )
+    await service.start_task(late_task.id, "/tmp/fake")
+
+    await service.cancel_project(project.id, reason="repeat cancel")
+
+    assert service.session.get(Task, late_task.id).status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_agent_crash_fails_task(orchestrator, tmp_path):
     """If _run_auxiliary_agent raises unexpectedly, the task must be failed."""
     service, wm, renderer = orchestrator
@@ -1725,6 +1776,12 @@ async def test_unresolved_requirement_ambiguities_force_ask_user(orchestrator, t
     assert len(batch["questions"]) == 2
     assert batch["questions"][0]["decision_key"] == "artifact.ambiguity_0"
     assert batch["questions"][0]["allow_free_text"] is True
+    assert batch["questions"][0]["options"] == []
+    assert [
+        option["key"] for option in batch["questions"][1]["options"]
+    ] == ["accept_default", "provide_custom"]
+    assert batch["questions"][1]["options"][0]["recommended"] is True
+    assert batch["questions"][1]["allow_free_text"] is True
 
 
 @pytest.mark.asyncio

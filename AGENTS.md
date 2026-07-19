@@ -1,6 +1,6 @@
 # AGENTS.md — MAC System 开发纪律
 
-## 项目当前状态（2026-07-18）
+## 项目当前状态（2026-07-19）
 
 ### 仓库
 
@@ -32,8 +32,8 @@
   - Agent 运行期间收到的自由文本/命令被消费为 `PendingUserInput`，scope_change/correction 会强制质量关进入 `REWORK`
   - 每轮任务记录 `round_number`，旧 approval 在状态重新进入时标记 `expired`
 - **Profile 系统校验**：新增 `StateMachine.validate()` 与回归测试，确保所有 `workflow_profiles/*.json` 可解析、阶段 ID 唯一、rework/acceptance 目标存在、编译后状态机无悬空跳转。
-- **单元测试基线**：**252 passed**（2026-07-18 复跑确认）。
-- **真实飞书端到端**：`full_feature_flow` 已在最新代码上全分支跑通到 `COMPLETED`（2026-07-18，`proj_20260717_165349_3f0d`：需求/Spec 驳回、编码/测试/评审 REWORK 回退、验收回需求全量重放）；`planning_rejection_form` / `architecture_confirmation` / `acceptance_question_card` / `runtime_recovery_card` / `conversation_delivery` 场景均已真实飞书验证；脚本已能自动接管质量 Agent 主动 fail 的 REWORK。
+- **单元测试基线**：**283 passed**（2026-07-19 复跑确认）。
+- **真实飞书端到端**：`full_feature_flow` 已在最新代码上全分支跑通到 `COMPLETED`（2026-07-19，`proj_20260719_020155_d373`：规划选择题、需求/Spec 驳回、编码/测试/评审 REWORK 回退、验收回需求全量重放）；`requirement_custom_question` / `planning_rejection_form` / `architecture_confirmation` / `acceptance_question_card` / `runtime_recovery_card` / `conversation_delivery` 场景均已真实飞书验证；脚本已能自动接管质量 Agent 主动 fail 的 REWORK。
   - 注意：**同一聊天窗口不要并发跑多个 e2e scenario**，否则 simulator 会把不同项目的 approval 卡片串扰。
 
 ### 已踩坑 & 必须规避
@@ -96,7 +96,7 @@
    pytest tests/ -q
    ```
 
-   当前基线：**252 passed**（含 full_flow 分支覆盖测试、状态机 profile 校验、安全与恢复回归测试）。
+   当前基线：**283 passed**（含 full_flow 分支覆盖测试、状态机 profile 校验、安全与恢复回归测试）。
 
 2. **真实飞书端到端验证（必须）**
 

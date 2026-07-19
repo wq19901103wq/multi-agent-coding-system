@@ -7,7 +7,12 @@ from mac_system.core.project_service import (
     ProjectNotFoundError,
     ProjectService,
 )
-from mac_system.models import FeedbackPacket, Task
+from mac_system.models import (
+    ConversationSession,
+    FeedbackPacket,
+    PendingConversationAction,
+    Task,
+)
 
 
 @pytest.fixture
@@ -529,6 +534,37 @@ async def test_cancelled_project_cannot_transition_from_late_agent_result(servic
     refreshed = service.get_project(project.id)
     assert refreshed.status == "cancelled"
     assert refreshed.current_state == "PLANNING_REQUIREMENTS"
+
+
+async def test_cancel_project_clears_conversation_session_and_pending_actions(service):
+    project = await service.create_project(
+        name="cancel-cleanup", task_type="feature", description="Test"
+    )
+    chat_id = "chat_cleanup"
+    conversation = service.get_or_create_conversation_session(chat_id)
+    service.update_conversation_session(
+        conversation,
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+    action = service.create_pending_conversation_action(
+        session_id=conversation.id,
+        action_type="confirm_plan",
+        payload={"key": "value"},
+        source_message_ids=["m1"],
+        idempotency_key="key1",
+        created_by="ou_1",
+        target_project_id=project.id,
+    )
+
+    await service.cancel_project(project.id)
+
+    refreshed = service.session.get(ConversationSession, conversation.id)
+    assert refreshed.active_project_id is None
+    assert refreshed.pending_action_id is None
+
+    refreshed_action = service.session.get(PendingConversationAction, action.id)
+    assert refreshed_action.status == "expired"
 
 
 async def test_create_approval_expires_existing_pending(service):

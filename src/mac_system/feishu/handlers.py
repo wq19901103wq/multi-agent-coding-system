@@ -58,6 +58,8 @@ from mac_system.state_machine import StateMachine
 
 logger = logging.getLogger(__name__)
 
+_CUSTOM_ANSWER_OPTION_KEY = "provide_custom"
+
 
 @dataclass
 class FeishuHandlerContext:
@@ -480,7 +482,24 @@ async def _handle_coordinated_free_text(
     )
     active_project = _find_active_project_for_user(ctx, open_id)
     if active_project is None and conversation.active_project_id:
-        active_project = ctx.service.get_project(conversation.active_project_id)
+        candidate = ctx.service.get_project(conversation.active_project_id)
+        if candidate is not None and candidate.status == "active":
+            active_project = candidate
+        elif candidate is not None:
+            # The conversation still references a cancelled/completed project.
+            # Clear it so the coordinator stops offering confirm/cancel options.
+            ctx.service.update_conversation_session(
+                conversation,
+                summary="当前无活跃项目。",
+                active_project_id=None,
+                update_active_project=True,
+            )
+
+    def _action_project_is_active(action: PendingConversationAction) -> bool:
+        if not action.target_project_id:
+            return True
+        proj = ctx.service.get_project(action.target_project_id)
+        return proj is not None and proj.status == "active"
 
     approvals: list[dict[str, Any]] = []
     if active_project is not None:
@@ -507,6 +526,7 @@ async def _handle_coordinated_free_text(
             "payload": action.payload,
         }
         for action in ctx.service.get_session_pending_actions(conversation.id)
+        if _action_project_is_active(action)
     ]
     pending_intent = ctx.service.get_pending_intent(open_id)
 
@@ -514,6 +534,18 @@ async def _handle_coordinated_free_text(
     workspace = Path(binding.directory) if binding else None
     if workspace is None and active_project is not None:
         workspace = Path(active_project.workspace_path)
+
+    available_repositories: list[dict[str, str]] = []
+    repo_mention_workspace: Path | None = None
+    if workspace is None:
+        # When nothing is bound, let the coordinator see candidate repos inside
+        # the allowed roots. If the user mentions one, give the coordinator a
+        # read-only worktree so it can inspect that project directly.
+        available_repositories = _scan_available_repositories(ctx)
+        matched = _match_repository_mention(msg.text, available_repositories)
+        if matched:
+            repo_mention_workspace = Path(matched["path"])
+            workspace = repo_mention_workspace
 
     active_project_data = (
         {
@@ -548,6 +580,7 @@ async def _handle_coordinated_free_text(
         ),
         "latest_artifact": json.dumps(conversation.latest_artifact, ensure_ascii=False),
         "workspace_path": str(workspace) if workspace else "未绑定工作区",
+        "available_repositories": json.dumps(available_repositories, ensure_ascii=False),
     }
     inspect_markers = (
         "看下最新", "看看最新", "检查代码", "检查文档", "查看代码",
@@ -555,7 +588,12 @@ async def _handle_coordinated_free_text(
     )
     coordinator_worktree = (
         workspace
-        if workspace and workspace.exists() and any(marker in msg.text.lower() for marker in inspect_markers)
+        if workspace
+        and workspace.exists()
+        and (
+            repo_mention_workspace is not None
+            or any(marker in msg.text.lower() for marker in inspect_markers)
+        )
         else None
     )
     execution_markers = (
@@ -566,7 +604,7 @@ async def _handle_coordinated_free_text(
     coordinator_started = time.monotonic()
 
     async def _coordinator_progress(event_type: str, content: str) -> None:
-        """Preserve the same real thinking/tool history used by project Agents."""
+        """Publish thinking/tool events so the execution history remains visible."""
         try:
             if event_type == "thinking":
                 title = "对话协调 · 思考中"
@@ -811,7 +849,10 @@ async def _apply_conversation_result(
 
     clarification = output.get("clarification") or {}
     clarification_options = clarification.get("options") or []
-    if output.get("needs_clarification") and clarification_options:
+    is_clarification = bool(
+        output.get("needs_clarification") or action_type == "request_clarification"
+    )
+    if is_clarification and clarification_options:
         payload = {
             "question": clarification.get("question") or reply,
             "reason": clarification.get("reason") or "",
@@ -1277,6 +1318,9 @@ async def _handle_question_card_reply(
             approval.id, "answer", msg.open_id, commit=False
         )
         ctx.service.session.commit()
+        await _update_completed_question_choice_card(
+            ctx, approval, interaction, project
+        )
         await ctx.service.transition_state(
             project.id,
             "answer",
@@ -1313,10 +1357,15 @@ async def _send_next_free_text_card(
     remains.
     """
     questions = ctx.service.get_questions_for_interaction(interaction.id)
+    custom_question_ids = set(
+        approval.payload.get("custom_answer_question_ids", [])
+    )
     next_q = next(
         (
             q for q in questions
-            if q.status == "pending" and q.allow_free_text and not q.options
+            if q.status == "pending"
+            and q.allow_free_text
+            and (not q.options or q.question_id in custom_question_ids)
         ),
         None,
     )
@@ -1352,6 +1401,47 @@ async def _send_next_free_text_card(
         }
         ctx.service.session.commit()
     return True
+
+
+async def _update_completed_question_choice_card(
+    ctx: FeishuHandlerContext,
+    approval: Approval,
+    interaction,
+    project: Project,
+) -> None:
+    """Turn the original choice card into a final read-only receipt."""
+    message_id = approval.payload.get("question_batch_message_id")
+    if not message_id:
+        return
+    choice_questions = [
+        q for q in ctx.service.get_questions_for_interaction(interaction.id)
+        if q.options
+    ]
+    if not choice_questions:
+        return
+    submitted_answers: dict[str, Any] = {}
+    for question in choice_questions:
+        answer_record = ctx.service.get_question_answer(question.id)
+        if answer_record and not answer_record.skipped and answer_record.answer:
+            submitted_answers[question.question_id] = answer_record.answer
+    if not submitted_answers:
+        return
+    card = build_question_batch_card(
+        approval_id=approval.id,
+        interaction_id=interaction.id,
+        questions=[q.model_dump() for q in choice_questions],
+        agent=interaction.agent,
+        stage=interaction.stage,
+        state=approval.state,
+        project_name=project.name or project.id,
+        chat_id=project.feishu_chat_id,
+        chat_type=project.feishu_chat_type,
+        submitted_answers=submitted_answers,
+    )
+    try:
+        await ctx.bridge.update_card(message_id, card)
+    except Exception:
+        logger.exception("Failed to finalize question batch receipt card")
 
 
 async def _handle_skip_free_text(
@@ -1576,7 +1666,6 @@ async def _respond_to_approval(
             receive_id_type=receive_id_type,
         )
         return
-
     project = ctx.service.get_project(approval.project_id)
     if project is None:
         await ctx.bridge.send_text(
@@ -2317,6 +2406,59 @@ def _infer_input_kind(text: str) -> str:
     return "question"
 
 
+def _scan_available_repositories(ctx: FeishuHandlerContext) -> list[dict[str, str]]:
+    """Return candidate git repositories under allowed bind roots.
+
+    The bot is only allowed to look inside ``MAC_ALLOWED_BIND_ROOTS``; this
+    keeps the coordinator's reach no wider than the explicit allow-list.
+    """
+    from mac_system.config import get_allowed_bind_roots
+
+    allowed_roots = get_allowed_bind_roots()
+    if not allowed_roots:
+        return []
+    return ProjectService.scan_candidate_repositories(allowed_roots)
+
+
+def _match_repository_mention(
+    text: str, candidates: list[dict[str, str]]
+) -> dict[str, str] | None:
+    """Pick the best repository candidate mentioned by the user.
+
+    Returns ``None`` when there is no clear single match.
+    """
+    lowered = text.lower()
+    # Extract tech-style tokens (e.g. "mac-rpa", "wechat_mac_rpa", "agent").
+    tokens = set(re.findall(r"[a-z0-9_-]+", lowered))
+    negative_markers = ("backup", "old", "copy", "clone", "temp", "tmp")
+    scored: list[tuple[int, dict[str, str]]] = []
+    for cand in candidates:
+        name = cand["name"].lower()
+        score = 0
+        for token in tokens:
+            if not token:
+                continue
+            if name == token:
+                score = max(score, 100)
+            elif name in token:
+                score = max(score, 70)
+            elif token in name:
+                score = max(score, 50)
+        if score <= 0:
+            continue
+        if any(m in name for m in negative_markers):
+            score -= 20
+        scored.append((score, cand))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (x[0], -len(x[1]["name"])), reverse=True)
+    best_score, best = scored[0]
+    # Only use the best if it clearly wins (tie means ambiguous).
+    if len(scored) > 1 and scored[1][0] == best_score:
+        return None
+    return best
+
+
 def _find_pending_input_approval(
     ctx: FeishuHandlerContext, open_id: str
 ) -> Any | None:
@@ -2865,6 +3007,13 @@ async def _submit_input(
             receive_id_type=receive_id_type,
         )
         return
+    if approval.status != "pending":
+        await ctx.bridge.send_text(
+            receive_id,
+            f"审批 {approval_id} 已处理，无需重复提交。",
+            receive_id_type=receive_id_type,
+        )
+        return
 
     project = ctx.service.get_project(approval.project_id)
     if project is None:
@@ -2999,7 +3148,15 @@ async def handle_card_action(ctx: FeishuHandlerContext, action: ButtonAction) ->
         if progress_message_id:
             await ctx.bridge.update_card(
                 progress_message_id,
-                build_content_card("已完成选择", f"✅ 已选择：**{label}**", color="green"),
+                build_conversation_clarification_card(
+                    pending.id,
+                    str(pending.payload.get("question") or "当前问题"),
+                    options,
+                    reason=str(pending.payload.get("reason") or ""),
+                    chat_id=ctx.chat_id,
+                    chat_type=ctx.chat_type,
+                    selected_key=option_key,
+                ),
             )
         question = str(pending.payload.get("question") or "当前问题")
         await _handle_coordinated_free_text(
@@ -3146,6 +3303,9 @@ async def _handle_question_batch_action(
     # Snapshot question data before any commit, because SQLAlchemy expires
     # ORM objects after commit and model_dump() would return empty dicts.
     pending_question_dicts = [q.model_dump() for q in pending_questions]
+    custom_answer_question_ids = set(
+        approval.payload.get("custom_answer_question_ids", [])
+    )
 
     if action.action == "select_question_option":
         target_question_id = action.extras.get("question_id") if action.extras else None
@@ -3190,12 +3350,20 @@ async def _handle_question_batch_action(
             if opt.get("key") == option_key:
                 answer_label = opt.get("label", option_key)
                 break
-        await ctx.service.submit_question_answer(target.id, option_key, answer_label, False, open_id, commit=False)
+        if option_key == _CUSTOM_ANSWER_OPTION_KEY and target.allow_free_text:
+            custom_answer_question_ids.add(target.question_id)
+        else:
+            await ctx.service.submit_question_answer(
+                target.id, option_key, answer_label, False, open_id, commit=False
+            )
     elif action.action == "submit_selected_options":
         selected_options = dict(approval.payload.get("selected_options", {}))
         for q in pending_questions:
             answer = selected_options.get(q.question_id) or q.recommended_option
             if answer is None:
+                continue
+            if answer == _CUSTOM_ANSWER_OPTION_KEY and q.allow_free_text:
+                custom_answer_question_ids.add(q.question_id)
                 continue
             answer_label = answer
             for opt in q.options:
@@ -3204,6 +3372,7 @@ async def _handle_question_batch_action(
                     break
             await ctx.service.submit_question_answer(q.id, answer, answer_label, False, open_id, commit=False)
     elif action.action == "answer_all_recommended":
+        custom_answer_question_ids.clear()
         for q in pending_questions:
             answer = q.recommended_option
             answer_label = answer
@@ -3218,6 +3387,9 @@ async def _handle_question_batch_action(
             answer = (action.extras or {}).get(field_name) if action.extras else None
             if answer is None:
                 answer = q.recommended_option
+            if answer == _CUSTOM_ANSWER_OPTION_KEY and q.allow_free_text:
+                custom_answer_question_ids.add(q.question_id)
+                continue
             answer_label = answer
             for opt in q.options:
                 if opt.get("key") == answer:
@@ -3230,6 +3402,11 @@ async def _handle_question_batch_action(
                 continue
             await ctx.service.submit_question_answer(q.id, None, None, True, open_id, commit=False)
 
+    approval.payload = {
+        **approval.payload,
+        "custom_answer_question_ids": sorted(custom_answer_question_ids),
+    }
+
     # Update the choice card to a read-only "已提交" receipt state showing the
     # recorded answers. This runs for any finalize action regardless of whether
     # the full interaction resolves, so the user sees their choices are locked.
@@ -3239,6 +3416,8 @@ async def _handle_question_batch_action(
             answer_record = ctx.service.get_question_answer(q.id)
             if answer_record and not answer_record.skipped and answer_record.answer:
                 submitted_answers[q.question_id] = answer_record.answer
+            elif q.question_id in custom_answer_question_ids:
+                submitted_answers[q.question_id] = _CUSTOM_ANSWER_OPTION_KEY
         receipt_card = build_question_batch_card(
             approval_id=approval_id,
             interaction_id=interaction_id,
@@ -3250,6 +3429,7 @@ async def _handle_question_batch_action(
             chat_id=project.feishu_chat_id,
             chat_type=project.feishu_chat_type,
             submitted_answers=submitted_answers,
+            awaiting_free_text=bool(custom_answer_question_ids),
         )
         batch_message_id = action.message_id or approval.payload.get("question_batch_message_id")
         if batch_message_id:
@@ -3262,8 +3442,23 @@ async def _handle_question_batch_action(
     all_questions = ctx.service.get_questions_for_interaction(interaction_id)
     pending_choice_qs = [q for q in all_questions if q.status == "pending" and q.options]
     pending_free_text_qs = [q for q in all_questions if q.status == "pending" and not q.options]
+    pending_custom_qs = [
+        q for q in pending_choice_qs
+        if q.question_id in custom_answer_question_ids and q.allow_free_text
+    ]
 
-    if pending_choice_qs:
+    if pending_custom_qs:
+        ctx.service.session.commit()
+        sent_next = await _send_next_free_text_card(
+            ctx, approval, interaction, project, receive_id, receive_id_type
+        )
+        if not sent_next:
+            await ctx.bridge.send_text(
+                receive_id,
+                "请选择回复输入卡，补充你的具体要求。",
+                receive_id_type=receive_id_type,
+            )
+    elif pending_choice_qs:
         # Still have choice questions to answer; don't move on yet.
         ctx.service.session.commit()
         if action.action == "answer_question_option":

@@ -72,7 +72,7 @@
 - `business_rules`: 业务规则数组，每项含 `id`、`rule`、`requirement_ids`
 - `functional_behaviors`: 功能与异常行为数组（至少 1 项），每项含 `id`、`scenario`、`expected_behavior`、`error_behavior`、`acceptance_criterion_ids`
 - `constraints`: 约束列表（字符串，可为空）
-- `ambiguities`: 模糊点列表（可为空），每项含 `question`，可选 `impact`、`default_assumption`
+- `ambiguities`: 仅记录不需要用户确认、不会阻塞当前方案的信息性模糊点（可为空），每项含 `question`，可选 `impact`、`default_assumption`
 - `assumptions`: 假设列表（可为空），每项含 `id`、`statement`、`risk`（`low`/`medium`/`high`）、`validation_plan`，可选 `owner`
 - `out_of_scope`: 范围外事项列表（字符串，可为空）
 - `goals`: 目标列表（字符串，可为空）
@@ -123,6 +123,8 @@
 - 每个需求决策问题都必须提供稳定的点分 `decision_key`；如果该 key 已存在于已确认方案的 `decisions` 中，禁止提问。
 - 选择题必须提供 `options`，其中恰好一个 `recommended: true`
 - 开放问题用 `allow_free_text: true`，不需 `options`
+- 任何需要用户确认、判断或选择的事项都必须走 `ask_user`，禁止写入 `ambiguities` 后以 `complete` 结束。即使已经给出 `default_assumption`，只要需要用户确认，也仍然属于决策问题。
+- 能列出备选方案时，提供 2-3 个互斥选项。只能确定默认方案、无法可靠枚举替代方案时，使用 `accept_default`（接受默认，推荐）和 `provide_custom`（我要修改）两个选项，并设置 `allow_free_text: true`；用户选择修改后系统会继续收集具体说明。
 - 不要问已经在历史问答记录中出现过的问题
 - **必须**把问题原样写入 `question_batch.questions` 中，不能只写 `next_state_event: ask_user` 或声称已提问；系统只读取 `question_batch` 里的内容来生成飞书卡片。
 - **不要**调用任何工具来提问，直接把上述 JSON 作为最终 stdout 输出。

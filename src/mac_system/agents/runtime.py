@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import re
+import signal
+import threading
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
@@ -11,6 +13,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+
+# Runtime instances are intentionally short-lived: API requests and Feishu
+# events each construct their own orchestrator/runtime.  Cancellation must
+# therefore use a process registry shared by all instances in this process.
+_ACTIVE_PROCESS_LOCK = threading.Lock()
+_ACTIVE_PROCESSES: dict[str, asyncio.subprocess.Process] = {}
 _STREAM_READER_LIMIT = 16 * 1024 * 1024
 if not logger.handlers:
     _h = logging.StreamHandler()
@@ -143,6 +152,8 @@ class ClaudeCodeRuntime(AgentRuntime):
             "--allowedTools",
             ",".join(allowed_tools),
             "--dangerously-skip-permissions",
+            "--setting-sources",
+            "",
             "--bare",
         ]
         if self.claude_model:
@@ -164,6 +175,12 @@ class ClaudeCodeRuntime(AgentRuntime):
             "--replay-user-messages",
             "--verbose",
             "--system-prompt-file", str(system_prompt_file),
+            # MAC owns the model endpoint and credential configuration. Do not
+            # load ~/.claude or project-local settings, whose env block can
+            # silently replace the explicitly configured provider and cause
+            # authentication failures.
+            "--setting-sources", "",
+            "--bare",
         ]
         if self.claude_model:
             cmd.extend(["--model", self.claude_model])
@@ -172,7 +189,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         if allowed_tools:
             cmd.extend(["--allowedTools", ",".join(allowed_tools)])
         else:
-            cmd.extend(["--tools", "", "--bare", "--strict-mcp-config"])
+            cmd.extend(["--tools", "", "--strict-mcp-config"])
         for d in readonly_dirs:
             cmd.extend(["--add-dir", str(d)])
         # The orchestrator observes and auto-approves tool calls centrally.
@@ -246,9 +263,14 @@ class ClaudeCodeRuntime(AgentRuntime):
             # can contain an entire artifact. The asyncio default (~64 KiB)
             # is too small for second-round planning artifacts.
             limit=_STREAM_READER_LIMIT,
+            # Put Claude and any tool subprocesses it launches in their own
+            # process group so cancellation terminates the whole execution.
+            start_new_session=os.name != "nt",
         )
         if task_id:
             self._processes[task_id] = proc
+            with _ACTIVE_PROCESS_LOCK:
+                _ACTIVE_PROCESSES[task_id] = proc
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
         result_event: dict[str, Any] | None = None
@@ -292,8 +314,13 @@ class ClaudeCodeRuntime(AgentRuntime):
         stderr_task = asyncio.create_task(_read_stream(proc.stderr, stderr_queue))
 
         def _cleanup_process() -> None:
-            if task_id and task_id in self._processes:
+            if not task_id:
+                return
+            if self._processes.get(task_id) is proc:
                 del self._processes[task_id]
+            with _ACTIVE_PROCESS_LOCK:
+                if _ACTIVE_PROCESSES.get(task_id) is proc:
+                    del _ACTIVE_PROCESSES[task_id]
 
         # Send the user prompt immediately.  The stream-json process may not
         # emit any output (including the init event) until it sees input.
@@ -427,14 +454,26 @@ class ClaudeCodeRuntime(AgentRuntime):
             stderr_task.cancel()
 
     def cancel(self, task_id: str) -> None:
-        """Kill the subprocess for a running task, if known."""
+        """Kill a task's process group, including from another Runtime instance."""
         proc = self._processes.pop(task_id, None)
+        with _ACTIVE_PROCESS_LOCK:
+            shared_proc = _ACTIVE_PROCESSES.pop(task_id, None)
+        proc = shared_proc or proc
         if proc is None or proc.returncode is not None:
             return
         try:
-            proc.kill()
+            if os.name != "nt":
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                proc.kill()
         except ProcessLookupError:
             pass
+
+    @staticmethod
+    def active_task_ids() -> list[str]:
+        """Return process-backed task IDs for test/diagnostic observability."""
+        with _ACTIVE_PROCESS_LOCK:
+            return sorted(_ACTIVE_PROCESSES)
 
     @staticmethod
     def _strip_ansi(text: str) -> str:

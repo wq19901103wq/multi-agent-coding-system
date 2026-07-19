@@ -1,6 +1,6 @@
 # MAC System 当前状态
 
-> 更新时间：2026-07-17（Asia/Shanghai）  
+> 更新时间：2026-07-19（Asia/Shanghai）
 > 本文件只记录当前可用能力和最新验证结果；历史过程放入 `docs/reviews/`。
 
 ## 已实现
@@ -21,7 +21,7 @@
 
 ## 最新验证
 
-- 完整单元测试：**246 passed**，2 个第三方弃用警告（2026-07-17 复跑确认）。
+- 完整单元测试：**283 passed**，2 个第三方弃用警告（2026-07-19 复跑确认）。
 - Ruff lint 与 `git diff --check` 通过；仓库历史代码尚未整体满足 `ruff format --check`。
 - 真实飞书 `conversation_delivery` 已通过：只讨论不创建、执行前确认、单次创建、重复点击幂等回执、取消清场。
 - 真实飞书卡片场景已通过（2026-07-16/17）：
@@ -32,10 +32,47 @@
 - 真实飞书 `full_feature_flow` 全分支（2026-07-17 01:35–03:01，项目 `proj_20260717_013549_7aed`）：
   需求驳回、架构确认、Spec 驳回、编码 reject→REWORK→to_coding、测试 reject→REWORK→to_testing、
   评审 reject→REWORK→to_coding、验收 reject→REWORK→to_requirements 后全量重放，最终 `COMPLETED`。
+- 最新代码真实飞书复验（2026-07-19 10:01–10:51，项目 `proj_20260719_020155_d373`）：
+  覆盖规划选择题、需求/Spec 驳回、三个质量关 REWORK、验收回需求和全量重放，最终 `COMPLETED`；
+  本轮日志无汇报卡发送失败、`NoneType`、数据库锁、Traceback、运行时失败或 401。
+- `requirement_custom_question` 已真实验证：选择“我要修改”只更新原卡为等待补充，用户提交定向文本后才恢复需求规划。
+
+## 已关闭的 2026-07-18 Live Issues
+
+> 关闭时间：2026-07-19（Asia/Shanghai）
+
+### Issue 1：API / control 端点 401
+
+- 服务端 `CONTROL_API_TOKEN` 配置正确，依赖 `require_control_api_token` 工作正常。
+- 现场验证：
+  - 不带 `Authorization` / `X-Control-Api-Token` → `/projects/{id}` 返回 **401**；
+  - 带正确的 `Authorization: Bearer <CONTROL_API_TOKEN>` → **200**；
+  - `/admin/projects` 因 `.env` 未配置 `ADMIN_TOKEN`，目前无认证要求，始终 200。
+- **根因**：调用方漏传 token 或 token 错误；不是服务端配置丢失。
+- **状态**：已关闭；E2E 客户端统一携带 Control API token。
+
+### Issue 2：私聊收到自由文本输入卡而非选择题
+
+- 项目 `proj_20260718_102234_f42e` 的 planner 在 `PLANNING_REQUIREMENTS` 完成后，把三个“有默认假设但需用户确认”的项写进产物 `ambiguities`。
+- Orchestrator 的 `_block_on_unresolved_ambiguities` 将其合成为 `question_batch`，但 `allow_free_text=true`、`options=[]`，最终渲染为自由文本输入卡。
+- **根因**：planner 没有按规范把“需用户做决策”的模糊点走 `ask_user` + 带 `options` 的 `question_batch`；系统兜底也未把有默认假设的歧义转成选择题。
+- **修复**：强化 planner 约束，并在 Orchestrator 兜底生成“接受默认 / 我要修改”选项；自定义修改采用两步交互。
+- **状态**：已关闭；单测与真实 `requirement_custom_question` 场景均通过。
+
+### Issue 3：planner 连续 401 失败导致项目进入恢复态
+
+- 历史项目 `proj_20260718_102234_f42e` 曾进入 `PLANNING_REQUIREMENTS_RECOVERY_PENDING`。
+- 失败任务 `task_20260718_123056_5646` 至 `task_20260718_123159_8b58` 均报 `API Error: 401`。
+- **根因**：Claude CLI 自动加载 `~/.claude/settings.json` 中另一套 Kimi 端点和凭证，覆盖了 MAC 显式提供的 DeepSeek 环境。
+- **修复**：所有 Runtime 命令使用 `--setting-sources "" --bare`，禁止用户级 settings 和插件污染项目运行时。
+- **状态**：已关闭；同一配置的手动调用、Runtime 单测和最新真实 full flow 均通过，日志无 401；历史项目也已在重启恢复后成功推进到 `ARCHITECTURE_CONFIRM_PENDING`。
+
+详见 `docs/reviews/2026-07-18-live-issues-handover.md`。
 
 ## 尚未宣称完成
 
 - Agent 主动 fail 触发的自动 REWORK 接管路径仅有单测与脚本逻辑覆盖；真实飞书运行中尚未自然出现 Agent 主动 fail（昨晚全部为脚本驱动的人工 reject）。
 - SQLite WAL/busy-timeout 修改后的并发压力验证。
+- Control API 取消项目会阻止晚到结果推进状态，但尚不能立即终止已启动的 Claude CLI 子进程；长任务取消后可能短时继续占用执行资源。
 - Project Manager 不是独立交付阶段 Agent；控制类澄清由 Conversation Coordinator 负责。
 - 多人群管理员权限、生产任务队列、生产数据库与完整可观测性。
