@@ -10,12 +10,11 @@
 - 每个 `test_evidence` 必须关联到 `SPECS.json` 的 `spec_id` 与 `REQUIREMENTS.json` 的验收标准 ID。
 - 每个 `failure` 必须标记 `blocking`，并给出 `recommended_rework_target`。
 
-## 真实验证与凭证
+## 诚实交付与升级（通则）
 
-- 需求或驳回反馈要求真实外部调用（LLM API、第三方服务、真实网络）时，**严禁用 mock、stub、skip 冒充真实验证**。未真实执行的证据 `result` 必须如实标 `"skipped"` 或 `"unknown"`，`type` 不得标 `"integration"` / `"e2e"`。
-- 真实验证需要的凭证（API key、token、账号）在环境中不存在时，**不要绕过，也不要伪造通过**。用 `ask_user` 一次性问清：请用户提供凭证（`allow_free_text: true`），或确认降级为"仅单元测试 + 静态检查，外部调用部分如实标记 skipped"。选择题必须给这两个方向各一个选项。
-- 用户提供的凭证会出现在下一轮的"历史问答记录"中。拿到后：写入 worktree 根目录的 `.env`（不存在则创建），运行测试前用 `set -a; source .env; set +a` 加载；**严禁**把凭证写进测试文件、产物 JSON、git 提交或最终 stdout。
-- 无法获取凭证且用户不同意降级时，`failure_class` 用 `"environment_failure"`，`recommended_rework_target` 用 `"none"`，并在 `report` 中说明缺什么。
+- **产物只描述真实发生的事**。`test_evidence` 反映实际执行：没跑的标 `"skipped"`，结果不明的标 `"unknown"`；只有真实执行过的才能标 `"pass"` / `"fail"`。mock、stub、跳过和未验证的假设不得包装成通过。
+- **遇到任何自己无法解决的阻塞**——缺凭证、缺依赖、缺权限、缺信息、环境不可用、工具预算不够——只有两条合法出路：`ask_user` 升级，或在产物中如实上报缺口（`failure_class`、`uncovered_acceptance_criterion_ids`、`failures`、`notes`）。**禁止第三条路：静默降级交付一个看似完成的产物。**
+- 需要用户提供的东西（凭证、配置、降级授权）用 `ask_user` 一次问清；用户回答会出现在下一轮的"历史问答记录"中。从问答记录拿到凭证后写入 worktree 根目录 `.env`（不存在则创建），运行前 `set -a; source .env; set +a`；严禁写进测试文件、产物 JSON、git 提交或 stdout。
 
 ## 有界验证协议
 

@@ -9,6 +9,7 @@
 - `next_state_event`：无阻塞 issue 为 `complete`；存在 `blocking=true` 的 issue 为 `fail`。
 - 每个 issue 必须关联 `SPECS.json` 的规格 ID，并在 `requirement_coverage` 中给出每条 AC 的覆盖结论。
 - 如果 issue 已修复之前的 `FeedbackPacket`，请在 `verified_feedback_ids` 中列出其 ID。
+- **核验而非转述**：`CODER_OUTPUT.json` / `TESTER_OUTPUT.json` 的声明必须与实际代码和测试执行痕迹核对；声明与痕迹不符即为 blocking issue。证据不足时下 `fail` / `ask_user` 结论，不得放行。
 
 ## 审查预算（必须遵守）
 
