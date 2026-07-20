@@ -894,6 +894,54 @@ async def test_tester_fail_creates_feedback_packet_and_goes_to_rework(orchestrat
 
 
 @pytest.mark.asyncio
+async def test_tester_ask_user_is_not_converted_to_failure(orchestrator):
+    """A tester asking for missing credentials must reach TESTING_INPUT_PENDING.
+
+    Regression: the TESTING quality gate used to stomp any output with
+    ``passed != True`` into a bogus quality_failure FeedbackPacket, so a
+    legitimate ask_user (e.g. "请提供 LLM API Key") never reached the user.
+    """
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "tester": {
+            "success": True,
+            "next_state_event": "ask_user",
+            "question_batch": {
+                "batch_key": "clarify_4",
+                "questions": [{
+                    "question_id": "q_llm_api_key", "kind": "blocking",
+                    "question": "请提供 LLM API Key", "reason": "集成测试需要真实凭证",
+                    "allow_free_text": True,
+                    "options": [],
+                    "affected_trace_ids": [],
+                }],
+            },
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 Todo CLI",
+        approval_mode="auto",
+    )
+    project.current_state = "TESTING"
+    service.session.commit()
+
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "TESTING_INPUT_PENDING"
+    assert service.get_open_feedback_packets(project.id) == []
+    interaction_id = updated.context.get("_pending_question_interaction_id")
+    assert interaction_id is not None
+    questions = service.get_questions_for_interaction(interaction_id)
+    assert [q.question_id for q in questions] == ["q_llm_api_key"]
+
+
+@pytest.mark.asyncio
 async def test_rework_approval_marks_recommended_option_primary(orchestrator):
     """REWORK approval options must expose option_key + primary recommendation.
 

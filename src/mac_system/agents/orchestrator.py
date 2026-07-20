@@ -918,12 +918,20 @@ class AgentOrchestrator:
         state = project.current_state
         event = output.get("next_state_event", "complete")
         feedback_packet_id: str | None = None
+        # An output carrying real questions is an escalation, not a quality
+        # verdict — route it to the unified ask_user path below instead of
+        # converting it into a bogus failure FeedbackPacket.
+        has_questions = bool(
+            (output.get("question_batch") or {}).get("questions")
+            if isinstance(output.get("question_batch"), dict)
+            else False
+        )
 
         # Quality gates: only an explicit pass is allowed to move forward.
         # A failing assessment is recorded as a structured FeedbackPacket and
         # routed to REWORK via the state machine's "fail" event.
         if state == "TESTING":
-            if output.get("passed") is not True:
+            if output.get("passed") is not True and not has_questions:
                 event = "fail"
                 packet = await self._create_feedback_from_tester_output(project, task, output)
                 feedback_packet_id = packet.id if packet else None
@@ -934,7 +942,7 @@ class AgentOrchestrator:
         elif state == "REVIEW":
             issues = output.get("issues", [])
             blocking_issue = any(issue.get("blocking") for issue in issues)
-            if output.get("result") != "pass" or blocking_issue:
+            if (output.get("result") != "pass" or blocking_issue) and not has_questions:
                 event = "fail"
                 packet = await self._create_feedback_from_reviewer_output(project, task, output)
                 feedback_packet_id = packet.id if packet else None
