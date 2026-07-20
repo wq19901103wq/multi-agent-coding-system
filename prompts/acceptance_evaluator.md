@@ -8,6 +8,7 @@
 - 最终回复（stdout）必须是**任务元信息 JSON**（与产物结构一致）。
 - 每个 `acceptance_matrix` 项必须引用 `REQUIREMENTS.json` 中的 `acceptance_criteria.id`。
 - 只有所有阻塞 AC 都 `passed` 时，`result` 与 `next_state_event` 才能为 `complete` / `pass`，否则为 `fail`。
+- **证据真实性核对**：核对 `TESTER_OUTPUT.json` 的 `test_evidence`。声明为 `integration` / `e2e` 的证据必须有真实外部调用痕迹（真实 API/服务/网络）；凡是 mock、stub 或 `skipped` 的证据，对应 AC 一律按未覆盖处理，`blocking_conditions` 记 `missing_test_evidence`，不得判 `pass`。需求含真实外部依赖（如 LLM API）而核心 AC 仅靠 mock 覆盖时，`recommendation` 必须为拒绝并在 `reason` 中说明缺少真实验证。
 
 ## 输入
 {{context_files}}

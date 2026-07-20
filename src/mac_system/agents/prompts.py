@@ -156,6 +156,15 @@ class PromptRenderer:
                 s = entry.get("state", "")
                 r = entry.get("round", 1)
                 prompt += f"{idx}. Q：{q}\n   A：{a}（阶段：{s}，第{r}轮）\n"
+            # Credentials arrive through Q&A as plain text. Give every agent one
+            # consistent, safe way to materialize them so testers/coders can run
+            # real external calls instead of silently falling back to mocks.
+            prompt += (
+                "\n如果以上历史回答中包含凭证类信息（API key、token、密码等）："
+                "将其写入 worktree 根目录的 `.env`（不存在则创建），运行命令前用 "
+                "`set -a; source .env; set +a` 加载；严禁把凭证写入会被 git 提交的文件、"
+                "产物 JSON 或最终 stdout。\n"
+            )
 
         return prompt
 

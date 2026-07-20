@@ -117,3 +117,50 @@ def test_planner_prompt_includes_confirmed_brief(agent_config, tmp_path):
 
     assert '"key": "agent.capability_scope"' in prompt
     assert '"answer": "开放智能体"' in prompt
+
+
+def test_qa_history_includes_credential_handling_note(agent_config, tmp_path):
+    renderer = PromptRenderer(agent_config)
+    project = FakeProject()
+    worktree = tmp_path / "wt-qa"
+    worktree.mkdir()
+
+    prompt = renderer.render_task_prompt(
+        agent_type="coder",
+        stage=None,
+        project=project,
+        state="TESTING",
+        worktree=worktree,
+        context_files=[],
+        qa_history=[{
+            "question": "请提供用于集成测试的 LLM API key",
+            "answer": "sk-test-redacted",
+            "state": "TESTING",
+            "round": 2,
+        }],
+    )
+
+    assert "历史问答记录" in prompt
+    assert "sk-test-redacted" in prompt
+    assert "`.env`" in prompt
+    assert "set -a; source .env; set +a" in prompt
+    assert "严禁把凭证写入会被 git 提交的文件" in prompt
+
+
+def test_no_qa_history_means_no_credential_note(agent_config, tmp_path):
+    renderer = PromptRenderer(agent_config)
+    project = FakeProject()
+    worktree = tmp_path / "wt-no-qa"
+    worktree.mkdir()
+
+    prompt = renderer.render_task_prompt(
+        agent_type="coder",
+        stage=None,
+        project=project,
+        state="TESTING",
+        worktree=worktree,
+        context_files=[],
+    )
+
+    assert "历史问答记录" not in prompt
+    assert "set -a; source .env; set +a" not in prompt

@@ -10,6 +10,13 @@
 - 每个 `test_evidence` 必须关联到 `SPECS.json` 的 `spec_id` 与 `REQUIREMENTS.json` 的验收标准 ID。
 - 每个 `failure` 必须标记 `blocking`，并给出 `recommended_rework_target`。
 
+## 真实验证与凭证
+
+- 需求或驳回反馈要求真实外部调用（LLM API、第三方服务、真实网络）时，**严禁用 mock、stub、skip 冒充真实验证**。未真实执行的证据 `result` 必须如实标 `"skipped"` 或 `"unknown"`，`type` 不得标 `"integration"` / `"e2e"`。
+- 真实验证需要的凭证（API key、token、账号）在环境中不存在时，**不要绕过，也不要伪造通过**。用 `ask_user` 一次性问清：请用户提供凭证（`allow_free_text: true`），或确认降级为"仅单元测试 + 静态检查，外部调用部分如实标记 skipped"。选择题必须给这两个方向各一个选项。
+- 用户提供的凭证会出现在下一轮的"历史问答记录"中。拿到后：写入 worktree 根目录的 `.env`（不存在则创建），运行测试前用 `set -a; source .env; set +a` 加载；**严禁**把凭证写进测试文件、产物 JSON、git 提交或最终 stdout。
+- 无法获取凭证且用户不同意降级时，`failure_class` 用 `"environment_failure"`，`recommended_rework_target` 用 `"none"`，并在 `report` 中说明缺什么。
+
 ## 有界验证协议
 
 - 先读取 `CODER_OUTPUT.json`、需求和规格，再检查它列出的改动；不要全仓扫描缓存、依赖或生成目录。
