@@ -276,6 +276,12 @@ class ClaudeCodeRuntime(AgentRuntime):
         stderr_lines: list[str] = []
         result_event: dict[str, Any] | None = None
         tool_calls: list[dict[str, Any]] = []
+        # The CLI emits cumulative assistant snapshots: the same thinking /
+        # text / tool_use block reappears in every later snapshot of the same
+        # message.  Forward each block once, otherwise every thinking card is
+        # shown to the user N times.
+        seen_progress_texts: set[str] = set()
+        seen_tool_use_keys: set[str] = set()
 
         stdout_queue: asyncio.Queue[Any] = asyncio.Queue()
         stderr_queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -386,10 +392,20 @@ class ClaudeCodeRuntime(AgentRuntime):
                         content = [content]
                     for block in content:
                         if block.get("type") in ("thinking", "text") and progress_callback:
-                            txt = block.get("text", "")[:500]
-                            if txt.strip():
+                            full_text = block.get("text", "")
+                            txt = full_text[:500]
+                            if txt.strip() and full_text not in seen_progress_texts:
+                                seen_progress_texts.add(full_text)
                                 await progress_callback("thinking", txt.strip())
                         if block.get("type") == "tool_use":
+                            tool_key = block.get("id") or json.dumps(
+                                [block.get("name"), block.get("input")],
+                                sort_keys=True,
+                                default=str,
+                            )
+                            if tool_key in seen_tool_use_keys:
+                                continue
+                            seen_tool_use_keys.add(tool_key)
                             tool_calls.append({
                                 "name": block.get("name"),
                                 "input": self._summarize_tool_input(block),

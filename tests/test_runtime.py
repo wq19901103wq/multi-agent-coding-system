@@ -237,3 +237,58 @@ async def test_stream_tool_use_is_observed_but_not_executed(tmp_path):
             "content_length": 100000,
         },
     }]
+
+
+@pytest.mark.asyncio
+async def test_cumulative_assistant_snapshots_are_deduplicated(tmp_path):
+    """The CLI re-emits completed blocks in later snapshots of the same
+    message; each block must be forwarded exactly once."""
+    fake_cli = tmp_path / "fake-claude"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "sys.stdin.readline()\n"
+        "thinking = {'type':'thinking','text':'从测试报告来看，都跑通了'}\n"
+        "tool = {'type':'tool_use','id':'tool-1','name':'Read','input':{'file_path':'/tmp/x'}}\n"
+        "# snapshot 1: thinking only; snapshot 2: same thinking + tool_use\n"
+        "print(json.dumps({'type':'assistant','message':{'content':[thinking]}}), flush=True)\n"
+        "print(json.dumps({'type':'assistant','message':{'content':[thinking, tool]}}), flush=True)\n"
+        "print(json.dumps({'type':'user','message':{'content':[{'type':'tool_result','tool_use_id':'tool-1','content':'ok','is_error':False}]},'isReplay':True}), flush=True)\n"
+        "# second turn: new thinking, then same thinking + final text\n"
+        "thinking2 = {'type':'thinking','text':'汇总结果'}\n"
+        "text = {'type':'text','text':'最终答复'}\n"
+        "print(json.dumps({'type':'assistant','message':{'content':[thinking2]}}), flush=True)\n"
+        "print(json.dumps({'type':'assistant','message':{'content':[thinking2, text]}}), flush=True)\n"
+        "print(json.dumps({'type':'result','is_error':False,'result':'{\\\"success\\\":true,\\\"next_state_event\\\":\\\"complete\\\"}'}), flush=True)\n",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+    runtime = ClaudeCodeRuntime(fake_cli)
+
+    progress: list[tuple[str, str]] = []
+
+    async def on_progress(event_type: str, content: str) -> None:
+        progress.append((event_type, content))
+
+    result = await runtime.execute(
+        agent_type="planner",
+        task_prompt="test",
+        system_prompt="system",
+        workspace=tmp_path,
+        worktree=tmp_path,
+        context_files=[],
+        output_schema=tmp_path / "schema.json",
+        allowed_tools=["Read"],
+        readonly_dirs=[],
+        timeout_seconds=5,
+        progress_callback=on_progress,
+    )
+
+    assert result.success
+    thinking_events = [content for kind, content in progress if kind == "thinking"]
+    assert thinking_events == ["从测试报告来看，都跑通了", "汇总结果", "最终答复"]
+    tool_events = [content for kind, content in progress if kind == "tool"]
+    assert len(tool_events) == 1
+    assert result.tool_calls == [
+        {"name": "Read", "input": {"file_path": "/tmp/x"}}
+    ]
