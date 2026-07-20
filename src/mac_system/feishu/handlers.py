@@ -126,6 +126,38 @@ def _confirmation_source_stage(confirmation_state: str) -> str:
     }.get(confirmation_state, confirmation_state)
 
 
+_FENCED_BLOCK_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+
+
+def _is_protocol_blob(blob: str) -> bool:
+    """A JSON blob that parses as coordinator output is protocol, not prose."""
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(data, dict) and "reply" in data and (
+        "success" in data or "proposed_action" in data or "needs_clarification" in data
+    )
+
+
+def _strip_protocol_echo(text: str) -> str:
+    """Remove self-echoes of the coordinator's output JSON from user-facing text.
+
+    The model sometimes appends a copy of its own machine output (the whole
+    {"success": ..., "reply": ...} object) as a fenced block inside its reply.
+    That is protocol data — showing it to users is always a bug. Legitimate
+    JSON snippets (artifacts, examples) do not match _is_protocol_blob and are
+    preserved.
+    """
+    if text and _is_protocol_blob(text):
+        return ""
+    cleaned = _FENCED_BLOCK_RE.sub(
+        lambda m: "" if _is_protocol_blob(m.group(1).strip()) else m.group(0),
+        text,
+    )
+    return cleaned.strip()
+
+
 def _workflow_stage_index(state_machine: StateMachine, state: str) -> int | None:
     """Return the ordered delivery-stage index represented by a concrete state."""
     stages = state_machine.profile["stages"]
@@ -901,7 +933,15 @@ async def _apply_conversation_result(
     """Apply one schema-validated coordinator result through safe handlers."""
     open_id = msg.open_id
     receive_id, receive_id_type = _reply_target(ctx, open_id)
-    reply = str(output.get("reply") or "").strip()
+    raw_reply = str(output.get("reply") or "").strip()
+    reply = _strip_protocol_echo(raw_reply)
+    if len(reply) < len(raw_reply):
+        logger.warning(
+            "Stripped protocol JSON echo from coordinator reply message=%s",
+            msg.message_id,
+        )
+    if not reply:
+        reply = "本次回复格式异常，请重试。"
     action = output.get("proposed_action") or {"type": "none"}
     action_type = action.get("type", "none")
     sent_message_id: str | None = None

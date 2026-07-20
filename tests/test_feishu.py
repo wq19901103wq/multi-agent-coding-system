@@ -5440,3 +5440,31 @@ async def test_confirmation_approval_confirm_via_coordinator_resolves(feishu_ctx
     assert any("你选择了「确认」" in c for c in cards)
     conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
     assert "已按 confirm 处理" in conversation.recent_turns[-1]["content"]
+
+
+def test_strip_protocol_echo_removes_self_echo_block():
+    from mac_system.feishu.handlers import _strip_protocol_echo
+
+    echo = (
+        "这是给你的答案。\n\n现在你有三条路可以选：\n\n"
+        '```json\n{"success": true, "reply": "这是给你的答案。", '
+        '"proposed_action": {"type": "answer"}, "needs_clarification": false}\n```'
+    )
+    cleaned = _strip_protocol_echo(echo)
+    assert "这是给你的答案" in cleaned
+    assert "```" not in cleaned
+    assert "proposed_action" not in cleaned
+
+
+def test_strip_protocol_echo_preserves_legit_json_block():
+    from mac_system.feishu.handlers import _strip_protocol_echo
+
+    text = '需求文档片段如下：\n\n```json\n{"requirements": [{"id": "REQ-1"}]}\n```'
+    assert _strip_protocol_echo(text) == text
+
+
+def test_strip_protocol_echo_whole_reply_is_blob_returns_empty():
+    from mac_system.feishu.handlers import _strip_protocol_echo
+
+    blob = '{"success": true, "reply": "x", "proposed_action": {"type": "answer"}}'
+    assert _strip_protocol_echo(blob) == ""
