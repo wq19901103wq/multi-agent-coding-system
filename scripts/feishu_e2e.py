@@ -327,7 +327,12 @@ class MacApiClient:
     async def tick(self, project_id: str) -> dict[str, Any]:
         if self.dry_run:
             return {"status": "ok"}
-        resp = await self._client.post(f"{self.base_url}/test/tick/{project_id}")
+        # A healthy Agent attempt may run for the configured 20-minute limit.
+        # Keep the control request alive longer than that instead of turning a
+        # successful late result into an empty httpx.ReadTimeout failure.
+        resp = await self._client.post(
+            f"{self.base_url}/test/tick/{project_id}", timeout=2700.0
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -1196,7 +1201,7 @@ async def wait_for_approval_at_state(
         # question at a time through the public command path until the same
         # interaction actually advances; intermediate answers do not create a
         # new Approval card.
-        for _ in range(12):
+        for _ in range(20):
             refreshed = await ctx.mac.get_status(project_id)
             refreshed_pending = refreshed.get("pending_approval") or {}
             if (
@@ -1204,13 +1209,27 @@ async def wait_for_approval_at_state(
                 or refreshed_pending.get("approval_id") != approval_id
             ):
                 break
-            anchor_message_id = await send_feishu_text(
+            sent_message_id = await send_feishu_text(
                 ctx, f"/input {approval_id} 按推荐方案处理"
-            ) or anchor_message_id
-            await asyncio.sleep(2.0)
+            )
+            if not sent_message_id:
+                raise RuntimeError(f"Failed to send input for {approval_id}")
+            # Do not flood the shared Feishu event queue. Wait until MAC has
+            # durably consumed this answer before sending the next question's
+            # answer; a fixed sleep allowed the driver to outrun WS handling.
+            consumed = await ctx.sim.wait_for_reply(
+                pattern=r"已记录该问题的回答|已收到你的回答",
+                after_message_id=sent_message_id,
+                timeout=120.0,
+            )
+            if consumed is None:
+                raise RuntimeError(
+                    f"Input {approval_id} was not acknowledged before timeout"
+                )
+            anchor_message_id = consumed.message_id
         else:
             raise RuntimeError(
-                f"Input interaction {approval_id} did not advance after 12 answers"
+                f"Input interaction {approval_id} did not advance after 20 answers"
             )
         return await wait_for_approval_at_state(
             ctx,
@@ -1322,14 +1341,20 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
         )
     )
     project_id = project["id"]
-    first_tick = asyncio.create_task(ctx.mac.tick(project_id))
     eprint(f"  created isolated project {project_id}")
+
+    # Drive both halves of the initial level-triggered transition. The first
+    # tick runs the Agent; when it completes directly (without ask_user), a
+    # second tick creates and sends the human-confirmation Approval card.
+    await ctx.mac.tick(project_id)
+    initial_status = await ctx.mac.get_status(project_id)
+    if not initial_status.get("pending_approval"):
+        await ctx.mac.tick(project_id)
 
     # ── 1. Requirements: reject then confirm ──────────────────────────────
     approval_id, reply = await wait_for_approval_at_state(
         ctx, project_id, "REQUIREMENT_CONFIRM_PENDING", after_message_id=anchor_message_id
     )
-    await first_tick
     eprint(f"  requirement approval {approval_id} (will reject)")
     msg_id = await send_feishu_text(
         ctx,
@@ -1891,6 +1916,127 @@ async def scenario_active_task_cancel(ctx: ScenarioContext) -> None:
     eprint(f"  active task cancelled through Feishu in {elapsed:.1f}s")
 
 
+async def scenario_agent_fail_auto_rework(ctx: ScenarioContext) -> None:
+    """Verify organic quality-gate fail routes to REWORK and auto-takeover recovers.
+
+    Unlike full_feature_flow (which drives rejects manually), this scenario
+    engineers the project description so the first coding iteration genuinely
+    misses one acceptance criterion. The tester agent should therefore emit
+    passed=false on its own, orchestrator pushes the project into REWORK, and
+    wait_for_approval_at_state auto-confirms the recommended rework target.
+    Assertion: REWORK was sighted at least once before TESTING_CONFIRM_PENDING.
+    """
+    eprint("Scenario: agent_fail_auto_rework")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    anchor_message_id = await _seed_card_anchor(ctx)
+    project = await ctx.mac.create_project(
+        **_project_create_kwargs(
+            ctx,
+            name="agent-fail-auto-rework",
+            task_type="feature",
+            description=(
+                "实现最小 Todo CLI：支持 add <文本> 和 list 两个命令，进程内存储，无持久化。"
+                "验收标准：add 空文本时报错且退出码非零；add 重复文本时必须拒绝并提示已存在；"
+                "list 输出全部条目。"
+                "本项目用于验证质量门：第一版实现请刻意不实现「拒绝重复文本」约束"
+                "（其余正常实现）；测试阶段应对照验收标准发现重复文本未被拒绝并判定不通过；"
+                "返工补齐后第二轮测试全部通过。"
+            ),
+            approval_mode="normal",
+        )
+    )
+    project_id = project["id"]
+    first_tick = asyncio.create_task(ctx.mac.tick(project_id))
+    eprint(f"  created isolated project {project_id}")
+
+    rework_states: list[str] = []
+    stop_watching = asyncio.Event()
+
+    async def _watch_rework() -> None:
+        while not stop_watching.is_set():
+            try:
+                status = await ctx.mac.get_status(project_id)
+                state = status.get("current_state")
+                if state == "REWORK":
+                    rework_states.append(state)
+                    eprint(f"  observed REWORK (sightings={len(rework_states)})")
+                    # One sighting is enough to satisfy the assertion; keep
+                    # watching briefly so we do not spam logs on every poll.
+                    await asyncio.sleep(8.0)
+                    continue
+            except Exception as exc:  # noqa: BLE001 - observability only
+                eprint(f"  rework watcher error: {exc!r}")
+            try:
+                await asyncio.wait_for(stop_watching.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                pass
+
+    watcher = asyncio.create_task(_watch_rework())
+    try:
+        # Planner can legitimately take >10min on the first pass when it asks
+        # a clarification batch and then re-plans with the answers.
+        approval_id, _ = await wait_for_approval_at_state(
+            ctx, project_id, "REQUIREMENT_CONFIRM_PENDING",
+            after_message_id=anchor_message_id, timeout=1500.0,
+        )
+        await first_tick
+        msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+        approval_id, _ = await wait_for_approval_at_state(
+            ctx, project_id, "ARCHITECTURE_CONFIRM_PENDING",
+            after_message_id=msg_id, timeout=600.0,
+        )
+        msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+        approval_id, _ = await wait_for_approval_at_state(
+            ctx, project_id, "IMPLEMENTATION_SPEC_CONFIRM_PENDING",
+            after_message_id=msg_id, timeout=600.0,
+        )
+        msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+        approval_id, _ = await wait_for_approval_at_state(
+            ctx, project_id, "CODING_CONFIRM_PENDING",
+            after_message_id=msg_id, timeout=1200.0,
+        )
+        msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+        # Tester runs. If it fails organically, orchestrator routes to REWORK
+        # and wait_for_approval_at_state auto-takes-over (to_testing) and
+        # walks back to TESTING_CONFIRM_PENDING. Either way we land here.
+        approval_id, _ = await wait_for_approval_at_state(
+            ctx, project_id, "TESTING_CONFIRM_PENDING",
+            after_message_id=msg_id, timeout=1200.0,
+        )
+        eprint(f"  reached TESTING_CONFIRM_PENDING (approval {approval_id})")
+
+        if not rework_states:
+            raise RuntimeError(
+                "Tester passed organically; quality gate fail was not induced. "
+                "Tighten the description so the first iteration clearly misses "
+                "one acceptance criterion."
+            )
+        eprint(f"  organic fail confirmed via {len(rework_states)} REWORK sighting(s)")
+    finally:
+        stop_watching.set()
+        try:
+            await asyncio.wait_for(watcher, timeout=10.0)
+        except asyncio.TimeoutError:
+            watcher.cancel()
+
+    # Cleanup: cancel the project so it does not linger in the shared chat.
+    cancel_message_id = await send_feishu_text(ctx, f"/cancel {project_id}")
+    reply = await ctx.sim.wait_for_reply(
+        pattern=rf"项目 {re.escape(project_id)} 已终止",
+        after_message_id=cancel_message_id,
+        timeout=20.0,
+    )
+    if reply is None:
+        eprint("  warn: /cancel reply not observed; project may still be active")
+    await asyncio.sleep(5.0)
+
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -2111,6 +2257,114 @@ async def scenario_duplicate_event_idempotent(ctx: ScenarioContext) -> None:
     eprint(f"  duplicate confirm idempotent, reached {status['current_state']}")
 
 
+def _server_db_path() -> str:
+    """Resolve the running server's SQLite path from settings."""
+    from mac_system.config import get_settings
+
+    url = get_settings().database_url
+    assert url.startswith("sqlite:///"), f"unsupported database_url: {url}"
+    return url.removeprefix("sqlite:///")
+
+
+def _latest_assistant_reply(db_path: str, chat_id: str | None) -> str | None:
+    """Return the newest assistant turn persisted for this chat, if any."""
+    if not chat_id:
+        return None
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT recent_turns FROM conversation_sessions "
+            "WHERE chat_id=? ORDER BY updated_at DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    for turn in reversed(json.loads(row[0])):
+        if turn.get("role") == "assistant":
+            return str(turn.get("content"))
+    return None
+
+
+async def scenario_coordinator_read_workspace(ctx: ScenarioContext) -> None:
+    """Bound chat + arbitrary phrasing: the coordinator must use Read.
+
+    Regression for the keyword-gating removal: with a bound directory the
+    coordinator receives a read-only worktree for ANY phrasing. Proof: the
+    answer must contain a sentinel token that exists only inside a file in
+    the bound directory — impossible without a real Read call.
+    """
+    eprint("Scenario: coordinator_read_workspace")
+    if ctx.dry_run:
+        return
+    from pathlib import Path
+    import shutil
+
+    token = f"E2E-ZEBRA-{int(time.time()) % 100000}"
+    fixture_dir = Path.home() / f"mac-e2e-coord-read-{int(time.time())}"
+    fixture_dir.mkdir(parents=True, exist_ok=True)
+    (fixture_dir / "SENTINEL.md").write_text(
+        f"# 哨兵文件\n\n本文件的口令是：{token}\n", encoding="utf-8"
+    )
+    try:
+        # 1. Bind the chat to the fixture directory.
+        msg1 = await send_feishu_text(ctx, f"/bind {fixture_dir}")
+        reply1 = await ctx.sim.wait_for_reply(
+            pattern=r"已将当前会话绑定到|绑定目录失败|不能切换目录",
+            after_message_id=msg1,
+            timeout=60.0,
+        )
+        if reply1 is None:
+            raise RuntimeError("MAC bot did not reply to /bind <path>")
+        if "已将当前会话绑定到" not in reply1.text:
+            raise RuntimeError(f"/bind failed: {reply1.text}")
+        eprint(f"  bound chat to {fixture_dir}")
+
+        # 2. Ask a question whose answer exists only inside the bound dir,
+        #    phrased without any legacy inspect keyword. The final reply card
+        #    is degraded by the Feishu message-list API (new-style cards lose
+        #    their body), so verify via the persisted conversation turns in
+        #    the server DB instead.
+        msg2 = await send_feishu_text(
+            ctx, "SENTINEL.md 里写的口令是什么？直接说内容。"
+        )
+        assert msg2 or ctx.dry_run
+        db_path = _server_db_path()
+        chat_id = ctx.args.chat_id
+        deadline = time.monotonic() + 240.0
+        answer: str | None = None
+        while time.monotonic() < deadline:
+            answer = _latest_assistant_reply(db_path, chat_id)
+            if answer and (token in answer or "处理失败" in answer):
+                break
+            await asyncio.sleep(3.0)
+        if answer and "处理失败" in answer:
+            raise RuntimeError(f"coordinator failed: {answer}")
+        if not answer or token not in answer:
+            raise RuntimeError(
+                "coordinator did not answer with the sentinel token — "
+                "Read tool likely unavailable for this phrasing"
+            )
+        eprint("  coordinator reply contains the sentinel token (Read verified)")
+
+        # 3. Unbind so later scenarios are unaffected.
+        msg3 = await send_feishu_text(ctx, "/unbind")
+        reply3 = await ctx.sim.wait_for_reply(
+            pattern=r"已解绑|不能解绑",
+            after_message_id=msg3,
+            timeout=60.0,
+        )
+        if reply3 is None or "已解绑" not in reply3.text:
+            eprint("  [warn] /unbind did not succeed; binding may persist")
+        else:
+            eprint("  unbound chat directory")
+    finally:
+        shutil.rmtree(fixture_dir, ignore_errors=True)
+
+
 SCENARIOS: dict[str, Any] = {
     "p2p_create": scenario_p2p_create,
     "p2p_create_with_type": scenario_p2p_create_with_type,
@@ -2138,7 +2392,9 @@ SCENARIOS: dict[str, Any] = {
     "group_status_at_mention": scenario_group_status_at_mention,
     "api_message_and_decision": scenario_api_message_and_decision,
     "full_feature_flow": scenario_full_feature_flow,
+    "agent_fail_auto_rework": scenario_agent_fail_auto_rework,
     "bind_dir_agent": scenario_bind_dir_agent,
+    "coordinator_read_workspace": scenario_coordinator_read_workspace,
 }
 
 

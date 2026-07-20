@@ -191,6 +191,90 @@ def build_pending_action_card(
     }
 
 
+_CONTROL_ACTION_TITLES = {
+    "pause": "确认暂停项目",
+    "resume": "确认恢复项目",
+    "cancel": "确认取消项目",
+    "rollback": "确认回滚项目",
+}
+
+_CONTROL_ACTION_DESCRIPTIONS = {
+    "pause": "暂停后项目将停止推进，正在运行的 Agent 会在当前步骤结束后挂起；可随时恢复。",
+    "resume": "恢复后项目将继续从上次的阶段推进。",
+    "cancel": "取消后项目将终止，相关 Approval 与 PendingInput 会被清理；此操作不可恢复。",
+    "rollback": "回滚后项目将回到目标阶段重新执行；当前阶段未完成的工作与待确认的审批会被清理。",
+}
+
+_ROLLBACK_TARGET_LABELS = {
+    "requirements": "需求分析",
+    "architecture": "方案设计",
+    "specs": "实现计划",
+    "coding": "编码",
+    "testing": "测试",
+}
+
+
+def build_project_control_card(
+    action_id: str,
+    control_action: str,
+    project_name: str,
+    project_id: str,
+    chat_id: str | None = None,
+    chat_type: str = "p2p",
+    target_stage: str | None = None,
+) -> dict[str, Any]:
+    """Ask the user to authorize a pause/resume/cancel/rollback on a project."""
+    title = _CONTROL_ACTION_TITLES.get(control_action, "确认项目操作")
+    description = _CONTROL_ACTION_DESCRIPTIONS.get(control_action, "")
+    if control_action == "rollback" and target_stage:
+        stage_label = _ROLLBACK_TARGET_LABELS.get(target_stage, target_stage)
+        title = f"确认回滚到{stage_label}"
+        description = (
+            f"回滚后项目将回到 **{stage_label}** 阶段重新执行；"
+            "当前阶段未完成的工作与待确认的审批会被清理。"
+        )
+    is_destructive = control_action in {"cancel", "rollback"}
+    header_color = "red" if is_destructive else "orange"
+
+    def action_button(label: str, decision: str, button_type: str = "default") -> dict[str, Any]:
+        return {
+            "tag": "button",
+            "text": _plain_text(label),
+            "type": button_type,
+            "value": {
+                "action": "conversation_action",
+                "decision": decision,
+                "pending_action_id": action_id,
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+            },
+        }
+
+    body = [
+        f"**目标项目**：{project_name}（`{project_id}`）",
+        description,
+        f"执行请求ID：{action_id}",
+    ]
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": _header(title, header_color),
+        "elements": [
+            {"tag": "div", "text": _lark_md("\n\n".join(part for part in body if part))},
+            {
+                "tag": "action",
+                "actions": [
+                    action_button(
+                        "确认执行",
+                        "confirm",
+                        "danger" if is_destructive else "primary",
+                    ),
+                    action_button("再想想", "reject"),
+                ],
+            },
+        ],
+    }
+
+
 def build_intent_confirm_card(
     task_type: str,
     chat_id: str | None = None,

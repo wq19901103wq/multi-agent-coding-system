@@ -725,7 +725,12 @@ class AgentOrchestrator:
                     agent_type, stage, result.logs or "no output",
                 )
                 return None
-            return result.output_json
+            output = dict(result.output_json)
+            # Runtime evidence is internal metadata, not model-authored output.
+            # The conversation handler uses it to verify that an inspection
+            # actually performed a Read before accepting its conclusions.
+            output["_runtime"] = {"tool_calls": list(result.tool_calls or [])}
+            return output
         finally:
             # Best-effort cleanup of the temp dir. Don't raise on failure.
             try:
@@ -1644,11 +1649,29 @@ class AgentOrchestrator:
             await self._notify_auto_resolve(project, state, chosen)
             return
 
-        # Otherwise, send notification and wait
+        # Otherwise, send notification and wait. Human-state ticks are
+        # level-triggered and reuse the same pending approval, so notification
+        # must be idempotent: exactly one card set per approval instance.
+        # A missing marker means the previous send crashed mid-way — retry.
         if self.feishu_bridge:
-            await self._send_confirmation_cards(
-                project, approval, question, options, acceptance_recommendation
-            )
+            notification = dict((approval.payload or {}).get("notification") or {})
+            existing_card_id = notification.get("confirmation_card_message_id")
+            if existing_card_id and acceptance_coverage_violation:
+                # Options were refreshed on the reused approval — update the
+                # existing card in place instead of posting a duplicate.
+                await self._send_confirmation_cards(
+                    project, approval, question, options,
+                    acceptance_recommendation,
+                    update_message_id=existing_card_id,
+                )
+            elif not existing_card_id:
+                sent_card_id = await self._send_confirmation_cards(
+                    project, approval, question, options, acceptance_recommendation
+                )
+                if sent_card_id:
+                    notification["confirmation_card_message_id"] = sent_card_id
+                    approval.payload = {**approval.payload, "notification": notification}
+                    self.project_service.session.commit()
 
     async def _send_confirmation_cards(
         self,
@@ -1658,10 +1681,16 @@ class AgentOrchestrator:
         options: list[dict],
         acceptance_recommendation: dict[str, Any] | None = None,
         show_actions: bool = True,
-    ) -> None:
-        """Send a report card followed by the action confirmation card."""
+        update_message_id: str | None = None,
+    ) -> str | None:
+        """Send a report card followed by the action confirmation card.
+
+        Returns the confirmation card's message id so callers can record it
+        for idempotent re-ticks. When ``update_message_id`` is given, skip the
+        report cards and refresh that existing card in place instead.
+        """
         if self.feishu_bridge is None:
-            return
+            return None
 
         sm = StateMachine(project.task_type)
         state_display = sm.display_name(project.current_state)
@@ -1678,6 +1707,31 @@ class AgentOrchestrator:
                 details["验收评估"] = rec_summary[:200]
             if acceptance_recommendation.get("action") == "confirm":
                 details["建议操作"] = "验收通过"
+
+        if update_message_id:
+            from mac_system.feishu.card import build_confirmation_card
+
+            card = build_confirmation_card(
+                title=title,
+                summary="请查看上方报告后选择操作",
+                details=details,
+                options=options,
+                approval_id=approval.id,
+                state=details.get("state", ""),
+                chat_id=project.feishu_chat_id,
+                chat_type=project.feishu_chat_type,
+                show_actions=show_actions,
+            )
+            try:
+                await self.feishu_bridge.update_card(update_message_id, card)
+            except Exception:
+                logger.warning(
+                    "Failed to update confirmation card for %s", project.id,
+                    exc_info=True,
+                )
+                return None
+            return update_message_id
+
         summary_text = self._build_summary_for_state(project, project.current_state)
         if not summary_text:
             logger.warning(
@@ -1709,7 +1763,7 @@ class AgentOrchestrator:
 
         # The confirmation card carries only metadata and action buttons.
         try:
-            await self.feishu_bridge.send_confirmation_card(
+            return await self.feishu_bridge.send_confirmation_card(
                 open_id=receive_id,
                 approval_id=approval.id,
                 title=title,
@@ -1725,6 +1779,7 @@ class AgentOrchestrator:
             logger.warning(
                 "Failed to send confirmation card for %s: %s", project.id, exc
             )
+            return None
 
     async def _handle_human_input(
         self,
@@ -1788,6 +1843,13 @@ class AgentOrchestrator:
                 )
                 return
 
+        # Human-state ticks are level-triggered and reuse the same pending
+        # approval, so card notification must be idempotent: exactly one card
+        # set per approval instance. A missing marker means the previous send
+        # crashed mid-way — fall through and retry.
+        if self.feishu_bridge and (approval.payload or {}).get("notification"):
+            return
+
         if self.feishu_bridge:
             receive_id, receive_id_type = self._resolve_project_recipient(project)
             project_tag = project.name or project.id
@@ -1839,6 +1901,11 @@ class AgentOrchestrator:
                     chat_id=project.feishu_chat_id,
                     chat_type=project.feishu_chat_type,
                 )
+                approval.payload = {
+                    **approval.payload,
+                    "notification": {"kind": "rework_confirmation"},
+                }
+                self.project_service.session.commit()
             else:
                 # Unified ask_user: if there is a pending QuestionInteraction,
                 # render a batch question card instead of a free-text input card.
@@ -1861,6 +1928,11 @@ class AgentOrchestrator:
                                     project, approval, data, receive_id, receive_id_type
                                 )
                                 sent_batch_card = True
+                                approval.payload = {
+                                    **approval.payload,
+                                    "notification": {"kind": "question_batch"},
+                                }
+                                self.project_service.session.commit()
                             except Exception as exc:
                                 logger.warning(
                                     "Failed to send question batch card for %s: %s",
@@ -1877,6 +1949,11 @@ class AgentOrchestrator:
                         chat_id=project.feishu_chat_id,
                         chat_type=project.feishu_chat_type,
                     )
+                    approval.payload = {
+                        **approval.payload,
+                        "notification": {"kind": "input_card"},
+                    }
+                    self.project_service.session.commit()
 
     async def _send_question_batch_card(
         self, project, approval, interaction_data, receive_id, receive_id_type,
@@ -2257,7 +2334,30 @@ class AgentOrchestrator:
             return "请确认 Review 结果", quality_gate_options
 
         if state == "REWORK":
-            return "本轮未通过，请选择如何处理", state_machine.rework_options()
+            options = state_machine.rework_options()
+            # Surface the quality agent's recommended target so users (and the
+            # E2E auto-takeover helper) can see which option the failing agent
+            # suggested, instead of guessing among equally-styled buttons.
+            open_feedback = self.project_service.get_open_feedback_packets(project.id)
+            recommended_stage = next(
+                (fb.recommended_rework_target for fb in open_feedback
+                 if fb.recommended_rework_target),
+                None,
+            )
+            stage_by_id = {stage["id"]: stage for stage in state_machine.profile["stages"]}
+            action_by_stage = {
+                item["target_stage"]: item["action"]
+                for item in state_machine.profile.get("rework_targets", [])
+                if item.get("target_stage") in stage_by_id
+            }
+            recommended_action = action_by_stage.get(recommended_stage or "")
+            enriched: list[dict] = []
+            for opt in options:
+                new_opt = {**opt, "option_key": opt["action"]}
+                if recommended_action and opt["action"] == recommended_action:
+                    new_opt["type"] = "primary"
+                enriched.append(new_opt)
+            return "本轮未通过，请选择如何处理", enriched
 
         if state.endswith("_RECOVERY_PENDING"):
             failure = project.context.get("last_agent_failure", {})

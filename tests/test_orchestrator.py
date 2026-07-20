@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,42 @@ from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.models import Approval, FeedbackPacket, Task
 from mac_system.state_machine import StateMachine
+
+
+def test_conversation_coordinator_prompt_examples_match_contract():
+    """Prompt examples must not teach values rejected by the runtime schema."""
+    root = Path(__file__).resolve().parents[1]
+    prompt = (root / "prompts" / "conversation_coordinator.md").read_text(
+        encoding="utf-8"
+    )
+    schema = json.loads(
+        (root / "specs" / "schemas" / "conversation_coordinator_output.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    examples = [
+        json.loads(block)
+        for block in re.findall(r"```json\s*(\{.*?\})\s*```", prompt, re.DOTALL)
+    ]
+    assert examples
+
+    properties = schema["properties"]
+    top_level_allowed = set(properties)
+    action_allowed = set(properties["proposed_action"]["properties"])
+    for example in examples:
+        assert set(example) <= top_level_allowed
+        for field in ("intent", "effect", "commitment"):
+            assert example[field] in properties[field]["enum"]
+        action = example["proposed_action"]
+        assert set(action) <= action_allowed
+        assert action["type"] in properties["proposed_action"]["properties"]["type"]["enum"]
+        if "option_key" in action:
+            assert isinstance(action["option_key"], str)
+        if action["type"] == "inspect_workspace":
+            inspection = example["inspection"]
+            assert inspection["files_read"]
+            assert inspection["summary"]
+            assert inspection["findings"]
 
 
 @pytest.fixture
@@ -854,6 +891,121 @@ async def test_tester_fail_creates_feedback_packet_and_goes_to_rework(orchestrat
     assert feedback[0].source_stage == "TESTING"
     assert feedback[0].kind == "quality_failure"
     assert feedback[0].recommended_rework_target == "coding"
+
+
+@pytest.mark.asyncio
+async def test_rework_approval_marks_recommended_option_primary(orchestrator):
+    """REWORK approval options must expose option_key + primary recommendation.
+
+    The Feishu card and the E2E auto-takeover helper both read
+    ``pending_approval.options[*]`` to find the recommended rollback target.
+    Without this enrichment the helper falls back to a static mapping and can
+    pick a target that sends the project back to the same failing stage
+    (observed in agent_fail_auto_rework E2E: tester kept re-running unchanged
+    code because ``to_testing`` was picked instead of ``to_coding``).
+    """
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "tester": {
+            "success": True,
+            "next_state_event": "complete",
+            "passed": False,
+            "report": "Add command is broken",
+            "failure_class": "implementation_bug",
+            "recommended_rework_target": "coding",
+            "failures": [{"test": "test_add", "error": "assertion failed"}],
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 Todo CLI",
+        approval_mode="auto",
+    )
+    project.current_state = "TESTING"
+    service.session.commit()
+
+    await oc.tick(project.id)
+    # Drive one more tick so the REWORK entry runs and creates the approval.
+    await oc.tick(project.id)
+
+    updated = service.get_project(project.id)
+    assert updated.current_state == "REWORK"
+
+    approval = service.session.exec(
+        select(Approval).where(
+            Approval.project_id == project.id,
+            Approval.state == "REWORK",
+            Approval.status == "pending",
+        )
+    ).first()
+    assert approval is not None, "REWORK approval was not created"
+    options = approval.payload["options"]
+    assert options, "REWORK approval has no options"
+
+    # Every option must expose option_key so helpers can match it.
+    for opt in options:
+        assert opt.get("option_key") == opt.get("action"), (
+            f"option missing option_key: {opt}"
+        )
+
+    primary = [opt for opt in options if opt.get("type") == "primary"]
+    assert len(primary) == 1, (
+        f"expected exactly one primary option, got {len(primary)}: {options}"
+    )
+    assert primary[0]["action"] == "to_coding"
+    assert primary[0]["option_key"] == "to_coding"
+
+
+@pytest.mark.asyncio
+async def test_rework_approval_without_recommendation_marks_nothing_primary(orchestrator):
+    """If the failing agent gave no recommendation, no option is primary."""
+    service, wm, renderer = orchestrator
+
+    runtime = FakeRuntime({
+        "tester": {
+            "success": True,
+            "next_state_event": "complete",
+            "passed": False,
+            "report": "Tests failed but cause unclear",
+            "failure_class": "environment_failure",
+            "recommended_rework_target": "none",
+            "failures": [{"test": "test_env", "error": "db unavailable"}],
+        }
+    })
+
+    oc = AgentOrchestrator(service, wm, runtime, renderer)
+    project = await service.create_project(
+        name="test",
+        task_type="feature",
+        description="实现 Todo CLI",
+        approval_mode="auto",
+    )
+    project.current_state = "TESTING"
+    service.session.commit()
+
+    await oc.tick(project.id)
+    await oc.tick(project.id)
+
+    approval = service.session.exec(
+        select(Approval).where(
+            Approval.project_id == project.id,
+            Approval.state == "REWORK",
+            Approval.status == "pending",
+        )
+    ).first()
+    assert approval is not None
+    options = approval.payload["options"]
+    primary = [opt for opt in options if opt.get("type") == "primary"]
+    assert primary == [], (
+        f"no option should be primary when recommendation is 'none': {options}"
+    )
+    # option_key is still present for helper compatibility.
+    for opt in options:
+        assert opt.get("option_key") == opt.get("action")
 
 
 @pytest.mark.asyncio
@@ -1859,3 +2011,175 @@ async def test_filter_confirmed_questions_falls_back_to_question_id(orchestrator
     assert len(filtered["questions"]) == 1
     assert filtered["questions"][0]["question_id"] == "q2"
     assert len(suppressed) == 1
+
+
+class _RecordingBridge:
+    """Records every outbound card so idempotency can be asserted."""
+
+    def __init__(self):
+        self.confirmation_cards: list[dict] = []
+        self.input_cards: list[dict] = []
+        self.content_cards: list[dict] = []
+        self.interactive: list[dict] = []
+        self.updated: list[str] = []
+
+    async def send_confirmation_card(self, open_id, approval_id, title, summary,
+                                     details, options, receive_id_type="open_id",
+                                     chat_id=None, chat_type="p2p", show_actions=True):
+        self.confirmation_cards.append({"approval_id": approval_id, "title": title})
+        return f"msg_conf_{len(self.confirmation_cards)}"
+
+    async def send_input_card(self, open_id, approval_id, title, question, context,
+                              receive_id_type="open_id", chat_id=None, chat_type="p2p"):
+        self.input_cards.append({"approval_id": approval_id, "title": title})
+        return f"msg_input_{len(self.input_cards)}"
+
+    async def send_content_card(self, open_id, title, content, color="blue",
+                                receive_id_type="open_id", page=None, total=None):
+        self.content_cards.append({"title": title})
+        return f"msg_content_{len(self.content_cards)}"
+
+    async def _send_interactive(self, open_id, card, receive_id_type="open_id"):
+        self.interactive.append(card)
+        return f"msg_inter_{len(self.interactive)}"
+
+    async def update_card(self, message_id, card):
+        self.updated.append(message_id)
+
+    async def send_text(self, open_id, text, receive_id_type="open_id"):
+        return "msg_text"
+
+
+async def _rework_project(service):
+    project = await service.create_project(
+        name="demo", task_type="feature", description="d",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_group", feishu_chat_type="group",
+    )
+    project.current_state = "REWORK"
+    service.session.add(project)
+    service.session.commit()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_human_input_tick_twice_sends_cards_once(orchestrator):
+    """Level-triggered ticks must not duplicate user-facing cards: the pending
+    approval row is reused, so the card set is sent exactly once per approval
+    instance."""
+    service, wm, renderer = orchestrator
+    bridge = _RecordingBridge()
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer, feishu_bridge=bridge)
+    project = await _rework_project(service)
+    sm = StateMachine(project.task_type)
+    approval = await service.create_approval(
+        project_id=project.id, task_id=None, state="REWORK",
+        approval_type="input", question="本轮未通过，请选择如何处理",
+        options=sm.rework_options(),
+    )
+
+    await oc._handle_human_input(service.require_project(project.id), sm, auto_resolve=False)
+    await oc._handle_human_input(service.require_project(project.id), sm, auto_resolve=False)
+
+    assert len(bridge.confirmation_cards) == 1
+    refreshed = service.get_approval(approval.id)
+    assert refreshed.payload.get("notification")
+
+
+@pytest.mark.asyncio
+async def test_human_input_resends_when_notification_marker_missing(orchestrator):
+    """A missing marker means the previous send crashed mid-way — the next
+    tick must retry the notification."""
+    service, wm, renderer = orchestrator
+    bridge = _RecordingBridge()
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer, feishu_bridge=bridge)
+    project = await _rework_project(service)
+    sm = StateMachine(project.task_type)
+    approval = await service.create_approval(
+        project_id=project.id, task_id=None, state="REWORK",
+        approval_type="input", question="本轮未通过，请选择如何处理",
+        options=sm.rework_options(),
+    )
+
+    await oc._handle_human_input(service.require_project(project.id), sm, auto_resolve=False)
+    approval = service.get_approval(approval.id)
+    payload = dict(approval.payload)
+    payload.pop("notification", None)
+    approval.payload = payload
+    service.session.commit()
+
+    await oc._handle_human_input(service.require_project(project.id), sm, auto_resolve=False)
+    assert len(bridge.confirmation_cards) == 2
+
+
+@pytest.mark.asyncio
+async def test_human_input_new_approval_round_sends_new_card(orchestrator):
+    """A new approval instance (next round) must notify again."""
+    service, wm, renderer = orchestrator
+    bridge = _RecordingBridge()
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer, feishu_bridge=bridge)
+    project = await _rework_project(service)
+    sm = StateMachine(project.task_type)
+    approval = await service.create_approval(
+        project_id=project.id, task_id=None, state="REWORK",
+        approval_type="input", question="本轮未通过，请选择如何处理",
+        options=sm.rework_options(),
+    )
+
+    await oc._handle_human_input(service.require_project(project.id), sm, auto_resolve=False)
+    assert len(bridge.confirmation_cards) == 1
+
+    await service.respond_approval(approval.id, "to_testing", "ou_1")
+    approval2 = await service.create_approval(
+        project_id=project.id, task_id=None, state="REWORK",
+        approval_type="input", question="本轮未通过，请选择如何处理",
+        options=sm.rework_options(),
+    )
+    await oc._handle_human_input(service.require_project(project.id), sm, auto_resolve=False)
+
+    assert len(bridge.confirmation_cards) == 2
+    assert bridge.confirmation_cards[-1]["approval_id"] == approval2.id
+
+
+@pytest.mark.asyncio
+async def test_human_confirmation_tick_twice_sends_cards_once(orchestrator):
+    """The confirmation path gets the same idempotency: reused pending
+    approval ⇒ no duplicate report/action card set."""
+    service, wm, renderer = orchestrator
+    bridge = _RecordingBridge()
+    oc = AgentOrchestrator(service, wm, FakeRuntime({}), renderer, feishu_bridge=bridge)
+    project = await service.create_project(
+        name="demo", task_type="feature", description="d",
+        creator_open_id="ou_1",
+        feishu_chat_id="oc_group", feishu_chat_type="group",
+    )
+    project.current_state = "ARCHITECTURE_CONFIRM_PENDING"
+    service.session.add(project)
+    service.session.commit()
+    sm = StateMachine(project.task_type)
+    approval = await service.create_approval(
+        project_id=project.id, task_id=None, state="ARCHITECTURE_CONFIRM_PENDING",
+        approval_type="confirmation", question="确认方案",
+        options=[{"action": "confirm", "label": "确认"},
+                 {"action": "reject", "label": "驳回"}],
+    )
+
+    await oc._handle_human_confirmation(service.require_project(project.id), sm)
+    first_content_count = len(bridge.content_cards)
+    await oc._handle_human_confirmation(service.require_project(project.id), sm)
+
+    assert len(bridge.confirmation_cards) == 1
+    assert len(bridge.content_cards) == first_content_count
+    refreshed = service.get_approval(approval.id)
+    assert refreshed.payload["notification"].get("confirmation_card_message_id")
+
+    # Next round (new approval instance) notifies again.
+    await service.respond_approval(approval.id, "confirm", "ou_1")
+    await service.create_approval(
+        project_id=project.id, task_id=None, state="ARCHITECTURE_CONFIRM_PENDING",
+        approval_type="confirmation", question="确认方案",
+        options=[{"action": "confirm", "label": "确认"},
+                 {"action": "reject", "label": "驳回"}],
+    )
+    await oc._handle_human_confirmation(service.require_project(project.id), sm)
+    assert len(bridge.confirmation_cards) == 2

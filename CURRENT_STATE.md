@@ -1,6 +1,6 @@
 # MAC System 当前状态
 
-> 更新时间：2026-07-19（Asia/Shanghai）
+> 更新时间：2026-07-20（Asia/Shanghai）
 > 本文件只记录当前可用能力和最新验证结果；历史过程放入 `docs/reviews/`。
 
 ## 已实现
@@ -21,7 +21,7 @@
 
 ## 最新验证
 
-- 完整单元测试：**283 passed**，2 个第三方弃用警告（2026-07-19 复跑确认）。
+- 完整单元测试：**320 passed**，2 个第三方弃用警告（2026-07-20 复跑确认）。
 - Ruff lint 与 `git diff --check` 通过；仓库历史代码尚未整体满足 `ruff format --check`。
 - 真实飞书 `conversation_delivery` 已通过：只讨论不创建、执行前确认、单次创建、重复点击幂等回执、取消清场。
 - 真实飞书卡片场景已通过（2026-07-16/17）：
@@ -35,6 +35,11 @@
 - 最新代码真实飞书复验（2026-07-19 10:01–10:51，项目 `proj_20260719_020155_d373`）：
   覆盖规划选择题、需求/Spec 驳回、三个质量关 REWORK、验收回需求和全量重放，最终 `COMPLETED`；
   本轮日志无汇报卡发送失败、`NoneType`、数据库锁、Traceback、运行时失败或 401。
+- 项目控制与 full flow 复验（2026-07-20）：
+  - `active_task_cancel` 在 13.3 秒内终止运行中 Agent，数据库与运行时进程均清理完成；
+  - `full_feature_flow` 项目 `proj_20260719_164305_f9de` 覆盖需求/Spec 驳回、编码/测试/Review REWORK、验收回需求全量重放并最终 `COMPLETED`；
+  - Tester 在真实运行中主动 fail，脚本按推荐项自动选择 `to_testing`，重测后通过，主动 fail 自动 REWORK 路径已获得真实飞书验证；
+  - 服务终端审计未发现汇报卡发送失败、`NoneType`、数据库锁、Traceback 或 401。
 - `requirement_custom_question` 已真实验证：选择“我要修改”只更新原卡为等待补充，用户提交定向文本后才恢复需求规划。
 
 ## 已关闭的 2026-07-18 Live Issues
@@ -71,8 +76,6 @@
 
 ## 尚未宣称完成
 
-- Agent 主动 fail 触发的自动 REWORK 接管路径仅有单测与脚本逻辑覆盖；真实飞书运行中尚未自然出现 Agent 主动 fail（昨晚全部为脚本驱动的人工 reject）。
 - SQLite WAL/busy-timeout 修改后的并发压力验证。
-- Control API 取消项目会阻止晚到结果推进状态，但尚不能立即终止已启动的 Claude CLI 子进程；长任务取消后可能短时继续占用执行资源。
 - Project Manager 不是独立交付阶段 Agent；控制类澄清由 Conversation Coordinator 负责。
 - 多人群管理员权限、生产任务队列、生产数据库与完整可观测性。

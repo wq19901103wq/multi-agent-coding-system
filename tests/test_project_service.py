@@ -342,6 +342,85 @@ async def test_restart_recovery_reschedules_active_agent_project(
     assert ticked == [project.id]
 
 
+async def test_full_crash_restart_lifecycle_marks_task_failed_and_resumes(
+    service, session, monkeypatch
+):
+    """B7: simulate the full crash → restart → resume path end-to-end.
+
+    Sequence:
+      1. Project is mid-execution (task running).
+      2. Server process is killed (simulated by recover_stale_tasks).
+      3. On startup, reconcile_project_invariants runs.
+      4. _resume_recovered_project schedules a tick for each recovered project.
+
+    Asserts:
+      - Running task transitioned to "failed" with a restart error message.
+      - Project remains in its pre-crash state (state machine intact).
+      - Reconcile identifies the project as needing a tick.
+      - Resume triggers orchestrator.tick for the recovered project.
+    """
+    from mac_system.api import main as api_main
+
+    project = await service.create_project(
+        name="crash-lifecycle", task_type="feature", description="Test"
+    )
+    # Force the project into an agent-execution state so the invariant checker
+    # treats it as resumable.
+    project.current_state = "CODING"
+    service.session.add(project)
+    service.session.commit()
+
+    running_task = await service.create_task(
+        project_id=project.id,
+        agent_type="coder",
+        state="CODING",
+        input_data={},
+    )
+    await service.start_task(running_task.id, "/tmp/wt")
+
+    # Step 1: server killed → on next startup, recover_stale_tasks runs first.
+    recovered = service.recover_stale_tasks()
+    assert [t.id for t in recovered] == [running_task.id]
+
+    service.session.refresh(running_task)
+    assert running_task.status == "failed"
+    assert "restarted" in (running_task.error_message or "")
+
+    # Step 2: project state is unchanged (crash did not corrupt state machine).
+    service.session.refresh(project)
+    assert project.current_state == "CODING"
+    assert project.status == "active"
+
+    # Step 3: on startup, the set of "projects to resume" is built from
+    # recover_stale_tasks (failed running tasks) + reconcile (human-state
+    # repairs). For a crashed *running* agent with no completed output,
+    # reconcile contributes nothing — the resume path goes through
+    # recover_stale_tasks alone.
+    needing_tick = service.reconcile_project_invariants()
+    assert project.id not in needing_tick
+    recovered_project_ids = {t.project_id for t in recovered}
+    assert project.id in recovered_project_ids
+
+    # Step 4: _resume_recovered_project triggers an orchestrator tick.
+    @contextmanager
+    def same_session_scope():
+        yield session
+
+    ticked: list[str] = []
+
+    class StubOrchestrator:
+        feishu_bridge = None
+
+        async def tick(self, project_id: str) -> None:
+            ticked.append(project_id)
+
+    monkeypatch.setattr(api_main, "session_scope", same_session_scope)
+    monkeypatch.setattr(api_main, "_build_orchestrator", lambda _session: StubOrchestrator())
+
+    await api_main._resume_recovered_project(project.id)
+    assert ticked == [project.id]
+
+
 async def test_pending_intent_crud(service):
     intent = service.upsert_pending_intent(
         open_id="ou_123",

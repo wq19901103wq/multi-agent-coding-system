@@ -8,7 +8,7 @@ import threading
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -36,6 +36,7 @@ class AgentRuntimeResult:
     output_files: list[Path]
     logs: str
     cost_info: dict[str, Any] | None
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AgentRuntime(ABC):
@@ -274,6 +275,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
         result_event: dict[str, Any] | None = None
+        tool_calls: list[dict[str, Any]] = []
 
         stdout_queue: asyncio.Queue[Any] = asyncio.Queue()
         stderr_queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -388,6 +390,10 @@ class ClaudeCodeRuntime(AgentRuntime):
                             if txt.strip():
                                 await progress_callback("thinking", txt.strip())
                         if block.get("type") == "tool_use":
+                            tool_calls.append({
+                                "name": block.get("name"),
+                                "input": self._summarize_tool_input(block),
+                            })
                             if progress_callback:
                                 await progress_callback("tool", json.dumps({
                                     "name": block.get("name"),
@@ -427,6 +433,7 @@ class ClaudeCodeRuntime(AgentRuntime):
                     output_files=self._scan_output_files(worktree),
                     logs=logs,
                     cost_info=self._extract_cost_info(result_event),
+                    tool_calls=tool_calls,
                 )
 
             return AgentRuntimeResult(
@@ -435,6 +442,7 @@ class ClaudeCodeRuntime(AgentRuntime):
                 output_files=[],
                 logs="No result event received before timeout",
                 cost_info=None,
+                tool_calls=tool_calls,
             )
 
         finally:
@@ -634,6 +642,7 @@ class FakeRuntime(AgentRuntime):
             output_files=[],
             logs="fake runtime",
             cost_info=None,
+            tool_calls=[],
         )
 
     def cancel(self, task_id: str) -> None:

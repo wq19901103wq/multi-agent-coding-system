@@ -449,10 +449,12 @@ class FeishuWebSocketClient:
                 lock.release()
 
     async def _handle_card_action(self, action: ButtonAction, event_id: str | None = None) -> dict[str, Any] | None:
-        # Selection-only clicks update the card in-place and must return quickly
-        # to Feishu. They are idempotent, so skip the per-user serialization lock
-        # to avoid blocking the synchronous card response path.
-        use_lock = action.action != "select_question_option"
+        # Selection clicks and conversation actions are protected by their own
+        # deterministic idempotency/atomic-claim logic. Do not queue a repeated
+        # confirmation behind the first action's potentially long Agent tick;
+        # it must return an immediate "already processing" receipt.
+        lock_free_actions = {"select_question_option", "conversation_action"}
+        use_lock = action.action not in lock_free_actions
         lock = self._user_lock(action.open_id) if use_lock else None
         if lock:
             await asyncio.to_thread(lock.acquire)

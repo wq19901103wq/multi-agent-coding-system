@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -524,6 +525,24 @@ def test_parse_text_message():
     assert msg.open_id == "ou_1"
     assert msg.text == "/whoami"
     assert msg.is_command is True
+
+
+def test_parse_text_message_converts_feishu_create_time():
+    bridge = FeishuBridge(app_id="x", app_secret="y")
+    payload = {
+        "event": {
+            "message": {
+                "message_id": "om_time",
+                "create_time": "1721376000123",
+                "sender": {"sender_id": {"open_id": "ou_1"}},
+                "content": json.dumps({"text": "hello"}),
+            }
+        }
+    }
+
+    msg = bridge.parse_text_message(payload)
+
+    assert msg.created_at == datetime(2024, 7, 19, 8, 0, 0, 123000)
 
 
 def test_parse_text_message_group_with_mention():
@@ -1075,6 +1094,23 @@ def test_parse_button_action():
     assert action.chat_type == "p2p"
 
 
+def test_parse_button_action_converts_feishu_create_time():
+    bridge = FeishuBridge(app_id="x", app_secret="y")
+    payload = {
+        "event": {
+            "action": {
+                "create_time": "1721376000123",
+                "value": {"approval_id": "appr_time", "action": "confirm"},
+            },
+            "operator": {"operator_id": {"open_id": "ou_2"}},
+        }
+    }
+
+    action = bridge.parse_button_action(payload)
+
+    assert action.created_at == datetime(2024, 7, 19, 8, 0, 0, 123000)
+
+
 def test_parse_button_action_includes_form_value():
     bridge = FeishuBridge(app_id="x", app_secret="y")
     payload = {
@@ -1602,12 +1638,15 @@ class _FakeOrchestratorWithBindDir:
         self.cancelled = []
         self.agent_output = agent_output
         self.agent_calls = []
+        self.project_service = None
 
     async def tick(self, project_id: str) -> None:
         self.ticked.append(project_id)
 
     async def cancel_project(self, project_id: str, reason: str = "") -> None:
         self.cancelled.append((project_id, reason))
+        if self.project_service is not None:
+            await self.project_service.cancel_project(project_id, reason=reason)
 
     async def run_chat_scoped_agent(
         self, agent_type, stage, input_data, extra_variables=None, *, worktree=None,
@@ -1830,6 +1869,91 @@ def test_match_repository_mention_returns_none_when_ambiguous():
     assert _match_repository_mention("mac-rpa", candidates) is None
 
 
+async def test_conversation_coordinator_gets_worktree_for_any_phrasing_when_bound(
+    feishu_ctx, tmp_path
+):
+    """A bound chat must hand the coordinator its Read worktree regardless of
+    how the user phrases the message — no keyword whitelist."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_bound_any_phrasing"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "group"
+    target_dir = tmp_path / "bound_repo"
+    target_dir.mkdir()
+    feishu_ctx.service.bind_directory_to_chat(chat_id, str(target_dir), "ou_1")
+
+    phrasings = [
+        "测试覆盖率为什么低",
+        "这个项目依赖了哪些第三方库",
+        "随便聊聊",
+        "help me summarize the code structure",
+    ]
+    for i, text in enumerate(phrasings):
+        fake = _FakeOrchestratorWithBindDir({
+            "success": True,
+            "reply": "好的。",
+            "intent": "discuss",
+            "effect": "none",
+            "commitment": "exploring",
+            "needs_clarification": False,
+            "proposed_action": {"type": "answer"},
+            "updated_summary": "闲聊",
+        })
+        feishu_ctx.orchestrator = fake
+        await handle_text_message(
+            feishu_ctx,
+            TextMessage(
+                open_id="ou_1",
+                message_id=f"om_any_{i}",
+                text=text,
+                is_command=False,
+                is_at_bot=True,
+                chat_id=chat_id,
+                chat_type="group",
+            ),
+        )
+        assert fake.agent_calls, f"coordinator not invoked for: {text}"
+        assert fake.agent_calls[0]["worktree"] == target_dir.resolve(), text
+
+
+async def test_conversation_coordinator_gets_no_worktree_when_unbound(feishu_ctx):
+    """Without a binding (and no repo mention) the coordinator runs with no
+    worktree — and therefore no filesystem tools."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_unbound_plain"
+    feishu_ctx.chat_type = "group"
+    fake = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "你好，有什么可以帮你？",
+        "intent": "discuss",
+        "effect": "none",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {"type": "answer"},
+        "updated_summary": "打招呼",
+    })
+    feishu_ctx.orchestrator = fake
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_unbound_1",
+            text="你好，聊聊",
+            is_command=False,
+            is_at_bot=True,
+            chat_id="oc_unbound_plain",
+            chat_type="group",
+        ),
+    )
+
+    assert fake.agent_calls
+    assert fake.agent_calls[0]["worktree"] is None
+
+
+
 async def test_conversation_coordinator_updates_progress_to_markdown_card(feishu_ctx):
     from mac_system.feishu.handlers import handle_text_message
 
@@ -1863,6 +1987,89 @@ async def test_conversation_coordinator_updates_progress_to_markdown_card(feishu
         el.get("tag") == "markdown" and "调研结论" in (el.get("content") or "")
         for el in feishu_ctx.bridge.sent[-1][2].get("body", {}).get("elements", [])
     )
+
+
+async def test_workspace_inspection_requires_completed_evidence(feishu_ctx):
+    """An inspect label without evidence must not leak an action preview."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_inspect_no_evidence"
+    feishu_ctx.chat_type = "p2p"
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我来查看项目，稍后告诉你结果。",
+        "intent": "inspect",
+        "effect": "read_only",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {"type": "inspect_workspace"},
+        "_runtime": {"tool_calls": []},
+        "updated_summary": "准备查看项目",
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_inspect_no_evidence",
+            text="看下当前项目", is_command=False, chat_type="p2p",
+        ),
+    )
+
+    assert "本次结果格式不完整" in str(feishu_ctx.bridge.sent[-1][2])
+    conversation = feishu_ctx.service.get_or_create_conversation_session(
+        "oc_inspect_no_evidence"
+    )
+    assert "我来查看项目" not in conversation.recent_turns[-1]["content"]
+
+
+async def test_workspace_inspection_persists_structured_evidence(feishu_ctx):
+    """Completed inspection evidence is retained for later execution turns."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    feishu_ctx.chat_id = "oc_inspect_evidence"
+    feishu_ctx.chat_type = "p2p"
+    evidence = {
+        "files_read": ["src/mac_system/feishu/handlers.py"],
+        "summary": "会话历史保存了协调器预测回复。",
+        "findings": [{
+            "title": "记忆与执行结果可能不一致",
+            "evidence": "动作结束后直接保存 reply 字段。",
+            "severity": "high",
+            "recommendation": "保存实际发送内容。",
+        }],
+    }
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "检查完成：会话记忆可能与实际执行结果不一致。",
+        "intent": "inspect",
+        "effect": "read_only",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {"type": "inspect_workspace"},
+        "inspection": evidence,
+        "_runtime": {
+            "tool_calls": [{
+                "name": "Read",
+                "input": {"file_path": "src/mac_system/feishu/handlers.py"},
+            }]
+        },
+        "updated_summary": "完成协调器记忆检查",
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_inspect_evidence",
+            text="检查协调器记忆", is_command=False, chat_type="p2p",
+        ),
+    )
+
+    conversation = feishu_ctx.service.get_or_create_conversation_session(
+        "oc_inspect_evidence"
+    )
+    assert "检查完成" in conversation.recent_turns[-1]["content"]
+    assert conversation.summary == evidence["summary"]
+    assert conversation.latest_artifact["evidence"] == evidence
 
 
 async def test_conversation_clarification_uses_choice_card_and_resumes(feishu_ctx):
@@ -2101,76 +2308,1152 @@ async def test_conversation_start_delivery_requires_card_and_is_idempotent(feish
     assert "已经处理" in feishu_ctx.bridge.sent[-1][2]
 
 
-async def test_invalid_coordinator_contract_degrades_to_safe_confirmation(feishu_ctx):
+async def test_resolve_pending_action_executes_before_recording_result(feishu_ctx):
+    """A coordinator success prediction must not be sent or stored before execution."""
     from mac_system.feishu.handlers import handle_text_message
-    from mac_system.models import PendingConversationAction, Project
 
-    feishu_ctx.chat_id = "oc_safe_fallback"
-    feishu_ctx.chat_type = "group"
+    chat_id = "oc_resolve_actual_result"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    pending = feishu_ctx.service.create_pending_conversation_action(
+        session_id=conversation.id,
+        action_type="unsupported_for_regression",
+        payload={},
+        source_message_ids=["om_source"],
+        idempotency_key="resolve-actual-result",
+        created_by="ou_1",
+    )
+    false_success = "已确认并成功开始执行。"
     feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
         "success": True,
-        "result_text": "我会开始处理。",
+        "reply": false_success,
+        "intent": "authorize_execution",
+        "effect": "workflow_control",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "target": {"kind": "pending_action", "id": pending.id},
+        "proposed_action": {"type": "resolve_pending_action"},
+        "updated_summary": false_success,
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_confirm_pending",
+            text="确认", is_command=False, chat_type="p2p",
+        ),
+    )
+
+    feishu_ctx.service.session.refresh(pending)
+    assert pending.status == "pending"
+    assert not any(false_success in str(item) for item in feishu_ctx.bridge.sent)
+    refreshed = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    assert false_success not in refreshed.recent_turns[-1]["content"]
+    assert "实际处理状态：pending" in refreshed.recent_turns[-1]["content"]
+    assert refreshed.summary == refreshed.recent_turns[-1]["content"]
+
+
+async def test_conversation_propose_project_control_pause_creates_pending_action(feishu_ctx):
+    """Coordinator-proposed pause must route through a card-confirmed
+    PendingConversationAction; confirming flips project.status to 'paused'.
+    """
+    from mac_system.feishu.handlers import handle_card_action, handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    chat_id = "oc_control_pause"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目运行中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我会先暂停这个项目。",
+        "intent": "control",
+        "effect": "none",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "proposed_action": {"type": "propose_project_control", "control_action": "pause"},
     })
 
     await handle_text_message(
         feishu_ctx,
         TextMessage(
             open_id="ou_1",
-            message_id="om_safe_fallback",
-            text="按刚才的最小范围开始开发",
+            message_id="om_pause",
+            text="先暂停一下",
             is_command=False,
-            is_at_bot=True,
-            chat_id="oc_safe_fallback",
-            chat_type="group",
+            chat_type="p2p",
         ),
     )
 
-    assert feishu_ctx.service.session.exec(select(Project)).all() == []
+    pendings = feishu_ctx.service.session.exec(select(PendingConversationAction)).all()
+    assert len(pendings) == 1
+    pending = pendings[0]
+    assert pending.action_type == "project_control"
+    assert pending.payload["control_action"] == "pause"
+    assert pending.payload["target_project_id"] == project.id
+    assert any(item[0] == "interactive" for item in feishu_ctx.bridge.sent)
+
+    action = ButtonAction(
+        open_id="ou_1",
+        approval_id="",
+        action="conversation_action",
+        state="",
+        decision_id=None,
+        option_key=None,
+        extras={"pending_action_id": pending.id, "decision": "confirm"},
+        chat_id=chat_id,
+        chat_type="p2p",
+    )
+    await handle_card_action(feishu_ctx, action)
+
+    feishu_ctx.service.session.refresh(project)
+    feishu_ctx.service.session.refresh(pending)
+    assert project.status == "paused"
+    assert pending.status == "resolved"
+    assert pending.target_project_id == project.id
+
+
+async def test_conversation_propose_project_control_resume_continues_project(feishu_ctx):
+    """A paused project remains visible to the coordinator and resumes with a tick."""
+    from mac_system.feishu.handlers import handle_card_action, handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    chat_id = "oc_control_resume"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d",
+        creator_open_id="ou_1", feishu_chat_id=chat_id,
+    )
+    project.current_state = "CODING"
+    feishu_ctx.service.session.commit()
+    await feishu_ctx.service.pause_project(project.id, triggered_by="test")
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目已暂停",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "恢复项目并继续执行。",
+        "intent": "control",
+        "effect": "workflow_control",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "propose_project_control",
+            "control_action": "resume",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_resume", text="继续项目",
+            is_command=False, chat_type="p2p",
+        ),
+    )
+
     pending = feishu_ctx.service.session.exec(select(PendingConversationAction)).one()
-    assert pending.status == "pending"
-    assert any("conversation_action" in str(item[2]) for item in feishu_ctx.bridge.sent)
+    active_context = json.loads(
+        feishu_ctx.orchestrator.agent_calls[0]["extra_variables"]["active_project"]
+    )
+    assert active_context["status"] == "paused"
+
+    await handle_card_action(
+        feishu_ctx,
+        ButtonAction(
+            open_id="ou_1", approval_id="", action="conversation_action", state="",
+            decision_id=None, option_key=None,
+            extras={"pending_action_id": pending.id, "decision": "confirm"},
+            chat_id=chat_id, chat_type="p2p",
+        ),
+    )
+
+    feishu_ctx.service.session.refresh(project)
+    feishu_ctx.service.session.refresh(pending)
+    assert project.status == "active"
+    assert pending.status == "resolved"
+    assert feishu_ctx.orchestrator.ticked == [project.id]
 
 
-async def test_failed_coordinator_degrades_execution_to_safe_confirmation(feishu_ctx):
+async def test_conversation_propose_project_control_cancel_cancels_project(feishu_ctx):
+    """Coordinator-proposed cancel must terminate the project once confirmed."""
+    from mac_system.feishu.handlers import handle_card_action, handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    chat_id = "oc_control_cancel"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目运行中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我来取消这个项目。",
+        "intent": "control",
+        "effect": "none",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "proposed_action": {"type": "propose_project_control", "control_action": "cancel"},
+    })
+    feishu_ctx.orchestrator.project_service = feishu_ctx.service
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_cancel",
+            text="取消这个项目",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    pending = feishu_ctx.service.session.exec(select(PendingConversationAction)).one()
+    assert pending.action_type == "project_control"
+    assert pending.payload["control_action"] == "cancel"
+
+    action = ButtonAction(
+        open_id="ou_1",
+        approval_id="",
+        action="conversation_action",
+        state="",
+        decision_id=None,
+        option_key=None,
+        extras={"pending_action_id": pending.id, "decision": "confirm"},
+        chat_id=chat_id,
+        chat_type="p2p",
+    )
+    await handle_card_action(feishu_ctx, action)
+
+    feishu_ctx.service.session.refresh(project)
+    feishu_ctx.service.session.refresh(pending)
+    assert project.status == "cancelled"
+    assert pending.status == "resolved"
+    assert feishu_ctx.orchestrator.cancelled == [
+        (project.id, "用户通过对话确认卡取消")
+    ]
+    refreshed_conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    assert refreshed_conversation.active_project_id is None
+
+
+async def test_conversation_propose_project_control_reject_keeps_project_active(feishu_ctx):
+    """Rejecting the control card must leave the project untouched."""
+    from mac_system.feishu.handlers import handle_card_action, handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    chat_id = "oc_control_reject"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目运行中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我来暂停这个项目。",
+        "intent": "control",
+        "effect": "none",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "proposed_action": {"type": "propose_project_control", "control_action": "pause"},
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_reject",
+            text="暂停一下",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    pending = feishu_ctx.service.session.exec(select(PendingConversationAction)).one()
+    action = ButtonAction(
+        open_id="ou_1",
+        approval_id="",
+        action="conversation_action",
+        state="",
+        decision_id=None,
+        option_key=None,
+        extras={"pending_action_id": pending.id, "decision": "reject"},
+        chat_id=chat_id,
+        chat_type="p2p",
+    )
+    await handle_card_action(feishu_ctx, action)
+
+    feishu_ctx.service.session.refresh(project)
+    feishu_ctx.service.session.refresh(pending)
+    assert project.status == "active"
+    assert pending.status == "rejected"
+
+
+async def test_conversation_propose_project_control_without_active_project_falls_back(feishu_ctx):
+    """If the session has no active project, propose_project_control must not
+    create a PendingConversationAction and must fall back to a plain reply.
+    """
     from mac_system.feishu.handlers import handle_text_message
     from mac_system.models import PendingConversationAction, Project
 
-    feishu_ctx.chat_id = "oc_failed_fallback"
-    feishu_ctx.chat_type = "group"
+    chat_id = "oc_control_no_active"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+
     feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
-        "success": False,
-        "error": "No result event received before timeout",
+        "success": True,
+        "reply": "当前没有可操作的项目。",
+        "intent": "control",
+        "effect": "none",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {"type": "propose_project_control", "control_action": "pause"},
     })
 
     await handle_text_message(
         feishu_ctx,
         TextMessage(
             open_id="ou_1",
-            message_id="om_failed_fallback",
-            text="按刚才的最小范围开始开发",
+            message_id="om_no_active",
+            text="暂停项目",
             is_command=False,
-            is_at_bot=True,
-            chat_id="oc_failed_fallback",
-            chat_type="group",
+            chat_type="p2p",
         ),
     )
 
+    assert feishu_ctx.service.session.exec(select(PendingConversationAction)).all() == []
     assert feishu_ctx.service.session.exec(select(Project)).all() == []
+
+
+async def test_conversation_propose_project_control_rollback_to_requirements(feishu_ctx):
+    """Coordinator-proposed rollback must call service.rollback_project and
+    move the project back to the target stage's execution state.
+    """
+    from mac_system.feishu.handlers import handle_card_action, handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    chat_id = "oc_control_rollback"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    # Simulate a project already in CODING so rollback target is valid.
+    project.current_state = "CODING"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目编码中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我来把项目回滚到需求阶段。",
+        "intent": "change_scope",
+        "effect": "workflow_control",
+        "commitment": "proposed",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "propose_project_control",
+            "control_action": "rollback",
+            "target_stage": "requirements",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_rollback",
+            text="改一下需求",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
     pending = feishu_ctx.service.session.exec(select(PendingConversationAction)).one()
-    assert pending.status == "pending"
-    assert any("conversation_action" in str(item[2]) for item in feishu_ctx.bridge.sent)
+    assert pending.action_type == "project_control"
+    assert pending.payload["control_action"] == "rollback"
+    assert pending.payload["target_stage"] == "requirements"
 
-    # The fallback reply must contain the real failure reason, not the legacy
-    # misleading timeout wording.
-    final_card_text = str(feishu_ctx.bridge.sent[-1][2])
-    assert "No result event received before timeout" in final_card_text
-    assert "时限" not in final_card_text
-    assert "结果已整理" not in final_card_text
+    action = ButtonAction(
+        open_id="ou_1",
+        approval_id="",
+        action="conversation_action",
+        state="",
+        decision_id=None,
+        option_key=None,
+        extras={"pending_action_id": pending.id, "decision": "confirm"},
+        chat_id=chat_id,
+        chat_type="p2p",
+    )
+    await handle_card_action(feishu_ctx, action)
 
-    # The progress card should reflect the failure, not completion.
-    failed_update = feishu_ctx.bridge.updated[-1][1]
-    assert failed_update["header"]["title"]["content"] == "处理失败"
-    assert "No result event received before timeout" in str(failed_update)
+    feishu_ctx.service.session.refresh(project)
+    feishu_ctx.service.session.refresh(pending)
+    assert project.current_state == "PLANNING_REQUIREMENTS"
+    assert project.previous_state == "CODING"
+    assert pending.status == "resolved"
+    assert feishu_ctx.orchestrator.ticked == [project.id]
+
+
+async def test_conversation_propose_project_control_rollback_missing_target(feishu_ctx):
+    """If the coordinator proposes rollback without target_stage, the handler
+    must NOT create a PendingConversationAction; it should ask the user to
+    specify which stage.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    chat_id = "oc_control_rollback_missing"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    project.current_state = "CODING"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目编码中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我需要更多信息。",
+        "intent": "change_scope",
+        "effect": "workflow_control",
+        "commitment": "ambiguous",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "propose_project_control",
+            "control_action": "rollback",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_rollback_amb",
+            text="我觉得这个不太对",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    # No pending action should be created; we should just have sent a reply.
+    assert feishu_ctx.service.session.exec(select(PendingConversationAction)).all() == []
+    feishu_ctx.service.session.refresh(project)
+    assert project.current_state == "CODING"
+
+
+async def test_conversation_project_control_rejects_forward_rollback(feishu_ctx):
+    """A rollback proposal cannot skip forward over uncompleted stages."""
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    chat_id = "oc_control_forward_rollback"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d",
+        creator_open_id="ou_1", feishu_chat_id=chat_id,
+    )
+    project.current_state = "PLANNING_REQUIREMENTS"
+    feishu_ctx.service.session.commit()
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "回滚到测试阶段。",
+        "intent": "change_scope",
+        "effect": "workflow_control",
+        "commitment": "proposed",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "propose_project_control",
+            "control_action": "rollback",
+            "target_stage": "testing",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_forward_rollback",
+            text="直接去测试", is_command=False, chat_type="p2p",
+        ),
+    )
+
+    assert feishu_ctx.service.session.exec(select(PendingConversationAction)).all() == []
+    assert feishu_ctx.service.require_project(project.id).current_state == "PLANNING_REQUIREMENTS"
+    assert any("只能回滚到当前阶段之前" in str(item[2]) for item in feishu_ctx.bridge.sent)
+
+
+async def test_conversation_propose_project_control_rollback_reject_keeps_state(feishu_ctx):
+    """Rejecting the rollback card must leave project.current_state unchanged."""
+    from mac_system.feishu.handlers import handle_card_action, handle_text_message
+    from mac_system.models import PendingConversationAction
+
+    chat_id = "oc_control_rollback_reject"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    project.current_state = "CODING"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目编码中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我来把项目回滚到需求阶段。",
+        "intent": "change_scope",
+        "effect": "workflow_control",
+        "commitment": "proposed",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "propose_project_control",
+            "control_action": "rollback",
+            "target_stage": "requirements",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_rollback_rej",
+            text="改一下需求",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    pending = feishu_ctx.service.session.exec(select(PendingConversationAction)).one()
+    action = ButtonAction(
+        open_id="ou_1",
+        approval_id="",
+        action="conversation_action",
+        state="",
+        decision_id=None,
+        option_key=None,
+        extras={"pending_action_id": pending.id, "decision": "reject"},
+        chat_id=chat_id,
+        chat_type="p2p",
+    )
+    await handle_card_action(feishu_ctx, action)
+
+    feishu_ctx.service.session.refresh(project)
+    feishu_ctx.service.session.refresh(pending)
+    assert project.current_state == "CODING"
+    assert pending.status == "rejected"
+
+
+async def test_conversation_view_artifact_requirements_returns_content(feishu_ctx):
+    """When the user asks to see the requirements doc, the handler must read
+    REQUIREMENTS.json from the project's .mac/ directory and return its content.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_view_requirements"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目运行中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    artifact = {
+        "version": 1,
+        "round": 1,
+        "status": "confirmed",
+        "objective": "实现一个 config-validator CLI",
+        "scope": ["validate 子命令", "yaml 解析"],
+        "acceptance_criteria": ["validate 能返回非零退出码"],
+    }
+    artifact_path = (
+        Path(project.workspace_path) / ".mac" / "REQUIREMENTS.json"
+    )
+    artifact_path.write_text(
+        json.dumps(artifact, ensure_ascii=False), encoding="utf-8"
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "这是当前的需求文档。",
+        "intent": "inspect",
+        "effect": "read_only",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "view_artifact",
+            "artifact_kind": "requirements",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_view_req",
+            text="看一下需求",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    # The reply is sent via send_content_card → logged as "interactive".
+    interactives = [item for item in feishu_ctx.bridge.sent if item[0] == "interactive"]
+    assert interactives, "expected at least one interactive reply"
+    last_card_text = str(interactives[-1][2])
+    assert "config-validator CLI" in last_card_text
+    assert "REQUIREMENTS.json" in last_card_text
+    assert "validate 子命令" in last_card_text
+
+
+async def test_conversation_view_artifact_missing_file_reports_not_produced(feishu_ctx):
+    """When the artifact file does not exist, reply 'not yet produced' rather
+    than crashing or making the coordinator guess paths.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_view_missing"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目运行中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我看一下。",
+        "intent": "inspect",
+        "effect": "read_only",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "view_artifact",
+            "artifact_kind": "architecture",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_view_missing",
+            text="看一下方案",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    replies = [item for item in feishu_ctx.bridge.sent if item[0] == "interactive"]
+    assert replies, "expected at least one interactive reply"
+    last_text = str(replies[-1][2])
+    assert "ARCHITECTURE.json" in last_text
+    assert "还未完成" in last_text or "没有产出" in last_text
+
+
+async def test_conversation_view_artifact_without_active_project_falls_back(feishu_ctx):
+    """No active project + view_artifact → no file read, plain fallback reply."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_view_no_project"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "当前没有项目。",
+        "intent": "inspect",
+        "effect": "read_only",
+        "commitment": "exploring",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "view_artifact",
+            "artifact_kind": "requirements",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_view_no_proj",
+            text="看一下需求",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    replies = [item for item in feishu_ctx.bridge.sent if item[0] == "interactive"]
+    assert replies, "expected at least one interactive reply"
+    last_text = str(replies[-1][2])
+    assert "当前没有可查看的活跃项目" in last_text or "没有项目" in last_text
+
+
+async def test_robustness_propose_start_delivery_blocked_with_active_project(feishu_ctx):
+    """A'5: coordinator must not spawn a parallel project while one is active.
+    Even if it tries (prompt slip), the handler must reject the action and
+    leave the existing project untouched.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import PendingConversationAction, Project
+
+    chat_id = "oc_robust_active_block"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="existing", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目运行中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    # Coordinator tries to start a new delivery despite active project.
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "这是整理后的最小范围方案。",
+        "intent": "authorize_execution",
+        "effect": "workspace_write",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "proposed_action": {
+            "type": "propose_start_delivery",
+            "task_type": "feature",
+            "description": "一个完全不同的新项目",
+            "scope": ["新功能 X"],
+            "out_of_scope": [],
+            "permissions": ["workspace_write"],
+            "acceptance_criteria": ["X 工作"],
+            "decisions": [],
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_new_req",
+            text="再帮我做一个别的功能",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    # No PendingConversationAction for start_delivery should exist.
+    assert feishu_ctx.service.session.exec(select(PendingConversationAction)).all() == []
+    # Only the original project exists.
+    projects = feishu_ctx.service.session.exec(select(Project)).all()
+    assert len(projects) == 1
+    assert projects[0].id == project.id
+    # Reply should tell the user there's an active project.
+    interactives = [item for item in feishu_ctx.bridge.sent if item[0] == "interactive"]
+    assert interactives
+    last_text = str(interactives[-1][2])
+    assert project.id in last_text
+    refreshed_conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    actual_reply = refreshed_conversation.recent_turns[-1]["content"]
+    assert project.id in actual_reply
+    assert "这是整理后的最小范围方案" not in actual_reply
+    assert refreshed_conversation.summary == actual_reply
+
+
+async def test_robustness_free_text_during_approval_does_not_auto_resolve(feishu_ctx):
+    """A'1: while a confirmation approval is pending, an ambiguous free-text
+    message must NOT auto-resolve the approval. The approval stays pending
+    and the user is asked to pick an option.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_robust_pending_approval"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    project.current_state = "ARCHITECTURE_CONFIRM_PENDING"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="等待方案确认",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+    approval = await feishu_ctx.service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="ARCHITECTURE_CONFIRM_PENDING",
+        approval_type="confirmation",
+        question="确认方案",
+        options=[{"action": "confirm", "label": "确认"}],
+    )
+
+    # Coordinator responds with an ambiguous answer (NOT approval_resolution).
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我需要更多信息才能判断。",
+        "intent": "discuss",
+        "effect": "none",
+        "commitment": "ambiguous",
+        "needs_clarification": False,
+        "proposed_action": {"type": "answer"},
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_during_approval",
+            text="这个方案你觉得怎么样",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    feishu_ctx.service.session.refresh(approval)
+    feishu_ctx.service.session.refresh(project)
+    # Approval must still be pending — no auto-resolution.
+    assert approval.status == "pending"
+    # Project state unchanged.
+    assert project.current_state == "ARCHITECTURE_CONFIRM_PENDING"
+
+
+async def test_robustness_rework_suibian_does_not_auto_decide(feishu_ctx):
+    """A'3: '随便' during REWORK must not trigger any approval resolution.
+    The approval stays pending and the project stays in REWORK.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_robust_rework_suibian"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    project.current_state = "REWORK"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="等待 rework 选择",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+    approval = await feishu_ctx.service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="REWORK",
+        approval_type="confirmation",
+        question="本轮未通过，请选择如何处理",
+        options=[
+            {"action": "to_coding", "label": "重新编码"},
+            {"action": "to_requirements", "label": "重新明确需求"},
+        ],
+    )
+
+    # Coordinator (correctly) treats '随便' as ambiguous and asks for clarification.
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "请告诉我要回到哪个阶段。",
+        "intent": "discuss",
+        "effect": "none",
+        "commitment": "ambiguous",
+        "needs_clarification": False,
+        "proposed_action": {"type": "answer"},
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_suibian",
+            text="随便",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    feishu_ctx.service.session.refresh(approval)
+    feishu_ctx.service.session.refresh(project)
+    # Approval NOT auto-resolved.
+    assert approval.status == "pending"
+    # Project still in REWORK.
+    assert project.current_state == "REWORK"
+
+
+async def test_robustness_gibberish_free_text_is_safe_no_op(feishu_ctx):
+    """A'6: gibberish free text with active project must not corrupt state.
+    Coordinator responds with answer; handler just relays; nothing else changes.
+    """
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import Approval, PendingConversationAction
+
+    chat_id = "oc_robust_gibberish"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d", feishu_chat_id=chat_id
+    )
+    project.current_state = "CODING"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目编码中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "我不太理解这句话，能换种方式描述吗？",
+        "intent": "unknown",
+        "effect": "none",
+        "commitment": "ambiguous",
+        "needs_clarification": False,
+        "proposed_action": {"type": "answer"},
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1",
+            message_id="om_gibberish",
+            text="asdkfjqwieorzxcv",
+            is_command=False,
+            chat_type="p2p",
+        ),
+    )
+
+    feishu_ctx.service.session.refresh(project)
+    assert project.current_state == "CODING"
+    assert project.status == "active"
+    # No pending action / approval created.
+    assert feishu_ctx.service.session.exec(select(PendingConversationAction)).all() == []
+    assert feishu_ctx.service.session.exec(select(Approval)).all() == []
+
+
+async def test_invalid_coordinator_contract_never_fabricates_action(feishu_ctx):
+    """Malformed coordinator output must degrade identically for every
+    phrasing: relay result_text as a plain answer, never fabricate a
+    pending execution action."""
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import PendingConversationAction, Project
+
+    phrasings = [
+        "按刚才的最小范围开始开发",  # legacy "execution keyword" phrasing
+        "可以动手了吗",  # execution intent without any keyword
+        "随便聊聊",
+    ]
+    for i, text in enumerate(phrasings):
+        chat_id = f"oc_safe_fallback_{i}"
+        feishu_ctx.chat_id = chat_id
+        feishu_ctx.chat_type = "group"
+        feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+            "success": True,
+            "result_text": "我会开始处理。",
+        })
+
+        await handle_text_message(
+            feishu_ctx,
+            TextMessage(
+                open_id="ou_1",
+                message_id=f"om_safe_fallback_{i}",
+                text=text,
+                is_command=False,
+                is_at_bot=True,
+                chat_id=chat_id,
+                chat_type="group",
+            ),
+        )
+
+        assert feishu_ctx.service.session.exec(select(Project)).all() == [], text
+        assert (
+            feishu_ctx.service.session.exec(select(PendingConversationAction)).all()
+            == []
+        ), text
+        assert "我会开始处理。" in str(feishu_ctx.bridge.sent[-1]), text
+
+
+async def test_failed_coordinator_safe_fallback_for_any_phrasing(feishu_ctx):
+    """Coordinator failure must degrade to the same safe retry message for
+    every phrasing — never fabricate a pending execution action from a
+    failed parse."""
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import PendingConversationAction, Project
+
+    phrasings = [
+        "按刚才的最小范围开始开发",  # legacy "execution keyword" phrasing
+        "可以动手了吗",  # execution intent without any keyword
+        "随便聊聊",
+    ]
+    for i, text in enumerate(phrasings):
+        chat_id = f"oc_failed_fallback_{i}"
+        feishu_ctx.chat_id = chat_id
+        feishu_ctx.chat_type = "group"
+        feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+            "success": False,
+            "error": "No result event received before timeout",
+        })
+
+        await handle_text_message(
+            feishu_ctx,
+            TextMessage(
+                open_id="ou_1",
+                message_id=f"om_failed_fallback_{i}",
+                text=text,
+                is_command=False,
+                is_at_bot=True,
+                chat_id=chat_id,
+                chat_type="group",
+            ),
+        )
+
+        assert feishu_ctx.service.session.exec(select(Project)).all() == [], text
+        assert (
+            feishu_ctx.service.session.exec(select(PendingConversationAction)).all()
+            == []
+        ), text
+
+        # The fallback reply must contain the real failure reason, not the
+        # legacy misleading timeout wording.
+        final_card_text = str(feishu_ctx.bridge.sent[-1])
+        assert "No result event received before timeout" in final_card_text, text
+        assert "时限" not in final_card_text, text
+        assert "结果已整理" not in final_card_text, text
+
+        # The progress card should reflect the failure, not completion.
+        failed_update = feishu_ctx.bridge.updated[-1][1]
+        assert failed_update["header"]["title"]["content"] == "处理失败", text
+        assert "No result event received before timeout" in str(failed_update), text
+
+
+async def test_free_text_during_running_agent_always_nonblocking_question(feishu_ctx):
+    """Free text while an agent is running is always recorded as a
+    non-blocking question — no keyword-based kind inference."""
+    from mac_system.feishu.handlers import handle_text_message
+    from mac_system.models import PendingUserInput
+
+    chat_id = "oc_running_kind"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo",
+        task_type="feature",
+        description="d",
+        creator_open_id="ou_1",
+        feishu_chat_id=chat_id,
+    )
+    project.current_state = "CODING"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation,
+        summary="项目编码中",
+        active_project_id=project.id,
+        update_active_project=True,
+    )
+    task = await feishu_ctx.service.create_task(
+        project_id=project.id,
+        agent_type="coder",
+        state="CODING",
+        input_data={},
+    )
+    await feishu_ctx.service.start_task(task.id)
+
+    phrasings = [
+        "改天再看吧",  # legacy classifier misfired: 改 -> "correction" (blocking)
+        "这个不要急",  # legacy classifier misfired: 不要 -> "scope_change" (blocking)
+        "我觉得这里设计有问题",  # real correction content, zero keyword overlap
+    ]
+    for i, text in enumerate(phrasings):
+        await handle_text_message(
+            feishu_ctx,
+            TextMessage(
+                open_id="ou_1",
+                message_id=f"om_kind_{i}",
+                text=text,
+                is_command=False,
+                chat_type="p2p",
+            ),
+        )
+
+    inputs = feishu_ctx.service.session.exec(
+        select(PendingUserInput).where(PendingUserInput.project_id == project.id)
+    ).all()
+    assert len(inputs) == len(phrasings)
+    assert {inp.kind for inp in inputs} == {"question"}
 
 
 async def test_failed_coordinator_shows_real_reason_no_fake_timeout(feishu_ctx):
@@ -3951,3 +5234,209 @@ def test_ws_client_staleness_rejects_pre_disconnect_events():
     client._last_disconnect_at = datetime.utcnow() - timedelta(minutes=5)
     pre_disconnect = datetime.utcnow() - timedelta(minutes=6)
     assert client._is_stale_event(service, open_id, open_id, pre_disconnect)
+
+
+async def _setup_rework_approval(feishu_ctx, chat_id: str):
+    """Project parked in REWORK with an option-based pending approval."""
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d",
+        creator_open_id="ou_1", feishu_chat_id=chat_id,
+    )
+    project.current_state = "REWORK"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    approval = await feishu_ctx.service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="REWORK",
+        approval_type="confirmation",
+        question="本轮未通过，请选择如何处理",
+        options=[
+            {"action": "to_requirements", "label": "重新明确需求",
+             "next_state": "PLANNING_REQUIREMENTS", "option_key": "to_requirements"},
+            {"action": "to_testing", "label": "直接重新测试",
+             "next_state": "TESTING", "option_key": "to_testing"},
+        ],
+    )
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation, summary="等待 rework 选择",
+        active_project_id=project.id, update_active_project=True,
+    )
+    return project, approval
+
+
+def _sent_card_texts(feishu_ctx) -> list[str]:
+    return [
+        json.dumps(item[2], ensure_ascii=False)
+        for item in feishu_ctx.bridge.sent
+        if item[0] == "interactive"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rework_approval_invalid_reject_decision_reports_failure(feishu_ctx):
+    """A 'reject' decision on an option-based (REWORK) approval must not crash,
+    must not send the coordinator's false success reply, and must leave the
+    approval pending with a user-visible failure notice."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_rework_reject"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project, approval = await _setup_rework_approval(feishu_ctx, chat_id)
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "已收到，驳回当前测试结果，Agent 将配置 LLM 后重新运行集成测试。",
+        "intent": "reject",
+        "effect": "workflow_control",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "target": {"kind": "approval", "id": approval.id},
+        "proposed_action": {
+            "type": "propose_approval_resolution",
+            "approval_decision": "reject",
+            "option_key": None,
+            "feedback": "配置 LLM 后重新测试",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_rework_reject",
+            text="驳回，配置 LLM 后重新测试", is_command=False, chat_type="p2p",
+        ),
+    )
+
+    refreshed = feishu_ctx.service.get_approval(approval.id)
+    assert refreshed.status == "pending"
+    assert feishu_ctx.service.require_project(project.id).current_state == "REWORK"
+    cards = _sent_card_texts(feishu_ctx)
+    assert any("无法按该方式处理当前审批" in c for c in cards)
+    assert not any("已收到，驳回当前测试结果" in c for c in cards)
+
+    # The coordinator must see the approval's options so it can emit a valid
+    # select_option next time.
+    call = feishu_ctx.orchestrator.agent_calls[0]
+    ctx_approvals = json.loads(call["extra_variables"]["pending_approvals"])
+    assert ctx_approvals[0]["options"] == [
+        {"option_key": "to_requirements", "label": "重新明确需求"},
+        {"option_key": "to_testing", "label": "直接重新测试"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rework_approval_select_option_resolves(feishu_ctx):
+    """select_option with a valid option_key maps to the option's action and
+    resolves the REWORK approval, then the deterministic result card is sent."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_rework_select"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project, approval = await _setup_rework_approval(feishu_ctx, chat_id)
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "已选择直接重新测试，项目将回到 TESTING 阶段重跑。",
+        "intent": "select_option",
+        "effect": "workflow_control",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "target": {"kind": "approval", "id": approval.id},
+        "proposed_action": {
+            "type": "propose_approval_resolution",
+            "approval_decision": "select_option",
+            "option_key": "to_testing",
+            "feedback": "配置 LLM 后重新运行集成测试",
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_rework_select",
+            text="直接重新测试", is_command=False, chat_type="p2p",
+        ),
+    )
+
+    assert feishu_ctx.service.require_project(project.id).current_state == "TESTING"
+    resolved = feishu_ctx.service.get_approval(approval.id)
+    assert resolved.status == "responded"
+    assert resolved.response == "to_testing"
+    cards = _sent_card_texts(feishu_ctx)
+    assert any("你选择了「直接重新测试」" in c for c in cards)
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    assert "已按 select_option 处理" in conversation.recent_turns[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_confirmation_approval_confirm_via_coordinator_resolves(feishu_ctx):
+    """Plain confirm on a confirmation approval keeps working through the
+    coordinator path (no options starvation regression)."""
+    from mac_system.feishu.handlers import handle_text_message
+
+    chat_id = "oc_confirm_coord"
+    feishu_ctx.chat_id = chat_id
+    feishu_ctx.chat_type = "p2p"
+    project = await feishu_ctx.service.create_project(
+        name="demo", task_type="feature", description="d",
+        creator_open_id="ou_1", feishu_chat_id=chat_id,
+    )
+    project.current_state = "ARCHITECTURE_CONFIRM_PENDING"
+    feishu_ctx.service.session.add(project)
+    feishu_ctx.service.session.commit()
+    approval = await feishu_ctx.service.create_approval(
+        project_id=project.id,
+        task_id=None,
+        state="ARCHITECTURE_CONFIRM_PENDING",
+        approval_type="confirmation",
+        question="确认方案",
+        options=[
+            {"action": "confirm", "label": "确认"},
+            {"action": "reject", "label": "驳回"},
+        ],
+    )
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    feishu_ctx.service.update_conversation_session(
+        conversation, summary="等待方案确认",
+        active_project_id=project.id, update_active_project=True,
+    )
+
+    feishu_ctx.orchestrator = _FakeOrchestratorWithBindDir({
+        "success": True,
+        "reply": "已确认当前技术方案，继续推进。",
+        "intent": "approve",
+        "effect": "workflow_control",
+        "commitment": "authorized",
+        "needs_clarification": False,
+        "target": {"kind": "approval", "id": approval.id},
+        "proposed_action": {
+            "type": "propose_approval_resolution",
+            "approval_decision": "confirm",
+            "option_key": None,
+            "feedback": None,
+        },
+    })
+
+    await handle_text_message(
+        feishu_ctx,
+        TextMessage(
+            open_id="ou_1", message_id="om_confirm_coord",
+            text="确认", is_command=False, chat_type="p2p",
+        ),
+    )
+
+    assert (
+        feishu_ctx.service.require_project(project.id).current_state
+        == "PLANNING_IMPLEMENTATION_SPECS"
+    )
+    resolved = feishu_ctx.service.get_approval(approval.id)
+    assert resolved.status == "responded"
+    assert resolved.response == "confirm"
+    cards = _sent_card_texts(feishu_ctx)
+    assert any("你选择了「确认」" in c for c in cards)
+    conversation = feishu_ctx.service.get_or_create_conversation_session(chat_id)
+    assert "已按 confirm 处理" in conversation.recent_turns[-1]["content"]

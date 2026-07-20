@@ -230,3 +230,10 @@ async def test_stream_tool_use_is_observed_but_not_executed(tmp_path):
     tool_progress = json.loads(next(content for kind, content in progress if kind == "tool"))
     assert tool_progress["input"]["content_length"] == 100000
     assert "content" not in tool_progress["input"]
+    assert result.tool_calls == [{
+        "name": "Write",
+        "input": {
+            "file_path": str(target),
+            "content_length": 100000,
+        },
+    }]

@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -14,7 +15,6 @@ from mac_system.feishu.card import (
 )
 from mac_system.feishu.crypto import decrypt_feishu, verify_signature
 from mac_system.utils.formatting import (
-    format_tool_preview,
     split_markdown_sections,
     split_text,
 )
