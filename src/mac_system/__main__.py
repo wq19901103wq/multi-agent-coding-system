@@ -9,7 +9,7 @@ import uvicorn
 
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.agents.prompts import PromptRenderer
-from mac_system.agents.runtime import ClaudeCodeRuntime
+from mac_system.agents.runtime import build_agent_runtime
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
@@ -44,7 +44,11 @@ def server(host: str, port: int, reload: bool) -> None:
 
 @cli.command("create-project")
 @click.option("--name", required=True, help="Project name.")
-@click.option("--task-type", default="feature", help="Task type (feature, bug_fix, documentation).")
+@click.option(
+    "--task-type",
+    default="feature",
+    help="Task type (feature, iteration, bug_fix, documentation).",
+)
 @click.option("--description", required=True, help="Task description.")
 @click.option("--approval-mode", default="auto", help="Approval mode (strict, normal, night, auto).")
 @click.option("--creator-open-id", default=None, help="Creator Feishu open_id.")
@@ -101,18 +105,7 @@ def tick(project_id: str) -> None:
             service = ProjectService(session)
             wm = WorktreeManager(settings.projects_dir)
             renderer = PromptRenderer(get_agent_config())
-            runtime = ClaudeCodeRuntime(
-                claude_bin=settings.claude_bin,
-                anthropic_api_key=settings.anthropic_api_key,
-                anthropic_auth_token=settings.anthropic_auth_token,
-                claude_model=settings.claude_model,
-                anthropic_base_url=settings.anthropic_base_url,
-                anthropic_default_opus_model=settings.anthropic_default_opus_model,
-                anthropic_default_sonnet_model=settings.anthropic_default_sonnet_model,
-                anthropic_default_haiku_model=settings.anthropic_default_haiku_model,
-                claude_code_effort_level=settings.claude_code_effort_level,
-                api_timeout_ms=settings.api_timeout_ms,
-            )
+            runtime = build_agent_runtime(settings, get_agent_config())
             orchestrator = AgentOrchestrator(service, wm, runtime, renderer)
             await orchestrator.tick(project_id)
             project = service.get_project(project_id)
@@ -158,18 +151,7 @@ def run(
 
         wm = WorktreeManager(run_settings.projects_dir)
         renderer = PromptRenderer(get_agent_config())
-        runtime = ClaudeCodeRuntime(
-            claude_bin=run_settings.claude_bin,
-            anthropic_api_key=run_settings.anthropic_api_key,
-            anthropic_auth_token=run_settings.anthropic_auth_token,
-            claude_model=run_settings.claude_model,
-            anthropic_base_url=run_settings.anthropic_base_url,
-            anthropic_default_opus_model=run_settings.anthropic_default_opus_model,
-            anthropic_default_sonnet_model=run_settings.anthropic_default_sonnet_model,
-            anthropic_default_haiku_model=run_settings.anthropic_default_haiku_model,
-            claude_code_effort_level=run_settings.claude_code_effort_level,
-            api_timeout_ms=run_settings.api_timeout_ms,
-        )
+        runtime = build_agent_runtime(run_settings, get_agent_config())
 
         for i in range(max_ticks):
             with session_scope() as session:

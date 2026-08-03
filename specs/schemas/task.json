@@ -12,7 +12,7 @@
     },
     "task_id": {"type": "string"},
     "agent_type": {
-      "enum": ["planner", "coder", "tester", "reviewer", "acceptance_evaluator", "project_manager"]
+      "enum": ["planner", "coder", "tester", "reviewer", "acceptance_agent", "acceptance_evaluator", "project_manager"]
     },
     "state": {"type": "string"},
     "input": {
@@ -36,6 +36,7 @@
         {"$ref": "coder_output.json"},
         {"$ref": "tester_output.json"},
         {"$ref": "reviewer_output.json"},
+        {"$ref": "acceptance_agent_output.json"},
         {"$ref": "acceptance_evaluator_output.json"},
         {"$ref": "project_manager_output.json"}
       ]

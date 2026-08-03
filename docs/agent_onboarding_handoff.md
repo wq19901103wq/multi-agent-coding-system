@@ -9,10 +9,12 @@
 
 1. Feature 主流程已经调整为：**Specify（需求 + 产品行为 + 验收标准）→ 技术方案 → 实现规格 → 编码 → 测试 → Review → 验收 → 合并**。需求与产品需求 Spec 不拆成两个确认环节。
 2. `PLANNING_IMPLEMENTATION_SPECS` 暂时保留兼容状态名，但语义已经明确为 Implementation Spec，不是产品 Spec。
-3. 三个规划角色可以复用同一个 `planner` Runtime，但职责、stage、prompt、schema、产物和确认关必须隔离：
-   - Product Requirements Analyst → `REQUIREMENTS.json`（同时包含角色、用户流程、业务规则、功能/异常行为和 AC）
-   - Architect → `ARCHITECTURE.json`
-   - Implementation Planner → `SPECS.json`
+3. 规划职责已拆成独立任务身份，不再都记为 `planner`：
+   - `requirements_analyst` → `REQUIREMENTS.json`（同时包含角色、用户流程、业务规则、功能/异常行为和 AC）
+   - `architect` → `ARCHITECTURE.json`
+   - `spec_writer` → `SPECS.json`
+   - Bug 和文档流程分别使用 `bug_analyst`、`documentation_planner`
+   历史 `planner` 配置仅用于旧项目兼容，新状态机不得继续引用。
 4. 当前代码中存在名为 `project_manager` 的辅助 Agent，但它**不是完整 Project Manager**。它只是无状态、只读的控制决策辅助 Agent，用于 project 已确定后的普通追问和受授权默认建议。
 5. 项目未确定时的聊天路由不能交给 LLM 猜测，必须由确定性 ConversationRouter 创建 conversation-scoped 选择交互。
 6. Planner/Coder/Tester/Reviewer/Acceptance Evaluator 已接入统一 QuestionInteraction；Project Manager 是控制辅助 Agent，其澄清由对话协调层处理，不应伪装成交付阶段。
@@ -141,7 +143,7 @@ Agent turn
 - `specs/schemas/agent_turn_output.json`
 - `specs/schemas/agent_question_batch.json`
 
-Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInteraction，并在回答后按 `resume_state` 创建原 Agent 的新轮次。Planner、Coder、Tester、Reviewer 已接入主执行链；Acceptance Evaluator 和控制决策辅助 Agent 走辅助调用路径，尚未完成同等 ask_user 闭环，不能对外宣称“所有 Agent 已全部支持”。真实飞书中仍需单独验证问题卡的下拉组件、自由文本回复和多轮追问。
+Orchestrator 会把业务 Agent 输出的 `question_batch` 转为 QuestionInteraction，先交给 Conversation Coordinator 基于 active confirmed facts 回答，只有事实不足时才升级用户；回答后按 `resume_state` 创建原 Agent 的新 attempt。Planner、Coder、Tester、Reviewer 和 Acceptance Evaluator 都使用这一协调闭环。问题卡选择、自由文本回复、多轮追问及恢复仍必须作为真实飞书回归场景持续验证。
 
 ## 6. 多聊天、多项目和中途消息
 
@@ -163,6 +165,10 @@ Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInt
 ### Runtime 与真实 E2E
 
 - Claude Code CLI 是工具执行唯一所有者；MAC Runtime 只观察 tool events，不重复执行 Write/Edit/Bash。
+- `RuntimeRouter` 已支持 Claude Code、Codex 和 Kimi Code；默认由 `agent_config.json` 按 Agent 选择，ZCode 因无 headless 协议仅登记不可调度状态。
+- 默认使用 Codex 做架构/Bug 分析/编码和只读主动黑盒验收，Claude Code 做需求/Spec/测试/Review、独立验收裁决、协调与 Project Manager。Kimi Code 已接入并可按 Agent 配置启用，但真实 E2E 既出现“全部证据通过且 failures 为空，同时 passed=false”的矛盾质量结论，也出现 Project Manager 请求超过 120 秒无响应，因此当前不承担默认生产角色。
+- 验收标准必须声明事实来源。系统可观察行为由 `acceptance_agent` 自己运行和操作，不得转嫁用户；只有偏好、授权和系统无法取得的外部事实可升级用户，并优先渲染为选择题。normal/night/auto 双重验收通过后自动交付，strict 保留人工终审。
+- 已绑定 Git 仓库不是特殊旁路：Agent 使用 `.mac/worktrees/{project_id}` 隔离工作并合并回原仓库，必须保留未在需求中授权修改的既有内容；真实飞书 `existing_repo_incremental` 场景持续验证该路径。
 - stream-json reader limit 提升到 16 MiB，修复 reject 后第二轮遇到大 Write event 静默卡住的问题。
 - 工具进度不向飞书泄露完整文件内容，只展示路径/长度摘要。
 - 已加入本地 NO_PROXY，避免本地网关请求被代理为 502。
@@ -197,15 +203,13 @@ Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInt
 ### 真实飞书 E2E 验证
 
 - **`bind_dir_agent` 场景**：覆盖 main 之前已在真实飞书跑通--Agent 返回 8 个候选、过滤后卡片正常渲染、点击回调正常。
-- **覆盖 main + 清理 .env 之后**：**尚未重新验证**。服务器已停，需要 `export FEISHU_TEST_MODE=1` 启动后重跑 `scripts/feishu_e2e.py --scenario bind_dir_agent`。
-- **`full_feature_flow`**：状态见 §9 P0，仍需在最新代码上重新验证。
+- **覆盖 main + 清理 .env 之后**：Session Binding 和 bind_dir 场景已验证；后续变更仍按 AGENTS.md 的两阶段验证纪律重跑受影响场景。
+- **`full_feature_flow`**：已在 2026-07-19 和 2026-07-22 的最新架构迭代中跑到 `COMPLETED`；每次状态机、卡片或协调协议变更后仍必须重跑。
 
 ### 已知问题（未修复）
 
-1. **ask_user 卡片在真实飞书未观测到**：代码已实现 `build_question_batch_card` 和 parent_id 回复路由，但尚未在真实飞书群验证下拉组件、按钮和自由文本回复的完整组合。
-2. **驳回后的两步回复卡尚未实现**：当前可用 `/reject <approval_id> <feedback>` 或点击驳回后发送反馈；目标交互是先发一张可回复的反馈卡，再决定回退。
-3. **目录绑定的群管理员角色仍未实现**：Control API 已要求 token，所有绑定入口已统一校验 `MAC_ALLOWED_BIND_ROOTS`；但多人群部署前仍应限制 `/bind` 为群管理员或系统 owner。
-4. **历史辅助脚本仍有用户路径硬编码**：`scripts/test_rejection_feedback_applied.py` 等旧调试脚本需后续改成从配置推导路径。
+1. **目录绑定的群管理员角色仍未实现**：Control API 已要求 token，所有绑定入口已统一校验 `MAC_ALLOWED_BIND_ROOTS`；但多人群部署前仍应限制 `/bind` 为群管理员或系统 owner。
+2. **历史辅助脚本仍有用户路径硬编码**：`scripts/test_rejection_feedback_applied.py` 等旧调试脚本需后续改成从配置推导路径。
 
 ## 9. 下一步工作（按优先级）
 
@@ -218,16 +222,16 @@ Orchestrator 已能把业务 Agent 输出的 `question_batch` 转为 QuestionInt
 5. 覆盖 Requirements/Architecture/Implementation Spec/质量门/Acceptance 的 reject 与 REWORK。
 6. 最终必须到 `COMPLETED`，并检查 `server.log` 无卡片发送、schema、reader 或数据库错误。
 
-### P0：验证 ask_user 卡片在真实飞书的渲染
+### P0：持续回归 ask_user 卡片的真实飞书渲染（已跑通）
 
 1. 触发一个 Agent ask_user（如 Requirements 阶段让 planner 输出 `question_batch`）。
 2. 确认 `build_question_batch_card` 生成的卡片在飞书正常渲染（`select_static` 下拉 + 按钮）。
 3. 确认「全部按推荐」「修改后提交」「跳过未答」三个按钮回调正常。
 
-### P0：统一业务 Agent ask_user（已实现，待 E2E 验证）
+### P0：统一业务 Agent ask_user（已实现并完成 E2E，持续回归）
 
 已实现：QuestionInteraction 模型 + CRUD + orchestrator 解析 + 卡片 + /input 路由 + 重启恢复 + qa_history 注入。
-待验证：S11 的 7 个场景真实飞书 E2E。
+当前协议增加 Coordinator 事实引用校验、密钥 Runtime 注入和多 pending clarification；对应场景需随每次相关变更持续回归。
 
 ### P1：ConversationInteraction（✅ 已实现）
 
@@ -350,5 +354,5 @@ grep -E "Failed to send|Traceback|database locked|schema|Runtime execution faile
 7. `specs/conversation_routing_spec.md`
 8. `specs/project_service_spec.md`
 9. `specs/feishu_bridge_spec.md`
-10. `specs/implementation_plan.md`
+10. `docs/history/implementation_plan_2026_07_12.md`（已归档：2026-07-12 P0/P1 已完成）
 11. `docs/reviews/2026-07-13-real-feishu-e2e-debugging-lessons.md`

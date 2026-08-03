@@ -387,7 +387,7 @@ def _make_progress_callback(self, project, task):
 
 ## 8. 事件解析
 
-### 7.1 文本消息
+### 8.1 文本消息
 
 ```json
 {
@@ -413,7 +413,7 @@ TextMessage(
 )
 ```
 
-### 7.2 按钮点击
+### 8.2 按钮点击
 
 ```json
 {
@@ -444,21 +444,21 @@ ButtonAction(
 
 本节只描述飞书侧交互；完整的聊天、用户、项目路由和权限规则以 `conversation_routing_spec.md` 为准。`project_users` 只表示权限，不再承担“当前消息属于哪个项目”的路由职责。
 
-### 8.1 创建项目时绑定
+### 9.1 创建项目时绑定
 
 - 从飞书创建项目时，把创建者 `open_id` 写入 `project_users` 表。
 
-### 8.2 后续绑定
+### 9.2 后续绑定
 
 - 用户通过菜单 **绑定到项目** → 选择项目 → 创建 `project_users` 记录。
 - 跨 chat 接入或接手他人项目走 admin API（如 `POST /admin/projects/{id}/bind-chat`），不再暴露文本命令。
 
-### 8.3 多用户
+### 9.3 多用户
 
 - `project_users` 表支持多对多。
 - MVP 阶段主要由创建者操作。
 
-### 8.4 多聊天与多项目
+### 9.4 多聊天与多项目
 
 - 一个聊天可以关联多个项目，一个项目可以关联多个聊天。
 - 自由文本根据 `(chat_id, open_id)` 的 active project 路由，不使用用户最近更新项目。
@@ -493,7 +493,7 @@ ButtonAction(
 - Agent 运行期间的自由文本必须回复“已保存、稍后处理”，并写入持久化 pending_user_inputs，不能只存在 WebSocket 处理线程内。
 - pending input/confirmation 状态下的自然语言必须绑定明确 approval_id；若用户有多个项目或多个候选审批，先让用户选择，禁止猜测。
 
-### 8.5 Agent 主动提问卡（Grill-Me）
+### 10.1 Agent 主动提问卡（Grill-Me）
 
 所有 Agent 都可以发送主动提问卡。卡片必须包含 Agent/阶段/轮次、问题与原因、blocking 和默认行为、2–5 个选项及推荐理由、自由文本入口，以及“采用推荐项”“接受默认假设并继续”“暂停/取消”等操作。
 

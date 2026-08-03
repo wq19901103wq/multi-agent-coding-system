@@ -123,6 +123,17 @@ class StateMachine:
 
             for event, target in stage.get("routes", {}).items():
                 execution["next_states"][event] = self._resolve_target(target, stage_by_id)
+            # Coordinator is the sole internal router.  Give it deterministic,
+            # schema-addressable routes between workflow stages so an Agent can
+            # report "the upstream artifact must change" without asking the user
+            # the same question repeatedly or retrying the wrong Agent forever.
+            for target_stage in stages:
+                if target_stage["id"] == stage["id"]:
+                    continue
+                execution["next_states"].setdefault(
+                    f"route_to_{target_stage['id']}",
+                    target_stage["execution_state"],
+                )
             states[execution_name] = execution
 
             confirmation_events = {
@@ -234,6 +245,27 @@ class StateMachine:
     def available_events(self, current: str) -> list[str]:
         state = self.get_state(current)
         return list(state.get("next_states", {}).keys())
+
+    def route_event_to_stage(self, current: str, target_stage: str) -> str | None:
+        """Return a valid event that routes ``current`` to a profile stage."""
+        target = next(
+            (
+                stage["execution_state"]
+                for stage in self._profile.get("stages", [])
+                if stage.get("id") == target_stage
+            ),
+            None,
+        )
+        if target is None:
+            return None
+        next_states = self.get_state(current).get("next_states", {})
+        preferred = f"route_to_{target_stage}"
+        if next_states.get(preferred) == target:
+            return preferred
+        return next(
+            (event for event, next_state in next_states.items() if next_state == target),
+            None,
+        )
 
     def is_terminal(self, name: str) -> bool:
         return self.state_type(name) == "terminal"

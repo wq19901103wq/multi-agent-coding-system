@@ -19,7 +19,7 @@ from typing import Any
 
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.agents.prompts import PromptRenderer
-from mac_system.agents.runtime import ClaudeCodeRuntime
+from mac_system.agents.runtime import build_agent_runtime
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
@@ -35,11 +35,6 @@ from mac_system.feishu.handlers import (
 from mac_system.feishu.models import ButtonAction, TextMessage
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logger.addHandler(_handler)
-    logger.setLevel(logging.INFO)
 
 
 _bot_open_id: str | None = None
@@ -88,12 +83,17 @@ class FeishuWebSocketClient:
         self.settings = get_settings()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        # Serialize handling of all events from the same user so that
-        # WebSocket messages/cards are processed in the order they were sent.
+        # Opportunistically serialize ordinary turns from the same user.  A
+        # turn may launch a multi-minute Agent run, so later turns must be
+        # allowed through when this lock is already busy; durable interaction
+        # and approval records provide the authoritative idempotency boundary.
         self._user_locks: dict[str, threading.Lock] = {}
         # Watermarks for rejecting buffered/old events after startup or reconnect.
         self._started_at = datetime.utcnow()
         self._last_disconnect_at: datetime | None = None
+        self._project_workers: set[str] = set()
+        self._project_worker_pending: set[str] = set()
+        self._project_worker_lock = threading.Lock()
 
     def start(self) -> None:
         if "PYTEST_CURRENT_TEST" in os.environ:
@@ -320,15 +320,16 @@ class FeishuWebSocketClient:
             logger.exception("Failed to persist Feishu event log")
 
     async def _handle_message(self, msg: TextMessage, event_id: str | None = None) -> None:
-        # A cancellation command must be able to interrupt a long-running
-        # handler from the same user. Other messages remain strictly ordered.
+        # A cancellation command must always be able to interrupt a long-running
+        # handler.  Ordinary turns take the per-user lock only when it is free:
+        # once a prior turn launches an Agent, later status questions,
+        # corrections, and unrelated questions must keep the chat responsive.
         normalized_text = _strip_mention_placeholders(msg.text or "")
         is_priority_cancel = normalized_text == "/cancel" or normalized_text.startswith(
             "/cancel "
         )
         lock = None if is_priority_cancel else self._user_lock(msg.open_id)
-        if lock:
-            await asyncio.to_thread(lock.acquire)
+        lock_acquired = bool(lock and lock.acquire(blocking=False))
         try:
             logger.info(
                 "[Feishu WS] raw message chat_type=%s chat_id=%s sender=%s mentions=%s text=%r",
@@ -445,19 +446,15 @@ class FeishuWebSocketClient:
                 detail=str(exc)[:500],
             )
         finally:
-            if lock:
+            if lock_acquired and lock:
                 lock.release()
 
     async def _handle_card_action(self, action: ButtonAction, event_id: str | None = None) -> dict[str, Any] | None:
-        # Selection clicks and conversation actions are protected by their own
-        # deterministic idempotency/atomic-claim logic. Do not queue a repeated
-        # confirmation behind the first action's potentially long Agent tick;
-        # it must return an immediate "already processing" receipt.
-        lock_free_actions = {"select_question_option", "conversation_action"}
-        use_lock = action.action not in lock_free_actions
-        lock = self._user_lock(action.open_id) if use_lock else None
-        if lock:
-            await asyncio.to_thread(lock.acquire)
+        # Card actions are idempotently claimed by their Approval/Interaction
+        # records.  They must not hold the per-user text-message lock: a
+        # confirmation can launch a multi-minute Agent tick, during which the
+        # user still needs to query status, add a correction, or cancel.
+        lock = None
         try:
             async with self._handler_context() as ctx:
                 service = getattr(ctx, "service", None)
@@ -572,7 +569,54 @@ class FeishuWebSocketClient:
 
     def _handler_context(self, msg: TextMessage | None = None) -> Any:
         """Return an async context manager that builds handler dependencies."""
-        return _WsHandlerContext(self.settings, msg)
+        return _WsHandlerContext(
+            self.settings,
+            msg,
+            background_scheduler=self._schedule_project_tick,
+        )
+
+    def _schedule_project_tick(self, project_id: str) -> None:
+        """Run durable project work outside the short-lived message callback.
+
+        One worker owns a project at a time.  Repeated level-triggered wakeups
+        are coalesced into one pending rerun, so a state change that races with
+        worker shutdown cannot leave an active project without an Agent task.
+        """
+        with self._project_worker_lock:
+            if project_id in self._project_workers:
+                self._project_worker_pending.add(project_id)
+                return
+            self._project_workers.add(project_id)
+
+        def runner() -> None:
+            worker_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(worker_loop)
+
+            async def run_until_boundary() -> None:
+                async with _WsHandlerContext(
+                    self.settings,
+                    background_scheduler=self._schedule_project_tick,
+                ) as ctx:
+                    await ctx.orchestrator.tick_until_stable(project_id, max_ticks=50)
+
+            try:
+                worker_loop.run_until_complete(run_until_boundary())
+            except Exception:
+                logger.exception("Project background worker failed for %s", project_id)
+            finally:
+                worker_loop.close()
+                with self._project_worker_lock:
+                    self._project_workers.discard(project_id)
+                    rerun = project_id in self._project_worker_pending
+                    self._project_worker_pending.discard(project_id)
+                if rerun and not self._stop_event.is_set():
+                    self._schedule_project_tick(project_id)
+
+        threading.Thread(
+            target=runner,
+            name=f"mac-project-{project_id[-12:]}",
+            daemon=True,
+        ).start()
 
     async def inject_text_message(
         self, msg: TextMessage, event_id: str | None = None
@@ -595,9 +639,16 @@ class FeishuWebSocketClient:
 class _WsHandlerContext:
     """Async context manager that creates a fresh handler context per event."""
 
-    def __init__(self, settings: Any, msg: TextMessage | None = None) -> None:
+    def __init__(
+        self,
+        settings: Any,
+        msg: TextMessage | None = None,
+        *,
+        background_scheduler: Any = None,
+    ) -> None:
         self.settings = settings
         self.msg = msg
+        self.background_scheduler = background_scheduler
         self._scope = None
 
     async def __aenter__(self) -> FeishuHandlerContext:
@@ -612,25 +663,16 @@ class _WsHandlerContext:
         )
         service = ProjectService(self.session)
         worktree_manager = WorktreeManager(self.settings.projects_dir)
-        runtime = ClaudeCodeRuntime(
-            claude_bin=self.settings.claude_bin,
-            anthropic_api_key=self.settings.anthropic_api_key,
-            anthropic_auth_token=self.settings.anthropic_auth_token,
-            claude_model=self.settings.claude_model,
-            anthropic_base_url=self.settings.anthropic_base_url,
-            anthropic_default_opus_model=self.settings.anthropic_default_opus_model,
-            anthropic_default_sonnet_model=self.settings.anthropic_default_sonnet_model,
-            anthropic_default_haiku_model=self.settings.anthropic_default_haiku_model,
-            claude_code_effort_level=self.settings.claude_code_effort_level,
-            api_timeout_ms=self.settings.api_timeout_ms,
-        )
-        renderer = PromptRenderer(get_agent_config())
+        agent_config = get_agent_config()
+        runtime = build_agent_runtime(self.settings, agent_config)
+        renderer = PromptRenderer(agent_config)
         orchestrator = AgentOrchestrator(
             service,
             worktree_manager,
             runtime,
             renderer,
             feishu_bridge=bridge,
+            background_scheduler=self.background_scheduler,
         )
         self._bridge = bridge
         return FeishuHandlerContext(

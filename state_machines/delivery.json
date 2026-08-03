@@ -34,6 +34,7 @@
       "display": "等待验收",
       "next_states": {
         "confirm": "MERGING",
+        "retry": "ACCEPTANCE_PENDING",
         "reject": "REWORK",
         "ask_user": "ACCEPTANCE_INPUT_PENDING"
       }

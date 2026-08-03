@@ -2,33 +2,68 @@
 
 from __future__ import annotations
 
-import asyncio
 import threading
+import asyncio
 from typing import Any, Coroutine
 
 
-class ProjectLockManager:
-    """Manage asyncio locks keyed by project_id and event loop.
+class _CrossLoopAsyncLock:
+    """Async context adapter around one process-wide threading lock."""
 
-    Locks are tied to the event loop that acquires them.  This avoids issues
-    when the same process is used by multiple event loops (e.g. FastAPI
-    TestClient or multi-threaded servers) while still serializing ticks for
-    the same project within a single loop.
+    def __init__(self, lock: threading.Lock) -> None:
+        self._lock = lock
+        self._acquired = False
+
+    async def __aenter__(self) -> "_CrossLoopAsyncLock":
+        # Cancelling ``asyncio.to_thread(lock.acquire)`` does not cancel the
+        # underlying blocking call. It may acquire later after the coroutine
+        # has disappeared, leaking the process-wide project lock forever.
+        # Shield the acquisition and attach a compensating release when its
+        # waiter is cancelled.
+        acquisition = asyncio.create_task(asyncio.to_thread(self._lock.acquire))
+        try:
+            await asyncio.shield(acquisition)
+        except asyncio.CancelledError:
+            def release_orphan(completed: asyncio.Task) -> None:
+                if completed.cancelled():
+                    return
+                try:
+                    acquired = bool(completed.result())
+                except Exception:
+                    return
+                if acquired:
+                    self._lock.release()
+
+            acquisition.add_done_callback(release_orphan)
+            raise
+        self._acquired = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._acquired:
+            self._acquired = False
+            self._lock.release()
+
+
+class ProjectLockManager:
+    """Serialize project ticks across every event loop in this process.
+
+    Feishu WebSocket handling and FastAPI control requests run on different
+    threads/event loops. Per-loop asyncio locks therefore allowed the same
+    project to start duplicate Coder/Reviewer/Acceptance tasks. A threading
+    lock is the correct process-wide ownership primitive; the adapter keeps
+    acquisition non-blocking for each event loop.
     """
 
     def __init__(self) -> None:
-        self._locks: dict[int, dict[str, asyncio.Lock]] = {}
+        self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
 
-    async def acquire(self, project_id: str) -> asyncio.Lock:
-        """Return the lock for ``project_id`` on the current loop."""
-        loop = asyncio.get_running_loop()
-        loop_id = id(loop)
+    async def acquire(self, project_id: str) -> _CrossLoopAsyncLock:
+        """Return a cross-loop async adapter for ``project_id``."""
         with self._guard:
-            locks = self._locks.setdefault(loop_id, {})
-            if project_id not in locks:
-                locks[project_id] = asyncio.Lock()
-            return locks[project_id]
+            lock = self._locks.setdefault(project_id, threading.Lock())
+        return _CrossLoopAsyncLock(lock)
 
     async def run_locked(self, project_id: str, coro: Coroutine[Any, Any, Any]) -> Any:
         """Run ``coro`` while holding the project lock."""

@@ -9,7 +9,7 @@ from sqlmodel import Session
 
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.agents.prompts import PromptRenderer
-from mac_system.agents.runtime import ClaudeCodeRuntime
+from mac_system.agents.runtime import build_agent_runtime
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
 from mac_system.core.worktree_manager import WorktreeManager
@@ -42,19 +42,9 @@ def _build_orchestrator(session: Session) -> AgentOrchestrator:
     settings = get_settings()
     service = ProjectService(session)
     worktree_manager = WorktreeManager(settings.projects_dir)
-    runtime = ClaudeCodeRuntime(
-        claude_bin=settings.claude_bin,
-        anthropic_api_key=settings.anthropic_api_key,
-        anthropic_auth_token=settings.anthropic_auth_token,
-        claude_model=settings.claude_model,
-        anthropic_base_url=settings.anthropic_base_url,
-        anthropic_default_opus_model=settings.anthropic_default_opus_model,
-        anthropic_default_sonnet_model=settings.anthropic_default_sonnet_model,
-        anthropic_default_haiku_model=settings.anthropic_default_haiku_model,
-        claude_code_effort_level=settings.claude_code_effort_level,
-        api_timeout_ms=settings.api_timeout_ms,
-    )
-    renderer = PromptRenderer(get_agent_config())
+    agent_config = get_agent_config()
+    runtime = build_agent_runtime(settings, agent_config)
+    renderer = PromptRenderer(agent_config)
     bridge = None
     if settings.feishu_app_id and settings.feishu_app_secret:
         bridge = FeishuBridge(

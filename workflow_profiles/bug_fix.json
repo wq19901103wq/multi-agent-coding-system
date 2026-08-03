@@ -4,7 +4,7 @@
   "description": "Bug 修复流程",
   "stages": [
     {
-      "id": "analysis", "kind": "planning", "execution_state": "BUG_ANALYSIS", "agent": "planner", "stage": "bug_analysis", "display": "Bug 分析中",
+      "id": "analysis", "kind": "planning", "execution_state": "BUG_ANALYSIS", "agent": "bug_analyst", "stage": "bug_analysis", "display": "Bug 分析中",
       "inputs": [{"state": "BUG_FIX_INPUT_PENDING", "display": "等待 Bug 分析澄清", "default": true}],
       "confirmation": {"state": "BUG_FIX_CONFIRM_PENDING", "display": "等待确认修复方案", "subject": "修复方案"}
     },

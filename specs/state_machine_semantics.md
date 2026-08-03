@@ -164,6 +164,8 @@ reject 必须按确认节点类型分流，不能用同一条“先消费 approv
 - 系统原子 resolve approval(reject) 并进入 `REWORK`。
 - 进入 `REWORK` 后必须立即且仅创建一次 REWORK approval/选择卡；不得回复“请直接输入修改意见”后停住。
 - 可选反馈若随命令到达则在同一事务创建；若稍后补充，则绑定当前 REWORK 和来源 Task，但不阻止回退选择卡出现。
+- Acceptance 先由只读 `acceptance_agent` 从真实入口主动黑盒验证，再由独立 `acceptance_evaluator` 复核证据。normal/night/auto 证据完整且均判定通过时自动进入 `MERGING`；strict 保留人工终审。
+- `system_observable` 验收项不得要求用户代测。只有 `user_preference`、`authorization`、`external_fact` 可以进入用户问题交互，并优先使用选择题。
 
 **推进不变量**
 
@@ -305,6 +307,8 @@ Agent：`reviewer`
 
 > 用户驳回时，系统通过 `acceptance_evaluator` 或 `project_manager` Agent 生成根因分析，推荐回退阶段，但最终由用户选择。
 
+非 strict 模式若主动验收与独立评估均通过，系统以 `system_auto` 触发 `confirm`；仍会发送验收证据汇报卡，但不发送多余确认卡。strict 模式以及确有外部输入缺口时继续保留人工边界。
+
 ### `MERGING`
 
 - **事件**：`complete`
@@ -352,16 +356,20 @@ Agent：`reviewer`
    - 状态名在 `require_confirmation_for` 列表中；或
    - 状态类型在 `require_confirmation_for_types` 列表中（如 `human_confirmation`、`human_input`）。
 3. 若当前状态不需要确认：
-   - `human_confirmation`：只有非禁止节点且前置 Agent 结果为 pass 时才能触发 `confirm`；`REWORK`、`ACCEPTANCE_PENDING`、quality fail 和存在未消费用户输入时不得自动处理。
+   - 规划 `human_confirmation`：调用 `conversation_coordinator`（Codex）读取阶段产物并选择 confirm/reject；无证据或依赖用户偏好、授权、外部事实时升级用户。
+   - 质量 `human_confirmation`：只有对应专业 Agent 已给出有效 pass 时自动 confirm；fail 必须进入 `REWORK`，Coordinator 不得自审改判。
+   - `REWORK`：存在 blocking feedback 的合法 `recommended_rework_target` 时按最新证据自动回退；没有可追溯建议才升级用户。
+   - `ACCEPTANCE_PENDING`：Acceptance Agent 与 Evaluator 证据充分且 pass 时自动交付；只有外部证据缺口才等待用户。
    - `human_input`（如 `CLARIFICATION_PENDING`）：
-     - 调用 `project_manager` Agent 基于上下文生成默认回答
+     - 调用 `conversation_coordinator` 基于确认事实和产物尝试回答
      - 以 `answer` 事件推进
-     - 记录 `auto_resolved` 决策日志
+     - 无法可靠回答且属于用户偏好、授权或外部事实时才发送用户问题
 
 ### `auto_resolve_strategy`
 
 - `none`：不自动决策，必须人工确认。
-- `project_manager_default`：由 `project_manager` Agent 生成默认回答/选择。
+- `conversation_coordinator`：由 Codex Coordinator 基于项目证据回答或审批；不得冒充用户。
+- `project_manager_default`：旧项目兼容策略；新项目不再使用。
 
 ## 夜间模式
 

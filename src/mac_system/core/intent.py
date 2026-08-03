@@ -1,41 +1,15 @@
-"""Intent router for classifying natural-language descriptions into task types.
+"""Project naming and the deterministic default for explicit ``/create``.
 
-The classifier decides which state machine (feature / bug_fix / documentation)
-should handle a user's free-form project description. This is intentionally a
-rule-based MVP implementation; the interface is stable enough to swap in an
-LLM-based classifier later without changing callers.
+Natural-language intent belongs to the Conversation Coordinator. This module
+must not infer task type from words in a user description. Explicit command
+options remain authoritative; an untyped ``/create`` uses the common delivery
+profile's neutral ``feature`` entry point.
 """
 
 from __future__ import annotations
 
-import re
-
-from mac_system.config import get_settings
 from mac_system.models import RouteDecision
 from mac_system.state_machine import StateMachine
-
-
-def _contains_word(text: str, word: str) -> bool:
-    """Case-insensitive whole-word or token match.
-
-    For English tokens we require a word boundary so that ``bug`` does not
-    match ``debug``. For Chinese keywords the substring check is sufficient.
-    Mixed tokens like ``agents.md`` are treated as atomic.
-    """
-    lowered = text.lower()
-    word_lower = word.lower()
-
-    # Pure ASCII tokens: use regex word boundary.
-    if word.isascii():
-        pattern = r"(?:^|[^a-z0-9_.])" + re.escape(word_lower) + r"(?:$|[^a-z0-9_.])"
-        return re.search(pattern, lowered) is not None
-
-    # Chinese / mixed tokens: substring match.
-    return word_lower in lowered
-
-
-def _any_word(text: str, words: list[str]) -> bool:
-    return any(_contains_word(text, w) for w in words)
 
 
 def _extract_name(description: str, max_length: int = 30) -> str:
@@ -56,104 +30,29 @@ def _extract_name(description: str, max_length: int = 30) -> str:
     return truncated.strip(".。,，!！?？")
 
 
-# Keyword sets. Order matters: we check bug_fix, then documentation, then feature.
-BUG_FIX_STARTERS = [
-    "bug",
-    "修复",
-    "报错",
-    "异常",
-    "崩溃",
-    "不工作",
-    "回归",
-    "fix",
-]
-
-DOCUMENTATION_STARTERS = [
-    "文档",
-    "readme",
-    "agents.md",
-    "说明文档",
-    "写一份",
-]
-
-FEATURE_EXPLICIT_STARTERS = [
-    "实现",
-    "开发",
-    "新功能",
-    "功能需求",
-    "feature",
-]
-
-FEATURE_FALLBACK_HINTS = [
-    "新增",
-    "加一个",
-    "支持",
-]
-
-# Confidence levels. Explicit starters (bug/doc/strong feature signals) are
-# trusted above the high threshold. Feature fallback hints are ambiguous enough
-# that we ask the user to confirm the inferred task type.
 CONFIDENCE_EXPLICIT = 0.85
-CONFIDENCE_FALLBACK = 0.75
-CONFIDENCE_UNCOVERED = 0.4
 
 
 class IntentRouter:
-    """Rule-based demand classifier."""
+    """Backward-compatible deterministic router for explicit ``/create``."""
 
     def __init__(
         self,
         high_threshold: float | None = None,
         low_threshold: float | None = None,
     ):
-        settings = get_settings()
-        self.high_threshold = high_threshold if high_threshold is not None else settings.intent_high_threshold
-        self.low_threshold = low_threshold if low_threshold is not None else settings.intent_low_threshold
+        self.high_threshold = high_threshold
+        self.low_threshold = low_threshold
 
     def route_demand(self, description: str) -> RouteDecision:
-        """Classify ``description`` and return a routing decision."""
-        task_type: str | None = None
-        confidence = CONFIDENCE_UNCOVERED
-        reason: str | None = None
-
-        if _any_word(description, BUG_FIX_STARTERS):
-            task_type = "bug_fix"
-            confidence = CONFIDENCE_EXPLICIT
-            reason = "命中 bug 修复关键词"
-        elif _any_word(description, DOCUMENTATION_STARTERS):
-            task_type = "documentation"
-            confidence = CONFIDENCE_EXPLICIT
-            reason = "命中文档关键词"
-        elif _any_word(description, FEATURE_EXPLICIT_STARTERS):
-            task_type = "feature"
-            confidence = CONFIDENCE_EXPLICIT
-            reason = "命中功能开发强关键词"
-        elif _any_word(description, FEATURE_FALLBACK_HINTS):
-            task_type = "feature"
-            confidence = CONFIDENCE_FALLBACK
-            reason = "命中功能开发弱关键词"
-        else:
-            reason = "未匹配到已知任务类型关键词"
-
-        initial_state: str | None = None
-        if task_type is not None:
-            try:
-                initial_state = StateMachine(task_type).initial_state
-            except FileNotFoundError:
-                # Unknown task_type should not happen with the hard-coded sets
-                # above, but keep the decision safe.
-                task_type = None
-                initial_state = None
-                confidence = CONFIDENCE_UNCOVERED
-                reason = "对应的状态机不存在"
-
-        needs_disambiguation = self.low_threshold <= confidence < self.high_threshold
+        """Return the neutral common workflow without inspecting description."""
+        task_type = "feature"
         return RouteDecision(
             task_type=task_type,
-            initial_state=initial_state,
-            confidence=confidence,
-            needs_disambiguation=needs_disambiguation,
-            reason=reason,
+            initial_state=StateMachine(task_type).initial_state,
+            confidence=1.0,
+            needs_disambiguation=False,
+            reason="未显式指定类型，使用统一交付流程",
         )
 
 

@@ -47,6 +47,9 @@ def eprint(msg: str) -> None:
 
 ID_RE = re.compile(r"\b(proj_[a-zA-Z0-9_]+)\b")
 APPROVAL_RE = re.compile(r"\b(appr_[a-zA-Z0-9_]+)\b")
+BIND_DIR_INTERACTION_RE = re.compile(
+    r"bind_dir_for_create_(?:skip|select)|(?:选择|绑定).{0,24}目录|系统工作区"
+)
 
 
 def extract_project_id(text: str) -> str | None:
@@ -59,8 +62,19 @@ def extract_approval_id(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _is_bind_dir_interaction(text: str) -> bool:
+    """Recognize the interaction contract across card copy/schema versions."""
+    return BIND_DIR_INTERACTION_RE.search(text) is not None
+
+
 def _extract_message_text(content: dict[str, Any]) -> str:
-    """Extract searchable text from text or interactive card content."""
+    """Extract searchable text and callback metadata from a Feishu message.
+
+    Opaque approval ids intentionally stay out of the user-facing card body,
+    but a real button click still carries one in its callback value.  The E2E
+    simulator needs to read that structured value to emulate the click; it
+    must not depend on the id also being rendered as visible prose.
+    """
     if "text" in content:
         return content["text"]
     parts: list[str] = []
@@ -71,6 +85,13 @@ def _extract_message_text(content: dict[str, Any]) -> str:
             for k, v in obj.items():
                 if k in _TEXT_KEYS and isinstance(v, str):
                     parts.append(v)
+                elif k == "approval_id" and isinstance(v, str) and v:
+                    parts.append(f"审批ID：{v}")
+                elif k == "option_key" and isinstance(v, str) and v:
+                    # Button callback metadata is the stable contract for an
+                    # interaction.  Visible card copy is deliberately free to
+                    # evolve and must not be the simulator's only selector.
+                    parts.append(f"动作：{v}")
                 else:
                     collect(v)
         elif isinstance(obj, list):
@@ -355,6 +376,20 @@ class MacApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def get_project_cards(self, project_id: str) -> list[dict[str, Any]]:
+        if self.dry_run:
+            return []
+        resp = await self._client.get(f"{self.base_url}/test/projects/{project_id}/cards")
+        resp.raise_for_status()
+        return list(resp.json().get("items") or [])
+
+    async def get_feishu_event(self, message_id: str) -> dict[str, Any]:
+        if self.dry_run:
+            return {"found": True, "status": "processed", "open_id": "ou_dryrun"}
+        resp = await self._client.get(f"{self.base_url}/test/feishu/events/{message_id}")
+        resp.raise_for_status()
+        return resp.json()
+
 
 @dataclass
 class ScenarioContext:
@@ -551,7 +586,26 @@ async def send_feishu_text(ctx: ScenarioContext, text: str) -> str | None:
         eprint(f"  [dry-run] send: {text}")
         return None
     assert ctx.sim is not None
-    return await ctx.sim.send_text(text)
+    message_id = await ctx.sim.send_text(text)
+    if ctx.args.scenario == "full_feature_flow":
+        # The message POST only proves Feishu accepted the user's message. Wait
+        # until MAC durably finishes the WS callback before reading the next
+        # approval; otherwise the driver can mistake the previous pending card
+        # for a newly generated one after reject/confirm.
+        deadline = time.monotonic() + 2700.0
+        while time.monotonic() < deadline:
+            receipt = await ctx.mac.get_feishu_event(message_id)
+            status = str(receipt.get("status") or "")
+            if receipt.get("found") and status == "processed":
+                return message_id
+            if receipt.get("found") and status == "error":
+                raise RuntimeError(
+                    f"MAC failed to process Feishu message {message_id}: "
+                    f"{receipt.get('detail') or 'unknown error'}"
+                )
+            await asyncio.sleep(1.0)
+        raise RuntimeError(f"MAC did not finish Feishu message {message_id}")
+    return message_id
 
 
 async def ensure_ws_ready(ctx: ScenarioContext, timeout: float = 90.0) -> None:
@@ -567,20 +621,16 @@ async def ensure_ws_ready(ctx: ScenarioContext, timeout: float = 90.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         msg_id = await ctx.sim.send_text("/whoami")
-        reply = await ctx.sim.wait_for_reply(
-            pattern=r"你的 open_id",
-            after_message_id=msg_id,
-            timeout=10.0,
-            interval=1.0,
-        )
-        if reply is not None:
-            match = re.search(r"你的 open_id 是：(\S+)", reply.text)
-            if match:
-                mac_open_id = match.group(1)
-                if mac_open_id != ctx.args.open_id:
+        receipt_deadline = min(deadline, time.monotonic() + 12.0)
+        while time.monotonic() < receipt_deadline:
+            receipt = await ctx.mac.get_feishu_event(msg_id)
+            if receipt.get("found") and receipt.get("status") == "processed":
+                mac_open_id = str(receipt.get("open_id") or "")
+                if mac_open_id and mac_open_id != ctx.args.open_id:
                     eprint(f"  [info] using MAC-context open_id: {mac_open_id}")
                     ctx.args.open_id = mac_open_id
-            return
+                return
+            await asyncio.sleep(1.0)
         eprint("  [warn] WS not ready, retrying ping...")
         await asyncio.sleep(2.0)
     raise RuntimeError(f"MAC bot did not respond to WS ping within {timeout}s")
@@ -598,53 +648,34 @@ async def feishu_create_project(ctx: ScenarioContext, text: str) -> str:
     if ctx.dry_run:
         return "proj_dryrun_000"
     assert ctx.sim is not None
-    reply = await ctx.sim.wait_for_reply(
-        pattern=r"已创建项目|确认任务类型|正在根据需求描述查找|选择要绑定的目录",
-        after_message_id=msg_id,
-        timeout=120.0,
-    )
-    if reply is None:
-        raise RuntimeError("MAC bot did not reply with project creation")
-    # Natural-language descriptions may trigger an intent confirmation card.
-    if "确认任务类型" in reply.text:
-        for t in ("feature", "bug_fix", "documentation"):
-            if t in reply.text:
-                await inject_action(
-                    ctx,
-                    open_id=ctx.args.open_id,
-                    approval_id="",
-                    action="menu",
-                    option_key=f"intent_confirm:{t}",
-                )
-                break
-        reply = await ctx.sim.wait_for_reply(
-            pattern=r"已创建项目|正在根据需求描述查找|选择要绑定的目录",
-            after_message_id=reply.message_id,
-            timeout=120.0,
-        )
-        if reply is None:
-            raise RuntimeError("MAC bot did not reply after intent confirmation")
-    # bind_dir recommendation: skip to use system workspace.
-    if "选择要绑定的目录" in reply.text or "正在根据需求描述查找" in reply.text:
-        await inject_action(
-            ctx,
-            open_id=ctx.args.open_id,
-            approval_id="",
-            action="menu",
-            option_key="bind_dir_for_create_skip",
-        )
-        reply = await ctx.sim.wait_for_reply(
-            pattern=r"已创建项目",
-            after_message_id=reply.message_id,
-            timeout=120.0,
-        )
-        if reply is None:
-            raise RuntimeError("MAC bot did not create project after skipping bind_dir")
-    project_id = extract_project_id(reply.text)
-    if not project_id:
-        raise RuntimeError(f"Could not extract project_id from reply: {reply.text!r}")
-    eprint(f"  created project {project_id}")
-    return project_id
+    # CardKit 2.0 message history returns only a client-upgrade placeholder,
+    # so creation is correlated through the durable inbound-event receipt.
+    # The message itself still travels through real Feishu, and later checks
+    # require provider message ids for the resulting cards.
+    deadline = time.monotonic() + 180.0
+    bind_dir_skipped = False
+    while time.monotonic() < deadline:
+        receipt = await ctx.mac.get_feishu_event(msg_id)
+        project_id = str(receipt.get("project_id") or "")
+        if project_id:
+            eprint(f"  created project {project_id}")
+            return project_id
+        if (
+            receipt.get("pending_intent_stage") == "awaiting_bind_dir_for_create"
+            and not bind_dir_skipped
+        ):
+            await inject_action(
+                ctx,
+                open_id=ctx.args.open_id,
+                approval_id="",
+                action="menu",
+                option_key="bind_dir_for_create_skip",
+            )
+            bind_dir_skipped = True
+        if receipt.get("status") == "error":
+            raise RuntimeError(f"MAC failed to process project creation: {receipt}")
+        await asyncio.sleep(1.0)
+    raise RuntimeError("MAC did not correlate the Feishu message with a new project")
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +691,78 @@ async def scenario_p2p_create(ctx: ScenarioContext) -> None:
     if status is None:
         raise RuntimeError("Project did not reach REQUIREMENT_CONFIRM_PENDING")
     eprint(f"  reached {status['current_state']}")
+
+
+async def scenario_agent_loop_delivery(ctx: ScenarioContext) -> None:
+    """Drive the native Coordinator loop through the real Feishu p2p UI."""
+    eprint("Scenario: agent_loop_delivery")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    anchor = await ctx.sim.send_text("/whoami")
+    project_id = await feishu_create_project(
+        ctx,
+        (
+            "/create --type=feature 创建一个最小 Python CLI：运行 `python -m hello_loop` "
+            "必须输出 `hello-loop`；补自动化测试。实现后从真实命令入口独立验证。"
+        ),
+    )
+    deadline = time.monotonic() + 900.0
+    status: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        status = await ctx.mac.get_status(project_id)
+        eprint(
+            f"  [agent-loop] lifecycle={status.get('status')} "
+            f"posture={status.get('execution_status')}"
+        )
+        if status.get("status") == "completed":
+            break
+        if status.get("status") in {"failed", "cancelled"}:
+            raise RuntimeError(f"agent-loop project terminated: {status}")
+        await asyncio.sleep(3.0)
+    if not status or status.get("status") != "completed":
+        raise RuntimeError(f"agent-loop project did not complete: {status}")
+    if status.get("display") != "交付完成":
+        raise RuntimeError(f"completed project has inconsistent visible status: {status}")
+    if status.get("pending_approval"):
+        raise RuntimeError("completed agent-loop project still has a pending approval")
+
+    completion = await ctx.sim.wait_for_reply(
+        pattern=r"已完成|hello-loop",
+        after_message_id=anchor,
+        timeout=120.0,
+    )
+    if completion is None:
+        raise RuntimeError("Feishu did not receive a completion/result card")
+    cards = await ctx.mac.get_project_cards(project_id)
+    if not any(
+        card.get("lifecycle_status") == "published"
+        and card.get("card_kind") in {"report", "progress"}
+        for card in cards
+    ):
+        raise RuntimeError(f"no published report projection for agent-loop: {cards}")
+    agent_cards = [
+        card for card in cards
+        if card.get("subject_type") == "coordinator_agent"
+    ]
+    if len(agent_cards) < 2 or any(
+        not card.get("provider_message_id")
+        or card.get("lifecycle_status") != "completed"
+        for card in agent_cards
+    ):
+        raise RuntimeError(
+            f"Coordinator agent cards are missing or out of sync: {agent_cards}"
+        )
+
+    status_message_id = await send_feishu_text(ctx, f"/status {project_id}")
+    status_card = await ctx.sim.wait_for_reply(
+        pattern=r"项目状态|交付完成|COMPLETED",
+        after_message_id=status_message_id,
+        timeout=120.0,
+    )
+    if status_card is None:
+        raise RuntimeError("Feishu status card was not observable after completion")
+    eprint(f"  completed native agent-loop project {project_id}")
 
 
 async def scenario_p2p_create_with_type(ctx: ScenarioContext) -> None:
@@ -1011,7 +1114,7 @@ async def scenario_bind_dir_agent(ctx: ScenarioContext) -> None:
     """16. Test /bind (no-args) and /create agent-recommended bind dir flow.
 
     Requires MAC_ALLOWED_BIND_ROOTS to be configured. Verifies:
-    1. /bind (no-args) triggers project_manager agent and shows candidate card.
+    1. /bind (no-args) deterministically discovers repos and shows a candidate card.
     2. /create <description> triggers agent recommendation and shows pick card.
     3. Clicking 'skip' on the pick card creates the project with system workspace.
     """
@@ -1059,6 +1162,14 @@ async def scenario_bind_dir_agent(ctx: ScenarioContext) -> None:
         )
         if reply2 is None:
             raise RuntimeError("MAC bot did not send pick card after agent scan")
+    if "已创建项目" in reply2.text:
+        project_id = extract_project_id(reply2.text)
+        if not project_id:
+            raise RuntimeError(f"Could not extract project_id from reply: {reply2.text!r}")
+        eprint(f"  recommendation timed out or returned no candidates; project created: {project_id}")
+        await _cancel_seeded_project(ctx, project_id)
+        eprint(f"  cleaned up test project: {project_id}")
+        return
     if "选择目录" in reply2.text or "跳过" in reply2.text:
         await inject_action(
             ctx,
@@ -1078,6 +1189,11 @@ async def scenario_bind_dir_agent(ctx: ScenarioContext) -> None:
         if not project_id:
             raise RuntimeError(f"Could not extract project_id from reply: {reply3.text!r}")
         eprint(f"  project created after skip: {project_id}")
+        # Keep the shared Feishu E2E chat reusable.  An active project blocks
+        # later /bind and /unbind checks by design, so this scenario must clean
+        # up the project it created after the behavior has been verified.
+        await _cancel_seeded_project(ctx, project_id)
+        eprint(f"  cleaned up test project: {project_id}")
     else:
         raise RuntimeError(f"Unexpected reply from /create: {reply2.text!r}")
 
@@ -1156,6 +1272,50 @@ async def wait_for_next_approval(
     return approval_id, reply
 
 
+def _confirmation_path_for_rework(target: str, expected_state: str) -> list[str]:
+    """Return upstream confirmations to pass before ``expected_state``."""
+    confirmation_chain = [
+        "REQUIREMENT_CONFIRM_PENDING",
+        "ARCHITECTURE_CONFIRM_PENDING",
+        "IMPLEMENTATION_SPEC_CONFIRM_PENDING",
+        "CODING_CONFIRM_PENDING",
+        "TESTING_CONFIRM_PENDING",
+        "REVIEW_CONFIRM_PENDING",
+    ]
+    target_state = {
+        "to_requirements": "REQUIREMENT_CONFIRM_PENDING",
+        "to_architecture": "ARCHITECTURE_CONFIRM_PENDING",
+        "to_specs": "IMPLEMENTATION_SPEC_CONFIRM_PENDING",
+        "to_coding": "CODING_CONFIRM_PENDING",
+        "to_testing": "TESTING_CONFIRM_PENDING",
+    }.get(target)
+    if target_state not in confirmation_chain:
+        raise RuntimeError(f"Unsupported structured rework target: {target}")
+    if expected_state not in confirmation_chain:
+        raise RuntimeError(f"Unsupported expected confirmation: {expected_state}")
+    start = confirmation_chain.index(target_state)
+    stop = confirmation_chain.index(expected_state)
+    if start > stop:
+        raise RuntimeError(
+            f"Rework target {target} is downstream of expected {expected_state}"
+        )
+    return confirmation_chain[start:stop]
+
+
+def _structured_recovery_blocker(
+    pending_approval: dict[str, Any],
+) -> str | None:
+    """Describe a protocol-declared non-retryable recovery, if present."""
+    recovery = pending_approval.get("recovery") or {}
+    if recovery.get("retryable") is not False:
+        return None
+    return (
+        "Agent entered recovery for a structured non-retryable external "
+        f"failure: domain={recovery.get('domain')}, "
+        f"status={recovery.get('status_code')}"
+    )
+
+
 async def wait_for_approval_at_state(
     ctx: ScenarioContext,
     project_id: str,
@@ -1165,11 +1325,106 @@ async def wait_for_approval_at_state(
     timeout: float = 300.0,
     recovery_depth: int = 0,
 ) -> tuple[str, Any]:
-    """Wait for one approval, recovering legitimate quality-agent failures."""
-    approval_id, reply = await wait_for_next_approval(
-        ctx, after_message_id=after_message_id, timeout=timeout
-    )
-    status = await ctx.mac.get_status(project_id)
+    """Wait for one visible approval card and resolve its callback id.
+
+    Feishu's message-history API deliberately omits button callback values.
+    Therefore the black-box side observes the card's visible question, while
+    the control plane supplies the pending approval id that the simulated
+    button click would have carried.  This mirrors a real UI click without
+    requiring opaque database ids to be printed in the card body.
+    """
+    if ctx.args.scenario == "full_feature_flow":
+        timeout = max(timeout, 2700.0)
+    assert ctx.sim is not None
+    deadline = time.monotonic() + timeout
+    reply = None
+    status: dict[str, Any] = {}
+    approval_id = ""
+    next_level_tick_at = 0.0
+    producer_state = {
+        "REQUIREMENT_CONFIRM_PENDING": "PLANNING_REQUIREMENTS",
+        "ARCHITECTURE_CONFIRM_PENDING": "PLANNING_ARCHITECTURE",
+        "IMPLEMENTATION_SPEC_CONFIRM_PENDING": "PLANNING_IMPLEMENTATION_SPECS",
+        "CODING_CONFIRM_PENDING": "CODING",
+        "TESTING_CONFIRM_PENDING": "TESTING",
+        "REVIEW_CONFIRM_PENDING": "REVIEW",
+        "ACCEPTANCE_PENDING": "ACCEPTANCE_PENDING",
+    }.get(expected_state)
+    while time.monotonic() < deadline:
+        status = await ctx.mac.get_status(project_id)
+        pending = status.get("pending_approval") or {}
+        current_state = str(status.get("current_state") or "")
+        now = time.monotonic()
+        if (
+            not pending
+            and current_state in {producer_state, expected_state}
+            and now >= next_level_tick_at
+        ):
+            # Agent execution and delivery of the following human boundary are
+            # level-triggered. Some Feishu command handlers only commit the
+            # transition; the black-box driver must provide the next tick just
+            # as the production scheduler does. A short backoff avoids polling
+            # an already-running task with repeated ticks.
+            next_level_tick_at = now + 10.0
+            await ctx.mac.tick(project_id)
+            continue
+        approval_id = str(pending.get("approval_id") or "")
+        visible_question = str(pending.get("question") or "").strip()
+        approval_type = str(pending.get("type") or "")
+        option_labels = {
+            str(option.get("label") or "").strip()
+            for option in pending.get("options") or []
+            if str(option.get("label") or "").strip()
+        }
+        if approval_id:
+            # Card 2.0 history bodies are intentionally replaced by Feishu
+            # with an upgrade placeholder. The durable projection is the
+            # authoritative receipt that the real provider accepted a visible
+            # card and gives us its real message id.
+            for projection in await ctx.mac.get_project_cards(project_id):
+                if (
+                    projection.get("subject_type") == "approval"
+                    and projection.get("subject_id") == approval_id
+                    and projection.get("provider_message_id")
+                ):
+                    reply = FeishuMessage(
+                        message_id=str(projection["provider_message_id"]),
+                        sender_id=ctx.sim.mac_app_id or ctx.sim.mac_bot_open_id,
+                        text=visible_question,
+                    )
+                    break
+        if approval_id and reply is None:
+            for message in await ctx.sim.get_messages():
+                if message.message_id == after_message_id:
+                    break
+                if message.sender_id not in (
+                    ctx.sim.mac_bot_open_id,
+                    ctx.sim.mac_app_id,
+                ):
+                    continue
+                question_matches = bool(
+                    visible_question and visible_question in message.text
+                )
+                option_matches = bool(
+                    option_labels
+                    and option_labels.issubset(set(message.text.splitlines()))
+                )
+                # Batched question cards show the individual questions rather
+                # than the generic Approval.question. Their submit control is
+                # the stable, user-visible indication that the card is ready.
+                input_card_matches = approval_type == "input" and any(
+                    label in message.text
+                    for label in ("提交答案", "提交回答", "提交自定义答案")
+                )
+                if question_matches or option_matches or input_card_matches:
+                    reply = message
+                    break
+        if reply is not None:
+            break
+        await asyncio.sleep(2.0)
+    if reply is None or not approval_id:
+        raise RuntimeError("Did not receive a visible pending approval card from MAC bot")
+
     actual_state = status.get("current_state")
     pending = status.get("pending_approval") or {}
     if (
@@ -1248,7 +1503,7 @@ async def wait_for_approval_at_state(
         }
         and recovery_depth < 3
     ):
-        target = {
+        fallback_target = {
             "CODING_CONFIRM_PENDING": "to_coding",
             "TESTING_CONFIRM_PENDING": "to_testing",
             "REVIEW_CONFIRM_PENDING": "to_coding",
@@ -1258,39 +1513,58 @@ async def wait_for_approval_at_state(
                 option.get("option_key")
                 for option in pending.get("options", [])
                 if option.get("type") == "primary"
-                and option.get("option_key") in {"to_coding", "to_testing"}
+                and option.get("option_key")
             ),
             None,
         )
-        target = recommended or target
+        target = str(recommended or fallback_target)
         eprint(
             f"  quality agent entered REWORK before {expected_state}; "
             f"auto-select {target}"
         )
         msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} {target}")
-        if target == "to_coding" and expected_state in {
-            "TESTING_CONFIRM_PENDING",
-            "REVIEW_CONFIRM_PENDING",
-        }:
-            coding_id, _ = await wait_for_approval_at_state(
+
+        # Follow the normal dependency chain from the Agent-recommended
+        # rework target back to the confirmation this caller is awaiting.
+        # Do not enumerate failure classes: the primary option is structured
+        # routing output from MAC and may point to any upstream stage.
+        for intermediate_state in _confirmation_path_for_rework(
+            target, expected_state
+        ):
+            intermediate_id, _ = await wait_for_approval_at_state(
                 ctx,
                 project_id,
-                "CODING_CONFIRM_PENDING",
+                intermediate_state,
                 after_message_id=msg_id,
                 timeout=timeout,
                 recovery_depth=recovery_depth + 1,
             )
-            msg_id = await send_feishu_text(ctx, f"/confirm {coding_id}")
-        if expected_state == "REVIEW_CONFIRM_PENDING":
-            testing_id, _ = await wait_for_approval_at_state(
-                ctx,
-                project_id,
-                "TESTING_CONFIRM_PENDING",
-                after_message_id=msg_id,
-                timeout=timeout,
-                recovery_depth=recovery_depth + 1,
-            )
-            msg_id = await send_feishu_text(ctx, f"/confirm {testing_id}")
+            msg_id = await send_feishu_text(ctx, f"/confirm {intermediate_id}")
+        return await wait_for_approval_at_state(
+            ctx,
+            project_id,
+            expected_state,
+            after_message_id=msg_id,
+            timeout=timeout,
+            recovery_depth=recovery_depth + 1,
+        )
+    if str(actual_state).endswith("_RECOVERY_PENDING"):
+        recovery_blocker = _structured_recovery_blocker(pending)
+        if recovery_blocker:
+            raise RuntimeError(recovery_blocker)
+    if (
+        str(actual_state).endswith("_RECOVERY_PENDING")
+        and recovery_depth < 3
+    ):
+        # A real model can exhaust its automatic attempts with malformed
+        # stdout even after writing a valid artifact. Exercise the same
+        # user-visible recovery action instead of treating the recovery card
+        # as the confirmation card expected by this scenario.
+        eprint(
+            f"  agent entered {actual_state}; auto-select retry before "
+            f"waiting for {expected_state}"
+        )
+        msg_id = await send_feishu_text(ctx, f"/confirm {approval_id} retry")
         return await wait_for_approval_at_state(
             ctx,
             project_id,
@@ -1334,10 +1608,14 @@ async def scenario_full_feature_flow(ctx: ScenarioContext) -> None:
             name="full-feature-flow",
             task_type="feature",
             description=(
-                "实现最小 Todo CLI：只支持 add <文本> 和 list 两个命令；"
-                "进程内存储；不做编辑、删除、权限、持久化和网络功能"
+                "实现最小 Todo 交互式 CLI：一次启动后从标准输入连续接收命令，"
+                "只支持 add <文本> 和 list；同一进程会话内存储，退出即丢失；"
+                "不做编辑、删除、权限、持久化和网络功能"
             ),
-            approval_mode="normal",
+            # Keep the exhaustive branch test explicitly manual so it can
+            # exercise acceptance rejection. Normal mode now auto-completes
+            # when active acceptance and independent evaluation both pass.
+            approval_mode="strict",
         )
     )
     project_id = project["id"]
@@ -1525,10 +1803,18 @@ async def scenario_p2p_create_interactive(ctx: ScenarioContext) -> None:
     if reply is None:
         raise RuntimeError("MAC bot did not prompt for description")
     project_id = await feishu_create_project(ctx, "帮我做一个个人网站")
-    status = await wait_for_state(ctx, project_id, "REQUIREMENT_CONFIRM_PENDING")
-    if status is None:
-        raise RuntimeError("Project did not reach REQUIREMENT_CONFIRM_PENDING")
-    eprint(f"  reached {status['current_state']}")
+    try:
+        # This scenario verifies interactive creation, not a particular
+        # approval policy.  A user's default authorization may automatically
+        # pass the requirements boundary before the observer polls it, so do
+        # not require one transient state/card here.  The exhaustive workflow
+        # scenario separately validates every visible approval boundary.
+        status = await ctx.mac.get_status(project_id)
+        if status.get("status") != "active":
+            raise RuntimeError(f"Created project is not active: {status!r}")
+        eprint(f"  reached {status['current_state']}")
+    finally:
+        await _cancel_seeded_project(ctx, project_id)
 
 
 async def scenario_conversation_delivery(ctx: ScenarioContext) -> None:
@@ -1611,6 +1897,14 @@ async def _seed_card_anchor(ctx: ScenarioContext) -> str:
     """Return a fresh MAC reply id so seeded cards cannot match old messages."""
     assert ctx.sim is not None
     message_id = await send_feishu_text(ctx, "/whoami")
+    if ctx.args.scenario == "full_feature_flow":
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            receipt = await ctx.mac.get_feishu_event(str(message_id))
+            if receipt.get("found") and receipt.get("status") == "processed":
+                return str(message_id)
+            await asyncio.sleep(1.0)
+        raise RuntimeError("MAC bot did not process the interaction anchor")
     reply = await ctx.sim.wait_for_reply(after_message_id=message_id, timeout=60.0)
     if reply is None:
         raise RuntimeError("MAC bot did not answer the interaction anchor")
@@ -1719,6 +2013,67 @@ async def scenario_architecture_confirmation(ctx: ScenarioContext) -> None:
     await _cancel_seeded_project(ctx, seeded["project_id"])
 
 
+async def scenario_reject_without_feedback_advances(ctx: ScenarioContext) -> None:
+    """Bug #3: /reject on a non-planning confirm state without feedback must advance the project.
+
+    Planning states (REQUIREMENT_CONFIRM_PENDING, ARCHITECTURE_CONFIRM_PENDING,
+    IMPLEMENTATION_SPEC_CONFIRM_PENDING) show a feedback form on reject.
+    Non-planning states (CODING_CONFIRM_PENDING, TESTING_CONFIRM_PENDING,
+    REVIEW_CONFIRM_PENDING) have no form - reject must transition and
+    _advance_until_confirm must run so the project does not get stuck.
+    """
+    eprint("Scenario: reject_without_feedback_advances (Bug #3)")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    anchor = await _seed_card_anchor(ctx)
+    seeded = await ctx.mac.seed_feishu_interaction(
+        kind="coding_confirmation",
+        open_id=ctx.args.open_id,
+        chat_id=ctx.args.chat_id or f"p2p:{ctx.args.open_id}",
+        chat_type="group" if ctx.args.chat_id else "p2p",
+    )
+    project_id = seeded["project_id"]
+    approval_id = seeded["approval_id"]
+    confirmation = await ctx.sim.wait_for_reply(
+        pattern=rf"审批ID.*{re.escape(approval_id)}",
+        after_message_id=anchor,
+        timeout=120.0,
+    )
+    if confirmation is None:
+        raise RuntimeError("Coding confirmation card was not rendered")
+
+    pre_state = (await ctx.mac.get_status(project_id)).get("current_state")
+    if pre_state != "CODING_CONFIRM_PENDING":
+        raise RuntimeError(
+            f"Seeded project not in CODING_CONFIRM_PENDING (got {pre_state})"
+        )
+
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        approval_id,
+        "reject",
+        state="CODING_CONFIRM_PENDING",
+    )
+
+    deadline = time.monotonic() + 120.0
+    post_state = pre_state
+    while time.monotonic() < deadline:
+        status = await ctx.mac.get_status(project_id)
+        post_state = status.get("current_state")
+        if post_state != "CODING_CONFIRM_PENDING":
+            break
+        await asyncio.sleep(2.0)
+    if post_state == "CODING_CONFIRM_PENDING":
+        raise RuntimeError(
+            "Bug #3 regression: project stuck in CODING_CONFIRM_PENDING "
+            "after reject without feedback"
+        )
+    eprint(f"  state advanced to {post_state}")
+    await _cancel_seeded_project(ctx, project_id)
+
+
 async def scenario_acceptance_question_card(ctx: ScenarioContext) -> None:
     """Render and answer an Acceptance ask_user choice card."""
     eprint("Scenario: acceptance_question_card")
@@ -1818,9 +2173,31 @@ async def scenario_requirement_custom_question(ctx: ScenarioContext) -> None:
         ctx,
         f"/input {seeded['approval_id']} 改为同时支持移动端和桌面端",
     )
-    status = await wait_for_state(
-        ctx, seeded["project_id"], "PLANNING_REQUIREMENTS", timeout=60.0
-    )
+    # The handler may resume and finish the Requirements Agent between two
+    # polling intervals.  Accept either the execution state or a legal state
+    # produced after that execution, but never mistake the original approval
+    # for progress merely because both are REQUIREMENT_INPUT_PENDING.
+    deadline = time.monotonic() + 120.0
+    status = None
+    legal_resumed_states = {
+        "PLANNING_REQUIREMENTS",
+        "REQUIREMENT_INPUT_PENDING",
+        "REQUIREMENT_CONFIRM_PENDING",
+    }
+    while time.monotonic() < deadline:
+        candidate = await ctx.mac.get_status(seeded["project_id"])
+        pending = candidate.get("pending_approval") or {}
+        approval_changed = pending.get("approval_id") != seeded["approval_id"]
+        if (
+            candidate.get("current_state") in legal_resumed_states
+            and (
+                candidate.get("current_state") != "REQUIREMENT_INPUT_PENDING"
+                or approval_changed
+            )
+        ):
+            status = candidate
+            break
+        await asyncio.sleep(1.0)
     if status is None:
         raise RuntimeError("Custom text answer did not resume the requirements Agent")
     eprint("  custom choice collected text and resumed requirements")
@@ -1944,7 +2321,10 @@ async def scenario_agent_fail_auto_rework(ctx: ScenarioContext) -> None:
                 "（其余正常实现）；测试阶段应对照验收标准发现重复文本未被拒绝并判定不通过；"
                 "返工补齐后第二轮测试全部通过。"
             ),
-            approval_mode="normal",
+            # This scenario explicitly observes and drives each planning
+            # boundary. Keep it strict; AI-first auto-confirmation is a
+            # separate behavior and would legitimately consume those cards.
+            approval_mode="strict",
         )
     )
     project_id = project["id"]
@@ -1977,11 +2357,17 @@ async def scenario_agent_fail_auto_rework(ctx: ScenarioContext) -> None:
     try:
         # Planner can legitimately take >10min on the first pass when it asks
         # a clarification batch and then re-plans with the answers.
+        await first_tick
+        initial_status = await ctx.mac.get_status(project_id)
+        if not initial_status.get("pending_approval"):
+            # Agent completion and human-boundary delivery are intentionally
+            # level-triggered. Drive the boundary tick before waiting for the
+            # visible card; waiting first creates a test-driver deadlock.
+            await ctx.mac.tick(project_id)
         approval_id, _ = await wait_for_approval_at_state(
             ctx, project_id, "REQUIREMENT_CONFIRM_PENDING",
             after_message_id=anchor_message_id, timeout=1500.0,
         )
-        await first_tick
         msg_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
 
         approval_id, _ = await wait_for_approval_at_state(
@@ -2289,6 +2675,219 @@ def _latest_assistant_reply(db_path: str, chat_id: str | None) -> str | None:
     return None
 
 
+def _latest_pending_conversation_action(
+    db_path: str,
+    created_by: str,
+    action_type: str,
+) -> dict[str, Any] | None:
+    """Return the newest pending action for an E2E actor."""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id, payload, status FROM pending_conversation_actions "
+            "WHERE created_by=? AND action_type=? AND status='pending' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (created_by, action_type),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "payload": json.loads(row[1]), "status": row[2]}
+
+
+def _pending_conversation_action_ids(db_path: str, created_by: str) -> list[str]:
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM pending_conversation_actions "
+            "WHERE created_by=? AND status='pending' ORDER BY created_at",
+            (created_by,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(row[0]) for row in rows]
+
+
+async def _reject_actor_pending_conversation_actions(ctx: ScenarioContext) -> None:
+    for action_id in _pending_conversation_action_ids(
+        _server_db_path(), ctx.args.open_id
+    ):
+        await inject_action(
+            ctx,
+            ctx.args.open_id,
+            "",
+            "conversation_action",
+            extras={"pending_action_id": action_id, "decision": "reject"},
+        )
+    await asyncio.sleep(1.0)
+
+
+def _reset_test_group_conversation(ctx: ScenarioContext) -> None:
+    """Reset only the explicitly configured E2E group conversation."""
+    if not ctx.args.chat_id:
+        return
+    import sqlite3
+
+    conn = sqlite3.connect(_server_db_path())
+    try:
+        row = conn.execute(
+            "SELECT id FROM conversation_sessions WHERE chat_id=?",
+            (ctx.args.chat_id,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE pending_conversation_actions SET status='expired' "
+                "WHERE session_id=? AND status='pending'",
+                (row[0],),
+            )
+            conn.execute(
+                "UPDATE conversation_sessions SET summary='', recent_turns='[]', "
+                "active_project_id=NULL, latest_artifact='{}', pending_action_id=NULL, "
+                "version=version+1 WHERE id=?",
+                (row[0],),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def _wait_for_pending_conversation_action(
+    ctx: ScenarioContext,
+    action_type: str,
+    timeout: float = 60.0,
+    exclude_id: str | None = None,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    db_path = _server_db_path()
+    while time.monotonic() < deadline:
+        action = _latest_pending_conversation_action(
+            db_path, ctx.args.open_id, action_type
+        )
+        if action is not None and action["id"] != exclude_id:
+            return action
+        await asyncio.sleep(1.0)
+    raise RuntimeError(f"pending conversation action not found: {action_type}")
+
+
+async def scenario_personal_site_clarification(ctx: ScenarioContext) -> None:
+    """A broad creation request must yield a question card, not a retry failure."""
+    eprint("Scenario: personal_site_clarification")
+    msg_id = await send_feishu_text(ctx, "我要做一个个人网站")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    card = await ctx.sim.wait_for_reply(
+        pattern=r"个人博客|个人简历|作品集|个人主页|哪种类型",
+        after_message_id=msg_id,
+        timeout=300.0,
+    )
+    if card is None:
+        failed = await ctx.sim.wait_for_reply(
+            pattern=r"处理失败|自动重试.*仍无法完成",
+            after_message_id=msg_id,
+            timeout=10.0,
+        )
+        if failed is not None:
+            raise RuntimeError(f"coordinator failed instead of asking: {failed.text}")
+        raise RuntimeError("personal-site request did not produce a clarification card")
+    if "处理失败" in card.text:
+        raise RuntimeError(f"coordinator failed instead of asking: {card.text}")
+    eprint("  personal-site clarification card delivered")
+
+
+async def scenario_personal_site_agent_revision(ctx: ScenarioContext) -> None:
+    """Reproduce the reported multi-turn private-chat contract failure."""
+    eprint("Scenario: personal_site_agent_revision")
+    if not ctx.dry_run:
+        if ctx.args.chat_id:
+            _reset_test_group_conversation(ctx)
+        else:
+            await _reject_actor_pending_conversation_actions(ctx)
+    msg_id = await send_feishu_text(ctx, "我要做一个个人网站")
+    if ctx.dry_run:
+        return
+    assert ctx.sim is not None
+    clarification_card = await ctx.sim.wait_for_reply(
+        pattern=r"个人博客|个人简历|作品集|个人主页|哪种类型",
+        after_message_id=msg_id,
+        timeout=300.0,
+    )
+    if clarification_card is None or "处理失败" in clarification_card.text:
+        raise RuntimeError("initial personal-site clarification failed")
+
+    clarification = await _wait_for_pending_conversation_action(ctx, "clarification")
+    options = clarification["payload"].get("options") or []
+    selected = next(
+        (
+            option
+            for option in options
+            if re.search(r"综合|博客.*作品集|作品集.*博客", str(option.get("label") or ""))
+        ),
+        None,
+    )
+    if selected is None:
+        raise RuntimeError(f"comprehensive-site option not found: {options!r}")
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        "",
+        "conversation_clarification",
+        option_key=str(selected["key"]),
+        extras={"pending_action_id": clarification["id"]},
+    )
+    first_action_card = await ctx.sim.wait_for_reply(
+        pattern=r"确认执行范围|执行请求ID.*cact_",
+        after_message_id=clarification_card.message_id,
+        timeout=300.0,
+    )
+    if first_action_card is None or "处理失败" in first_action_card.text:
+        raise RuntimeError("site selection did not produce an execution proposal")
+    first_action = await _wait_for_pending_conversation_action(ctx, "start_delivery")
+
+    revision_message_id = await send_feishu_text(ctx, "上面需要一个个人agent")
+    revised_action_card = await ctx.sim.wait_for_reply(
+        pattern=r"确认执行范围|执行请求ID.*cact_",
+        after_message_id=revision_message_id,
+        timeout=300.0,
+    )
+    if revised_action_card is None:
+        failure = await ctx.sim.wait_for_reply(
+            pattern=r"处理失败|schema violation|自动重试.*仍无法完成",
+            after_message_id=revision_message_id,
+            timeout=10.0,
+        )
+        raise RuntimeError(
+            f"personal-Agent revision failed: {failure.text if failure else 'no card'}"
+        )
+
+    revised = await _wait_for_pending_conversation_action(
+        ctx, "start_delivery", timeout=60.0, exclude_id=first_action["id"]
+    )
+    payload_text = json.dumps(revised["payload"], ensure_ascii=False).lower()
+    if not re.search(r"个人\s*(?:agent|ai\s*助手|助手|智能体)", payload_text):
+        raise RuntimeError(f"revision was lost from delivery payload: {revised['payload']!r}")
+    for index, decision in enumerate(revised["payload"].get("decisions") or []):
+        required = {"key", "question", "answer", "status"}
+        if not isinstance(decision, dict) or not required.issubset(decision):
+            raise RuntimeError(f"decision {index} is not canonical: {decision!r}")
+        if decision["status"] != "confirmed":
+            raise RuntimeError(f"decision {index} is not confirmed: {decision!r}")
+
+    await inject_action(
+        ctx,
+        ctx.args.open_id,
+        "",
+        "conversation_action",
+        extras={"pending_action_id": revised["id"], "decision": "reject"},
+    )
+    eprint("  personal-Agent revision produced a canonical execution proposal")
+
+
 async def scenario_coordinator_read_workspace(ctx: ScenarioContext) -> None:
     """Bound chat + arbitrary phrasing: the coordinator must use Read.
 
@@ -2365,13 +2964,174 @@ async def scenario_coordinator_read_workspace(ctx: ScenarioContext) -> None:
         shutil.rmtree(fixture_dir, ignore_errors=True)
 
 
+async def scenario_existing_repo_incremental(ctx: ScenarioContext) -> None:
+    """Run a real delivery against an existing Git repository.
+
+    Verifies that MAC inherits the chat binding, preserves existing content,
+    commits incremental changes through isolated worktrees, runs active
+    acceptance, and completes without a final user acceptance click.
+    """
+    eprint("Scenario: existing_repo_incremental")
+    if ctx.dry_run:
+        return
+    from pathlib import Path
+    import shutil
+    import subprocess
+
+    fixture_dir = Path.home() / f"mac-e2e-existing-{int(time.time())}"
+    fixture_dir.mkdir(parents=True, exist_ok=False)
+    project_id: str | None = None
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=fixture_dir, check=True)
+        subprocess.run(
+            ["git", "config", "user.name", "MAC E2E"], cwd=fixture_dir, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "mac-e2e@example.invalid"],
+            cwd=fixture_dir,
+            check=True,
+        )
+        original_readme = "# Existing Project\n\nOriginal content must remain.\n"
+        (fixture_dir / "README.md").write_text(original_readme, encoding="utf-8")
+        (fixture_dir / "legacy.txt").write_text("legacy-data\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md", "legacy.txt"], cwd=fixture_dir, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "existing baseline"],
+            cwd=fixture_dir,
+            check=True,
+        )
+
+        bind_message = await send_feishu_text(ctx, f"/bind {fixture_dir}")
+        bind_reply = await ctx.sim.wait_for_reply(
+            pattern=r"已将当前会话绑定到|绑定目录失败|不能切换目录",
+            after_message_id=bind_message,
+            timeout=60.0,
+        )
+        if bind_reply is None or "已将当前会话绑定到" not in bind_reply.text:
+            raise RuntimeError(f"could not bind existing repo: {getattr(bind_reply, 'text', None)}")
+
+        anchor_message_id = await _seed_card_anchor(ctx)
+        project = await ctx.mac.create_project(
+            **_project_create_kwargs(
+                ctx,
+                name="existing-repo-incremental",
+                task_type="iteration",
+                description=(
+                    "在现有仓库上增量修改：保留 README.md 全部原文，在末尾新增 "
+                    "'## MAC Incremental Update' 小节；新增 incremental_marker.txt，"
+                    "内容必须为 'mac-existing-repo-pass'；不得删除或改写 legacy.txt。"
+                ),
+                approval_mode="strict",
+                confirmed_brief={
+                    "objective": "在现有仓库上完成一个范围明确的增量修改",
+                    "scope": [
+                        "保留 README.md 全部原文并追加指定小节",
+                        "新增包含指定内容的 incremental_marker.txt",
+                        "保持 legacy.txt 不变",
+                    ],
+                    "out_of_scope": ["删除或改写任何现有功能"],
+                    "acceptance_criteria": [
+                        "README.md 保留原文并包含 ## MAC Incremental Update",
+                        "incremental_marker.txt 内容严格等于 mac-existing-repo-pass",
+                        "legacy.txt 内容仍严格等于 legacy-data",
+                    ],
+                },
+            )
+        )
+        project_id = project["id"]
+        if Path(project.get("workspace_path", "")).resolve() != fixture_dir.resolve():
+            raise RuntimeError(f"project did not inherit bound directory: {project}")
+        await ctx.mac.tick(project_id)
+        status = await ctx.mac.get_status(project_id)
+        if not status.get("pending_approval"):
+            await ctx.mac.tick(project_id)
+
+        message_id = anchor_message_id
+        for expected_state in (
+            "CODING_CONFIRM_PENDING",
+            "TESTING_CONFIRM_PENDING",
+            "REVIEW_CONFIRM_PENDING",
+        ):
+            approval_id, _ = await wait_for_approval_at_state(
+                ctx,
+                project_id,
+                expected_state,
+                after_message_id=message_id,
+                timeout=900.0,
+            )
+            eprint(f"  {expected_state}: confirm {approval_id}")
+            message_id = await send_feishu_text(ctx, f"/confirm {approval_id}")
+
+        acceptance_id, _ = await wait_for_approval_at_state(
+            ctx,
+            project_id,
+            "ACCEPTANCE_PENDING",
+            after_message_id=message_id,
+            timeout=1800.0,
+        )
+        eprint(f"  ACCEPTANCE_PENDING: confirm {acceptance_id}")
+        await send_feishu_text(ctx, f"/confirm {acceptance_id}")
+
+        completed = await wait_for_state(ctx, project_id, "COMPLETED", timeout=1800.0)
+        if completed is None:
+            current = await ctx.mac.get_status(project_id)
+            raise RuntimeError(
+                "existing repo project did not auto-complete after acceptance: "
+                f"{current.get('current_state')}"
+            )
+
+        readme = (fixture_dir / "README.md").read_text(encoding="utf-8")
+        marker = (fixture_dir / "incremental_marker.txt").read_text(
+            encoding="utf-8"
+        ).strip()
+        legacy = (fixture_dir / "legacy.txt").read_text(encoding="utf-8")
+        if original_readme.strip() not in readme or "## MAC Incremental Update" not in readme:
+            raise RuntimeError("existing README content was lost or update section is missing")
+        if marker != "mac-existing-repo-pass" or legacy != "legacy-data\n":
+            raise RuntimeError("incremental marker or legacy content is incorrect")
+        commit_count = int(
+            subprocess.run(
+                ["git", "rev-list", "--count", "HEAD"],
+                cwd=fixture_dir,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        if commit_count < 2:
+            raise RuntimeError("incremental delivery did not create a repository commit")
+        eprint(f"  existing repo completed with {commit_count} commits and preserved legacy files")
+    finally:
+        if project_id:
+            try:
+                status = await ctx.mac.get_status(project_id)
+                if status.get("current_state") not in {"COMPLETED", "FAILED", "CANCELLED"}:
+                    await ctx.mac.cancel_project(project_id)
+            except Exception:
+                pass
+        try:
+            unbind_message = await send_feishu_text(ctx, "/unbind")
+            await ctx.sim.wait_for_reply(
+                pattern=r"已解绑|没有绑定目录|不能切换目录",
+                after_message_id=unbind_message,
+                timeout=60.0,
+            )
+        except Exception:
+            pass
+        shutil.rmtree(fixture_dir, ignore_errors=True)
+
+
 SCENARIOS: dict[str, Any] = {
     "p2p_create": scenario_p2p_create,
+    "agent_loop_delivery": scenario_agent_loop_delivery,
     "p2p_create_with_type": scenario_p2p_create_with_type,
     "p2p_create_interactive": scenario_p2p_create_interactive,
     "conversation_delivery": scenario_conversation_delivery,
+    "personal_site_clarification": scenario_personal_site_clarification,
+    "personal_site_agent_revision": scenario_personal_site_agent_revision,
     "planning_rejection_form": scenario_planning_rejection_form,
     "architecture_confirmation": scenario_architecture_confirmation,
+    "reject_without_feedback_advances": scenario_reject_without_feedback_advances,
     "acceptance_question_card": scenario_acceptance_question_card,
     "requirement_custom_question": scenario_requirement_custom_question,
     "runtime_recovery_card": scenario_runtime_recovery_card,
@@ -2395,6 +3155,7 @@ SCENARIOS: dict[str, Any] = {
     "agent_fail_auto_rework": scenario_agent_fail_auto_rework,
     "bind_dir_agent": scenario_bind_dir_agent,
     "coordinator_read_workspace": scenario_coordinator_read_workspace,
+    "existing_repo_incremental": scenario_existing_repo_incremental,
 }
 
 

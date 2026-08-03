@@ -1,11 +1,13 @@
 # Prompt 模板规范
 
-> 版本：v1.0  
-> 用途：定义 Orchestrator 如何组合 system prompt、skill prompt、user prompt，并生成喂给 `claude -p` 的最终文本。
+> 版本：v1.1
+> 用途：定义 Orchestrator 如何组合 system prompt、skill prompt、user prompt，并生成喂给 Claude Code CLI 的最终文本。
+
+> 权威调用方式以 [`runtime_spec.md`](./runtime_spec.md) 为准。Runtime 实际使用 `--input-format stream-json --output-format stream-json` 双向会话模式（`runtime.py:_build_command`）；本文件早期版本描述的 `claude -p` 一次性模式仅作为 `runtime.py:build_command` 的测试兼容路径保留，不得用于生产。
 
 ## Prompt 组成
 
-最终传给 `claude -p` 的 prompt 由三部分按顺序拼接：
+最终传给 Claude Code CLI 的 prompt 由三部分按顺序拼接：
 
 ```
 [system_prompt_file 内容]
@@ -19,18 +21,22 @@
 [user prompt 模板渲染结果]
 ```
 
-实际调用方式：
+实际调用方式（stream-json 模式，权威以 `runtime_spec.md` 为准）：
 
 ```bash
-claude -p "{user_prompt}" \
+{claude_bin} \
+  --input-format stream-json \
+  --output-format stream-json \
+  --replay-user-messages \
+  --verbose \
   --system-prompt-file {system_prompt_file} \
-  --output-format json \
-  --json-schema {output_schema} \
+  --tools "{allowed_tools}" \
   --allowedTools "{allowed_tools}" \
-  --add-dir {readonly_dir} ...
+  --add-dir {readonly_dir} ... \
+  --dangerously-skip-permissions
 ```
 
-> 说明：`--system-prompt-file` 只接收一个文件，因此 skills 需要在 Orchestrator 渲染 system prompt 时先合并成一个临时文件。
+User prompt 不通过命令行参数传递，而是在 stream-json 会话启动后作为 user message 写入 stdin。`--system-prompt-file` 只接收一个文件，因此 skills 需要在 Orchestrator 渲染 system prompt 时先合并成一个临时文件。
 
 ## System Prompt 渲染
 
@@ -121,7 +127,7 @@ prompts/
 
 ## 输出 JSON Schema 传递
 
-Orchestrator 将 `output_schema` 文件路径传给 `claude -p --json-schema`，Agent 输出必须严格符合该 schema。
+Agent 输出必须严格符合 `output_schema` 指定的 JSON Schema。stream-json 模式下 schema 通过 prompt 内嵌引用（Agent 在 prompt 中被告知输出契约），Runtime 解析最终 `result` 事件时再行校验；早期 `claude -p --json-schema` 一次性路径保留给测试兼容入口。
 
 ## 模板渲染流程
 
@@ -130,7 +136,7 @@ Orchestrator 将 `output_schema` 文件路径传给 `claude -p --json-schema`，
 3. 若有 skills，读取 skill 文件并追加到 system prompt
 4. 替换模板变量
 5. 生成临时 system prompt 文件
-6. 调用 `claude -p`
+6. 通过 stream-json 会话调用 Claude Code CLI（详见 `runtime_spec.md`）
 
 ## 示例
 

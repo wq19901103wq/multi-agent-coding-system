@@ -3,9 +3,13 @@
   "$id": "https://mac-system.local/schemas/doc_outline.json",
   "title": "DOC_OUTLINE.json",
   "type": "object",
-  "required": ["summary", "sections", "affected_files"],
+  "required": ["artifact_id", "version", "round", "status", "summary", "sections", "affected_files", "acceptance_criteria"],
   "additionalProperties": false,
   "properties": {
+    "artifact_id": {"const": "doc_outline"},
+    "version": {"type": "integer", "minimum": 1},
+    "round": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["draft", "pending_confirmation", "confirmed", "stale"]},
     "summary": {"type": "string"},
     "sections": {
       "type": "array",
@@ -27,6 +31,22 @@
     "affected_files": {
       "type": "array",
       "items": {"type": "string"}
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "statement", "verification_method", "evidence_source"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "statement": {"type": "string"},
+          "verification_method": {"enum": ["automated_test", "integration_test", "e2e", "manual", "inspection", "metric"]},
+          "evidence_source": {"enum": ["system_observable", "user_preference", "authorization", "external_fact"]},
+          "evidence_required": {"type": "string"}
+        }
+      }
     }
   }
 }

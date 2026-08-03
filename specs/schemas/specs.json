@@ -11,7 +11,7 @@
     "round": {"type": "integer", "minimum": 1},
     "status": {"enum": ["draft", "pending_confirmation", "confirmed", "stale", "superseded", "rejected"]},
     "based_on_architecture_version": {"type": "integer", "minimum": 1},
-    "content_hash": {"type": "string"},
+    "content_hash": {"type": ["string", "null"]},
     "supersedes_round": {"type": ["integer", "null"], "minimum": 1},
     "open_questions": {"type": "array", "items": {"type": "string"}},
     "resolved_questions": {

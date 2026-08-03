@@ -1,21 +1,18 @@
 # Control API 规范
 
-> 版本：v1.1
+> 版本：v1.2
 > 用途：定义 FastAPI 端点的请求/响应格式。
+> 状态：本文件存在设计意图与实现偏差。已确认的偏差在对应小节以 **[实现偏差]** 标注；未标注处以代码为权威。
 
 ## 基础信息
 
 - 框架：FastAPI
-- 启动：`uvicorn mac_system.api.main:app --host 0.0.0.0 --port 8000`
-- 前缀：无（根路径）
-- 错误格式统一：
+- 启动：`uvicorn mac_system.api.main:app --host 0.0.0.0 --port 18080`（端口由 `MCS_PORT` 环境变量配置，默认 18080，见 `.env`、`scripts/start_server.sh:21`）
+- 前缀：根路径无前缀；管理面有 `/admin` 前缀（见下文）
+- 错误格式：**[实现偏差]** 实际使用 FastAPI 默认错误响应 `{"detail": "<message or code>"}`，本文件早期版本描述的 `{error_code, message, current_state}` 自定义信封未实现。错误码以字符串形式放在 `detail` 字段中。
 
 ```json
-{
-  "error_code": "INVALID_STATE_TRANSITION",
-  "message": "Cannot confirm requirement from state PLANNING_ARCHITECTURE",
-  "current_state": "PLANNING_ARCHITECTURE"
-}
+{"detail": "PROJECT_NOT_FOUND"}
 ```
 
 ## 端点
@@ -35,6 +32,8 @@
   "bound_directory": "/absolute/path/to/existing-repository"
 }
 ```
+
+`task_type` 支持 `feature`、`iteration`、`bug_fix`、`documentation`。其中 `iteration` 只用于已有绑定仓库，并要求请求携带非空 `confirmed_brief.scope` 与 `confirmed_brief.acceptance_criteria`；普通客户端不应把它用于创建全新项目。
 
 **Response：**
 
@@ -159,9 +158,11 @@
 
 ### `POST /projects/{project_id}/approvals/{approval_id}/resolve`
 
-原子响应当前 approval。服务校验 approval 仍为 pending、属于项目当前状态且 action 在 options 中，然后在同一事务内提交 approval 响应和状态转换。重复请求返回第一次处理结果并标记 `already_resolved=true`。
+**[实现偏差]** 此端点为设计意图，当前未单独实现。实际响应 approval 的入口是 `POST /projects/{project_id}/decisions`（携带 `approval_id` 与 `action`）。`/decisions` 端点已涵盖 approval 响应、状态转换与幂等校验。
 
 ### 会话上下文接口
+
+**[实现偏差]** 以下端点为设计意图，当前未实现：
 
 ```text
 GET    /conversations/{chat_id}/projects
@@ -172,7 +173,23 @@ POST   /projects/{project_id}/chats
 DELETE /projects/{project_id}/chats/{chat_id}
 ```
 
+会话与项目的绑定目前通过飞书 `/bind` 文本命令和 admin HTML 面板维护，无 REST 端点。
+
 设置 active project 时必须同时验证用户的 ProjectUser 权限和项目的 ProjectChat 可见关系。管理 API 使用受认证主体，不应信任请求方随意填写 open_id。
+
+### 管理面接口（`/admin` 前缀）
+
+实际实现的管理面端点（HTML 与 action 端点），认证依赖 `_admin_token_dependency`：
+
+```text
+GET    /admin/projects                       管理面项目列表（HTML）
+GET    /admin/projects/{project_id}          管理面项目详情（HTML）
+POST   /admin/projects/{project_id}/cancel   取消项目
+POST   /admin/projects/{project_id}/tick     手动触发一次 tick
+POST   /admin/projects/{project_id}/rollback 回退到指定状态
+```
+
+> **安全提示**：当前 `_admin_token_dependency` 通过 query string 传递 token，且在 `admin_token` 未配置时 fail-open。详见代码 `src/mac_system/api/admin_routes.py:24-27`。
 
 ### `POST /projects/{project_id}/commands`
 
@@ -207,9 +224,9 @@ DELETE /projects/{project_id}/chats/{chat_id}
 }
 ```
 
-### `POST /webhook/feishu`
+### `POST /events`
 
-接收飞书事件回调。
+**[实现偏差]** 飞书事件回调实际入口为 `/events`（由 `feishu_routes.py:56` 定义），不是 `/webhook/feishu`。当 `feishu_transport=websocket` 时此端点不接收事件，仅作为 HTTP 兜底。
 
 **Request：** 飞书原始事件 payload。
 

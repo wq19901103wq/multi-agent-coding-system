@@ -4,7 +4,7 @@
   "description": "文档编写/更新流程",
   "stages": [
     {
-      "id": "outline", "kind": "planning", "execution_state": "DOC_OUTLINE", "agent": "planner", "stage": "doc_outline", "display": "大纲设计中",
+      "id": "outline", "kind": "planning", "execution_state": "DOC_OUTLINE", "agent": "documentation_planner", "stage": "doc_outline", "display": "大纲设计中",
       "inputs": [{"state": "OUTLINE_INPUT_PENDING", "display": "等待大纲澄清", "default": true}],
       "confirmation": {"state": "OUTLINE_CONFIRM_PENDING", "display": "等待确认大纲", "subject": "文档大纲"}
     },

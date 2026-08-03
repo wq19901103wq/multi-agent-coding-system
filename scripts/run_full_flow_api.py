@@ -209,7 +209,11 @@ async def wait_for_state(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MAC full-flow live E2E via API")
-    parser.add_argument("--task-type", default=TASK_TYPE, help="Task type (feature, bug_fix, documentation)")
+    parser.add_argument(
+        "--task-type",
+        default=TASK_TYPE,
+        help="Task type (feature, iteration, bug_fix, documentation)",
+    )
     parser.add_argument("--name", default=PROJECT_NAME, help="Project name")
     parser.add_argument("--description", default=PROJECT_DESCRIPTION, help="Task description")
     return parser.parse_args()

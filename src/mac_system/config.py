@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     state_machines_dir: Path = Field(default=Path("./state_machines"), alias="STATE_MACHINES_DIR")
     workflow_profiles_dir: Path = Field(default=Path("./workflow_profiles"), alias="WORKFLOW_PROFILES_DIR")
     agent_config_path: Path = Field(default=Path("./agent_config.json"), alias="AGENT_CONFIG_PATH")
+    secret_store_path: Path = Field(
+        default=Path("./.mac-secrets.json"), alias="MAC_SECRET_STORE_PATH"
+    )
 
     # Claude Code
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
@@ -35,6 +38,24 @@ class Settings(BaseSettings):
     anthropic_default_haiku_model: str | None = Field(default=None, alias="ANTHROPIC_DEFAULT_HAIKU_MODEL")
     claude_code_effort_level: str | None = Field(default=None, alias="CLAUDE_CODE_EFFORT_LEVEL")
     api_timeout_ms: int | None = Field(default=None, alias="API_TIMEOUT_MS")
+
+    # Alternative coding-agent CLIs. Provider selection is configured per
+    # Agent in agent_config.json; these paths only describe local executables.
+    kimi_bin: Path = Field(default=Path("kimi"), alias="KIMI_BIN")
+    codex_bin: Path = Field(default=Path("codex"), alias="CODEX_BIN")
+    coordinator_codex_home: Path = Field(
+        default=Path("~/.mac-system/codex-coordinator"),
+        alias="MAC_COORDINATOR_CODEX_HOME",
+    )
+    agent_codex_home: Path = Field(
+        default=Path("~/.mac-system/codex-agents"),
+        alias="MAC_AGENT_CODEX_HOME",
+    )
+    pi_bin: Path = Field(default=Path("pi"), alias="PI_BIN")
+    zcode_bin: Path = Field(
+        default=Path("/Applications/ZCode.app/Contents/MacOS/ZCode"),
+        alias="ZCODE_BIN",
+    )
 
     # Feishu
     feishu_app_id: str | None = Field(default=None, alias="FEISHU_APP_ID")

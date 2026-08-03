@@ -1,8 +1,129 @@
 {
   "version": "1.0",
+  "runtimes": {
+    "claude_code": {
+      "enabled": true,
+      "mode": "headless_cli",
+      "description": "Claude Code stream-json runtime"
+    },
+    "kimi_code": {
+      "enabled": true,
+      "mode": "headless_cli",
+      "description": "Kimi Code stream-json runtime"
+    },
+    "codex": {
+      "enabled": true,
+      "mode": "headless_cli",
+      "description": "Codex exec JSONL runtime; MAC validates output schemas locally"
+    },
+    "pi": {
+      "enabled": true,
+      "mode": "headless_cli",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "thinking": "high",
+      "description": "Pi ephemeral JSONL runtime; MAC owns prompts, context, tools and output validation"
+    },
+    "zcode": {
+      "enabled": false,
+      "mode": "desktop_only",
+      "description": "ZCode currently exposes an interactive desktop Agent but no supported headless execution protocol; it is registered but cannot be scheduled by MAC"
+    }
+  },
   "approval_modes_path": "specs/approval_modes.json",
+  "runtime_capabilities": [
+    {
+      "id": "deepseek_openai_compatible",
+      "description": "System-managed DeepSeek credential for OpenAI-compatible application runtimes",
+      "env_bindings": {
+        "LLM_API_KEY": "ANTHROPIC_AUTH_TOKEN"
+      },
+      "applies_to": [
+        "coder",
+        "tester",
+        "acceptance_agent"
+      ],
+      "usage": "Use LLM_API_KEY at the application process boundary. For a durable user-scoped managed service, it may be forwarded through that service manager's private configuration when the project's existing deployment mechanism requires it; never write it into the project/repository, Agent artifacts, test evidence, stdout, cards, or logs."
+    }
+  ],
   "agents": {
+    "requirements_analyst": {
+      "runtime": "claude_code",
+      "description": "只负责把用户目标、边界和验收标准整理成确认需求",
+      "skills": [],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "stages": {
+        "requirements": {
+          "prompt_file": "prompts/planner_requirements.md",
+          "output_file": "REQUIREMENTS.json",
+          "output_schema": "specs/schemas/agent_turn_output.json",
+          "artifact_schema": "specs/schemas/requirements.json",
+          "skills": []
+        }
+      }
+    },
+    "architect": {
+      "runtime": "codex",
+      "description": "根据已确认需求和仓库事实独立设计技术架构",
+      "skills": [],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "stages": {
+        "architecture": {
+          "prompt_file": "prompts/planner_architecture.md",
+          "output_file": "ARCHITECTURE.json",
+          "output_schema": "specs/schemas/agent_turn_output.json",
+          "artifact_schema": "specs/schemas/architecture.json",
+          "skills": []
+        }
+      }
+    },
+    "spec_writer": {
+      "runtime": "claude_code",
+      "description": "把确认的需求与架构转成可执行、可测试的实现合同",
+      "skills": [],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "stages": {
+        "specs": {
+          "prompt_file": "prompts/planner_specs.md",
+          "output_file": "SPECS.json",
+          "output_schema": "specs/schemas/agent_turn_output.json",
+          "artifact_schema": "specs/schemas/specs.json",
+          "skills": []
+        }
+      }
+    },
+    "bug_analyst": {
+      "runtime": "codex",
+      "description": "复现、定位并界定缺陷根因，不负责实现修复",
+      "skills": ["grill-me"],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "stages": {
+        "bug_analysis": {
+          "prompt_file": "prompts/planner_bug_analysis.md",
+          "output_file": "BUG_ANALYSIS.json",
+          "output_schema": "specs/schemas/agent_turn_output.json",
+          "artifact_schema": "specs/schemas/bug_analysis.json",
+          "skills": ["grill-me"]
+        }
+      }
+    },
+    "documentation_planner": {
+      "runtime": "claude_code",
+      "description": "根据目标读者和已有事实设计文档结构",
+      "skills": ["brainstorming"],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "stages": {
+        "doc_outline": {
+          "prompt_file": "prompts/planner_doc_outline.md",
+          "output_file": "DOC_OUTLINE.json",
+          "output_schema": "specs/schemas/agent_turn_output.json",
+          "artifact_schema": "specs/schemas/doc_outline.json",
+          "skills": ["brainstorming"]
+        }
+      }
+    },
     "planner": {
+      "runtime": "claude_code",
       "model": "claude-sonnet-4-20250514",
       "description": "负责需求分析、架构设计和 Spec 拆分",
       "skills": [
@@ -15,38 +136,45 @@
         "requirements": {
           "prompt_file": "prompts/planner_requirements.md",
           "output_file": "REQUIREMENTS.json",
-          "output_schema": "specs/schemas/requirements.json",
-          "skills": ["brainstorming", "grill-me"]
+        "output_schema": "specs/schemas/agent_turn_output.json",
+        "artifact_schema": "specs/schemas/requirements.json",
+          "skills": []
         },
         "architecture": {
           "prompt_file": "prompts/planner_architecture.md",
           "output_file": "ARCHITECTURE.json",
-          "output_schema": "specs/schemas/architecture.json",
-          "skills": ["spec-kit"]
+        "output_schema": "specs/schemas/agent_turn_output.json",
+        "artifact_schema": "specs/schemas/architecture.json",
+          "skills": []
         },
         "specs": {
           "prompt_file": "prompts/planner_specs.md",
           "output_file": "SPECS.json",
-          "output_schema": "specs/schemas/specs.json",
-          "skills": ["spec-kit"]
+        "output_schema": "specs/schemas/agent_turn_output.json",
+        "artifact_schema": "specs/schemas/specs.json",
+          "skills": []
         },
         "bug_analysis": {
           "prompt_file": "prompts/planner_bug_analysis.md",
           "output_file": "BUG_ANALYSIS.json",
-          "output_schema": "specs/schemas/bug_analysis.json",
+        "output_schema": "specs/schemas/agent_turn_output.json",
+        "artifact_schema": "specs/schemas/bug_analysis.json",
           "skills": ["grill-me"]
         },
         "doc_outline": {
           "prompt_file": "prompts/planner_doc_outline.md",
           "output_file": "DOC_OUTLINE.json",
-          "output_schema": "specs/schemas/doc_outline.json",
+        "output_schema": "specs/schemas/agent_turn_output.json",
+        "artifact_schema": "specs/schemas/doc_outline.json",
           "skills": ["brainstorming"]
         }
       }
     },
     "coder": {
+      "runtime": "codex",
       "model": "claude-sonnet-4-20250514",
       "description": "根据 Spec 编写代码或文档",
+      "max_tool_calls": 60,
       "skills": [],
       "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
       "prompt_file": "prompts/coder.md",
@@ -54,33 +182,49 @@
       "output_schema": "specs/schemas/coder_output.json"
     },
     "tester": {
+      "runtime": "codex",
       "model": "claude-sonnet-4-20250514",
       "description": "运行测试并验证实现",
+      "max_tool_calls": 60,
       "skills": [],
-      "default_allowed_tools": ["Read", "Edit", "Write", "Bash"],
+      "default_allowed_tools": ["Read", "Edit", "Write", "Bash", "HostAutomation"],
       "prompt_file": "prompts/tester.md",
       "output_file": "TASK.json",
       "output_schema": "specs/schemas/tester_output.json"
     },
     "reviewer": {
+      "runtime": "codex",
       "model": "claude-sonnet-4-20250514",
       "description": "Review 代码并给出验收结论",
+      "max_tool_calls": 50,
       "skills": [],
-      "default_allowed_tools": ["Read", "Write", "Bash"],
+      "default_allowed_tools": ["Read", "Write", "Bash", "HostAutomation"],
       "prompt_file": "prompts/reviewer.md",
       "output_file": "TASK.json",
       "output_schema": "specs/schemas/reviewer_output.json"
     },
     "acceptance_evaluator": {
+      "runtime": "codex",
       "model": "claude-sonnet-4-20250514",
       "description": "根据测试和 Review 结果给出最终验收建议",
+      "max_tool_calls": 0,
       "skills": [],
-      "default_allowed_tools": ["Read"],
+      "default_allowed_tools": [],
       "prompt_file": "prompts/acceptance_evaluator.md",
       "output_file": "TASK.json",
       "output_schema": "specs/schemas/acceptance_evaluator_output.json"
     },
+    "acceptance_agent": {
+      "runtime": "codex",
+      "description": "从真实用户入口主动执行黑盒验收并产出逐 AC 可复核证据",
+      "skills": [],
+      "default_allowed_tools": ["Read", "Bash", "SandboxWrite", "HostAutomation"],
+      "prompt_file": "prompts/acceptance_agent.md",
+      "output_file": "TASK.json",
+      "output_schema": "specs/schemas/acceptance_agent_output.json"
+    },
     "project_manager": {
+      "runtime": "claude_code",
       "model": "claude-sonnet-4-20250514",
       "description": "处理用户追问、生成确认摘要、推荐下一步动作、目录候选推荐",
       "skills": [],
@@ -100,13 +244,35 @@
       }
     },
     "conversation_coordinator": {
-      "model": "claude-sonnet-4-20250514",
+      "runtime": "codex",
       "description": "理解自由文本对话并在受约束能力之间路由，不直接执行副作用",
       "skills": [],
       "default_allowed_tools": ["Read"],
       "prompt_file": "prompts/conversation_coordinator.md",
       "output_file": "TASK.json",
-      "output_schema": "specs/schemas/conversation_coordinator_output.json"
+      "output_schema": "specs/schemas/conversation_coordinator_output.json",
+      "stages": {
+        "agent_clarification": {
+          "prompt_file": "prompts/coordinator_agent_clarification.md",
+          "output_schema": "specs/schemas/coordinator_agent_clarification_output.json",
+          "allowed_tools": []
+        },
+        "failure_recovery": {
+          "prompt_file": "prompts/coordinator_failure_recovery.md",
+          "output_schema": "specs/schemas/coordinator_failure_recovery_output.json",
+          "allowed_tools": []
+        },
+        "approval_decision": {
+          "prompt_file": "prompts/coordinator_approval_decision.md",
+          "output_schema": "specs/schemas/coordinator_approval_decision_output.json",
+          "allowed_tools": ["Read"]
+        },
+        "input_resolution": {
+          "prompt_file": "prompts/coordinator_input_resolution.md",
+          "output_schema": "specs/schemas/coordinator_input_resolution_output.json",
+          "allowed_tools": ["Read"]
+        }
+      }
     }
   }
 }

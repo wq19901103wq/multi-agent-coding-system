@@ -38,6 +38,8 @@ env/
 .env.local
 .env.bak
 .env.bak.*
+.mac-secrets.json
+.mac-secrets.json.tmp
 
 # SQLite databases
 *.db

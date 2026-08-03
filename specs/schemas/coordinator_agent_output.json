@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Coordinator spawned agent result",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["status", "summary"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "success", "pass", "blocked", "failed"]
+    },
+    "summary": {"type": "string"},
+    "changes": {
+      "type": "array",
+      "items": {}
+    },
+    "verification": {
+      "type": "array",
+      "items": {}
+    },
+    "blockers": {
+      "type": "array",
+      "items": {}
+    }
+  }
+}

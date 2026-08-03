@@ -14,7 +14,9 @@ def test_feature_state_machine_basic():
     assert sm.task_type == "feature"
     assert sm.initial_state == "PLANNING_REQUIREMENTS"
     assert sm.state_type("PLANNING_REQUIREMENTS") == "agent_execution"
-    assert sm.agent_for("PLANNING_REQUIREMENTS") == "planner"
+    assert sm.agent_for("PLANNING_REQUIREMENTS") == "requirements_analyst"
+    assert sm.agent_for("PLANNING_ARCHITECTURE") == "architect"
+    assert sm.agent_for("PLANNING_IMPLEMENTATION_SPECS") == "spec_writer"
     assert sm.stage_for("PLANNING_REQUIREMENTS") == "requirements"
 
 
@@ -86,6 +88,20 @@ def test_documentation_state_machine():
     assert sm.next_state("CODING", "complete") == "CODING_CONFIRM_PENDING"
     assert sm.next_state("CODING_CONFIRM_PENDING", "confirm") == "REVIEW"
     assert sm.next_state("CODING", "outline_question") == "DOC_OUTLINE"
+
+
+def test_iteration_state_machine_skips_redundant_planning_but_keeps_quality():
+    sm = StateMachine("iteration")
+
+    assert sm.initial_state == "CODING"
+    assert [stage["agent"] for stage in sm.profile["stages"]] == [
+        "coder", "tester", "reviewer",
+    ]
+    assert sm.next_state("CODING_CONFIRM_PENDING", "confirm") == "TESTING"
+    assert sm.next_state("TESTING_CONFIRM_PENDING", "confirm") == "REVIEW"
+    assert sm.next_state("REVIEW_CONFIRM_PENDING", "confirm") == "ACCEPTANCE_PENDING"
+    assert sm.available_events("REWORK") == ["to_coding", "to_testing"]
+    assert sm.next_state("ACCEPTANCE_PENDING", "reject_to_coding") == "CODING"
 
 
 def test_terminal_states():

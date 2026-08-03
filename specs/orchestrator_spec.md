@@ -15,33 +15,33 @@
 
 ## 主循环
 
+每个 `tick` 处理**一次**状态转换，然后返回。多个 tick 由外部调度器（消息驱动 / 定时器 / API 调用）连续触发，不在单次 tick 内部循环推进。
+
 ```python
 async def tick(project_id: str) -> None:
     project = await project_service.get_project(project_id)
     state_machine = StateMachine(project.task_type)
 
-    while True:
-        state = project.current_state
-        state_type = state_machine.state_type(state)
+    state = project.current_state
+    state_type = state_machine.state_type(state)
 
-        if state_machine.is_terminal(state):
-            break
+    if state_machine.is_terminal(state):
+        return
 
-        if state_type == "agent_execution":
-            await _execute_agent(project, state_machine)
-        elif state_type == "human_confirmation":
-            await _handle_human_confirmation(project, state_machine)
-        elif state_type == "human_input":
-            await _handle_human_input(project, state_machine)
-        elif state_type == "system_action":
-            await _execute_system_action(project, state_machine)
-        elif state_type == "idle":
-            break
-
-        project = await project_service.get_project(project_id)
+    if state_type == "agent_execution":
+        await _execute_agent(project, state_machine)
+    elif state_type == "human_confirmation":
+        await _handle_human_confirmation(project, state_machine)
+    elif state_type == "human_input":
+        await _handle_human_input(project, state_machine)
+    elif state_type == "system_action":
+        await _execute_system_action(project, state_machine)
+    elif state_type == "idle":
+        return
+    # tick 结束，由外部调度决定是否再次进入 tick
 ```
 
-> 注意：每个 `tick` 只处理一个状态转换，然后重新加载项目状态。避免一次性推进多个状态导致难以调试。
+> 关键约束：单次 `tick` 只执行上述分支中的一个，然后返回。状态转换在分支内部完成；下一次 tick 重新加载 `project.current_state` 决定下一步。这避免了"一次性推进多个状态导致难以调试"，也使 cancel/pause/rollback 等控制命令能在 tick 之间生效。
 
 ## Agent 执行流程
 
@@ -135,7 +135,7 @@ result = await agent_runtime.execute(
 4. 若超过最大重试：
    - 进入 `FAILED` 状态
 
-### 8. 人工确认状态
+### 8. 决策边界（AI-first / 人工升级）
 
 对于 `human_confirmation` / `human_input` 状态：
 
@@ -144,16 +144,29 @@ result = await agent_runtime.execute(
 3. 根据 `approval_mode` 决定：
    - 发送飞书卡片
    - 或自动决策
-4. **结果汇报卡片要求**：每轮 Agent 执行进入 human_confirmation 状态后，必须先发送一张或多张独立的结果汇报卡片（`send_content_card`），展示本轮输出摘要；然后才发送带操作按钮的确认卡片（`send_confirmation_card`）。汇报卡片和确认卡片必须分开发送，不能合并。
-5. 等待用户响应（异步，由 Feishu 回调或 API 触发下一次 `tick`）
+4. **结果汇报卡片要求**：每轮 Agent 执行进入 human_confirmation 状态后，必须先通过 Notification Outbox 发送一张或多张独立的结果汇报卡片，展示本轮输出摘要；然后才发送带操作按钮的确认卡片。汇报卡片和确认卡片必须分开发送，不能合并；审批 payload 不是去重真相源。
+5. 默认 `normal` 模式不把确认态等同于人工等待：规划交给 Codex Coordinator，质量 pass 按专业证据自动推进，REWORK 按 blocking feedback 的推荐目标回退。
+6. 只有偏好、授权、系统不可观测的外部事实，或 Coordinator 无法形成有证据决策时，才等待用户响应。`strict` 模式仍逐项等待人工。
 
 ### 多轮确认与恢复
 
 - 需求、方案、Spec、编码、测试和 Review 都允许多轮；每次重入执行态必须创建新 task_id，并增加该阶段 `round_number`。
-- Agent 因信息不足发出 `ask_user` 时进入对应输入态；用户回答后，回答以 feedback packet 注入下一轮同阶段 Task。
+- Agent 因信息不足发出 `ask_user`（外部 schema 兼容名，语义为 ClarificationRequest）时，Orchestrator 先交给 Coordinator。Coordinator 仅可依据引用的 active confirmed facts 回答；不足时才进入对应用户输入态。回答写入确认事实并注入下一轮同阶段 Task。
 - 用户在确认态选择 `revise` 时，保存本轮产物版本和用户意见，旧 approval 过期，然后回到原执行态。
 - 测试或 Review 明确 fail 时直接进入 `REWORK`，不得改写为 complete，也不得由 night/auto 模式自动放行。
 - Review 回到 Coding 时，Coder 的输入必须包含完整 reviewer output、用户补充意见和未关闭 blocking issues；下一轮 Reviewer 必须逐项复核 Coder 的 `addressed_feedback`。
+
+### WorkItem v2 与无进展循环
+
+- 每个业务 Task 必须由 WorkItem Compiler 生成 v2 合同，包含 owner、stage kind、显式 AC 范围、feedback routes、完成条件、runtime contract 和性能预算。
+- Feedback Router 只读取结构化来源、责任目标和 AC 引用；禁止依据 summary/error message 关键词决定回退。
+- runtime/schema/进程失败留在当前 Task 恢复路径；质量证据失败才进入项目 REWORK。
+- 同一结构化失败签名累计到第三次时，禁止再次静默采用相同回退目标，必须交给 Coordinator 重新选择策略。
+- 若第三次重复后仍需回到同一 owner，Runtime Router 必须优先切换到已安装的另一 headless provider；WorkItem、反馈范围和完成条件保持一致，以减少模型盲区而不要求用户重述问题。
+- Coordinator 自动驳回规划产物时，必须在转换回执行态前把 reason/evidence_refs 写成 `coordinator_rejection` FeedbackPacket；Owner 重跑前必须幂等补建旧版本或崩溃窗口中缺失的 packet，禁止只保留 reject 状态边。
+- 一次 Acceptance fail 只创建一个主责任反馈；coverage validator 只检查 pass 结论是否有完整证据，不得把 fail 再转写成第二个 specs feedback。
+- Acceptance Agent 的缓存键只依赖产品 artifact、workspace 内容、外部证据与执行合同；Tester/Reviewer 的语义输出只影响 Evaluator。任务 ID、profiling、时间戳不参与语义 revision。
+- AcceptanceEvidence 按显式 AC 依赖做局部失效；未受影响的 active evidence 可以跨 artifact revision 复用。
 
 ### Tick 前后检查点
 
@@ -229,8 +242,18 @@ result = await agent_runtime.execute(
 ## 并发控制
 
 - 每个项目同时只能有一个 `tick` 在运行
-- 使用项目级锁（如数据库行锁或 asyncio Lock）
+- 项目级锁必须跨线程、跨 asyncio event loop 生效；HTTP 与飞书 WebSocket 不得各自持有互不相干的 event-loop local lock
+- 当前单进程实现使用 `threading.Lock` 的异步适配层；若扩展为多进程/多实例，必须替换为数据库行锁或分布式租约
+- running-task 检查、条件状态更新和 stale approval 拒绝作为锁之外的数据库幂等防线
 - 全局 Agent 执行受运行时队列限制
+
+## 自适应流程选择
+
+- Coordinator 直接输出 `task_type`；Handler 只校验结构化合同，不扫描用户措辞。
+- `feature` 保留 Requirements → Architecture → Specs → Coding → Testing → Review → Acceptance。
+- `iteration` 仅用于已绑定 Git 仓库中范围明确、架构不确定性低的局部修改，执行 Coding → Testing → Review → Acceptance。
+- `iteration` 创建时必须把已确认 brief 固化为 `ITERATION_BRIEF.json`，为每条 AC 分配稳定 ID，并累积历史项目仍有效的回归 AC。
+- 快速路径不得用于完整参考复刻，也不得因为追求速度跳过 Tester、Reviewer 或主动验收。
 
 ## 事件日志
 
@@ -279,7 +302,7 @@ handler 返回前执行 stuck invariant：active 非终态项目必须具有 run
 
 ### 10. 质量确认关
 
-通用交付状态机按 `feature` profile 生成 8 个人工确认节点：
+通用交付状态机按 `feature` profile 生成 7 个决策边界（状态类型沿用 `human_confirmation` 以兼容持久化协议，但默认并不都等待人）：
 
 | 节点 | 类型 | reject 目标 |
 |---|---|---|
@@ -292,8 +315,9 @@ handler 返回前执行 stuck invariant：active 非终态项目必须具有 run
 | `ACCEPTANCE_PENDING` | 验收确认 | → `REWORK` 或快捷回退 |
 
 质量确认关（CODING/TESTING/REVIEW_CONFIRM_PENDING）的行为：
-- reject 后进入 `REWORK` 状态，由用户选择回退目标
-- REWORK 状态下系统必须在同一交互链中确保回退目标选择卡已发送；用户通过按钮或 `/confirm appr_xxx to_<target>` 选择
+- 专业 Agent 有效 pass 后自动推进并发送只读汇报卡；用户无需重复批准测试事实
+- fail 后进入 `REWORK`；有 blocking feedback 推荐目标时系统自动回退到该阶段
+- 仅在推荐目标缺失/冲突，或用户主动选择 `strict` 模式时发送回退选择卡
 - 回退到 CODING 时，coder 的输入包含 reviewer output 和未关闭的 blocking issues
 - 下一轮 Reviewer 必须逐项复核 coder 的 `addressed_feedback`
 - 质量失败不允许 night/auto 模式自动确认通过
@@ -305,6 +329,8 @@ handler 返回前执行 stuck invariant：active 非终态项目必须具有 run
 - 防止重复 tick 导致多个 claude 进程操作同一 worktree
 
 已在 `orchestrator.py` 中实现。
+
+仅靠上述 running-task 检查不足以覆盖“检查后、写入前”的竞态。`ProjectLockManager` 必须在 FastAPI 和飞书 WebSocket 所在线程间共享同一把项目锁；审批创建还需以当前状态条件更新为准，状态已离开时拒绝创建旧审批，并在状态转换时过期上一状态的 pending approval。
 
 ### 12. Runtime 工具边界与重启恢复
 
@@ -318,12 +344,12 @@ handler 返回前执行 stuck invariant：active 非终态项目必须具有 run
 
 - 所有 Agent 均可返回 `ask_user`，不是 Planner 专属能力。
 - Orchestrator 持久化 question packet，并进入该 Agent 的 input pending 边界；回答后恢复到 `resume_state`、创建新 round，不得统一回退到 Planner。
-- 同一 Agent 可连续多次 `ask_user`。每轮只能有一个当前 pending question，历史问题与回答只追加、不覆盖。
+- 同一 Agent 可连续多次 `ask_user`。多个 pending clarification 可以共存；用户切换话题不会自动关闭旧问题，只有 parent_id、approval_id、问题 ID 或 Coordinator 明确关联的回答才会 resolve 对应问题。历史问题与回答只追加、不覆盖。
 - question packet 同时支持结构化选项和自由文本，包含推荐项、默认假设、blocking、影响范围及 trace IDs。
 - blocking question 未解决时拒绝 Agent 的 `complete`；只有用户明确接受默认假设后，非阻塞未决问题才可随产物进入下一质量门。
 - `ask_user` 处理优先于阶段自己的 `complete/fail` 质量判断；同一输出不得同时推进业务状态和创建问题。
 - 发问 Task 结束为 `waiting_for_user`（或等价可审计状态），回答后创建新 Task/round；不得依赖保持 Claude CLI 进程存活。
 - 恢复前重新加载最新项目状态、用户中途输入、产物版本和 open feedback。若版本已变化，问题标记 stale 并重新评估，不直接套用旧回答。
-- Project Manager 只负责路由歧义或受授权的默认决策，不能代替 Architecture/Coder/Tester/Reviewer 回答其专业问题，也不能绕过 owner-only 决策。
+- Conversation Coordinator 是唯一用户澄清入口。它可以用有来源的确认事实回答业务 Agent，但不能创造事实、替代专业产物判断或绕过 owner-only 决策；`project_manager` 仅保留为控制决策辅助能力。
 
 当前实现验收门槛：所有 Agent 输出 schema 均接受统一 `questions` 结构；所有 agent-execution 状态均接受 `ask_user`；ProjectService 具有 question/answer 的持久模型；Feishu/API 共用原子回答入口；上述任一项缺失时，该能力应标为“设计中”，不能标为“已支持”。

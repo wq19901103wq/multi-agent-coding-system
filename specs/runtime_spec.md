@@ -1,7 +1,23 @@
 # Agent Runtime 规范
 
-> 版本：v1.1
-> 用途：定义 `ClaudeCodeRuntime` 的调用方式、参数、返回值、错误处理。
+> 版本：v2.0
+> 用途：定义多 Provider Agent Runtime 的路由、调用、返回值和错误处理。
+
+## Provider 与路由
+
+生产入口统一通过 `build_agent_runtime()` 构造 `RuntimeRouter`，API、飞书 WebSocket
+和 CLI 不得各自重复创建 Claude-only Runtime。路由来源是
+`agent_config.json -> agents.<agent_type>.runtime`。
+
+- `claude_code`：双向 stream-json，支持 system prompt file 和工具白名单。
+- `kimi_code`：`--print --output-format stream-json` 无交互执行。
+- `codex`：`codex exec --json` JSONL 执行；写角色使用 `workspace-write`，只读角色使用
+  `read-only`。
+- `zcode`：登记为 `desktop_only`；没有受支持的 headless 协议前不得调度。
+
+Codex 不直接接收 MAC 的 Draft 7 output schema。当前 schema 使用 `allOf` 等合法构造，
+而 Codex CLI 的 structured-output 子集会拒绝它们。完整 schema 已注入 prompt，最终对象
+仍必须由 MAC 的 `validate_agent_output()` 做同一份确定性校验，不能降低合同强度。
 
 ## 接口
 
@@ -95,6 +111,10 @@ Runtime 采用 **Claude Code CLI 托管工具执行**：
 
 ## 返回值解析
 
+所有 Provider 都必须归一化为 `AgentRuntimeResult`，并执行同一套本地 schema 校验、
+canonical `.mac` 产物恢复、输出文件扫描、超时和跨 Runtime 实例取消。Provider 原始
+JSONL 保存在日志中，用户进度只展示脱敏的工具摘要；不得展示 Write/Edit 正文或完整 diff。
+
 ### 成功
 
 收到 `type=result` 且 `is_error=false`，并能从 `result` 解析任务元信息 JSON：
@@ -151,24 +171,25 @@ result = AgentRuntimeResult(
 
 ## 安全限制
 
-### Bash 命令白名单（默认）
+### 当前能力边界（MVP 实际状态）
 
-允许：
-- `python` / `python3`
-- `pytest`
-- `git`
-- `ls` / `cat` / `find` / `grep`
-- `mkdir` / `touch`
-- `pip` / `uv`（仅安装沙箱内依赖）
+Runtime 启动 Claude Code CLI 时统一加 `--dangerously-skip-permissions`，**这意味着 CLI 内置的命令审批层被完全绕过**。MVP 阶段的安全边界实际由以下三层提供：
 
-禁止（Agent 尝试执行时 Orchestrator 应拦截）：
+1. **工具白名单**：通过 `--tools` 和 `--allowedTools` 限定 Agent 可调用的工具集（如 `Read`、`Edit`、`Write`、`Bash`、`Glob`、`Grep`）。
+2. **文件系统隔离**：Agent 在专用 worktree 中运行；`--add-dir` 仅授予沙箱外目录的只读访问。
+3. **进程级隔离**：subprocess 在 worktree 作为 cwd 下启动，不继承 MAC System 的管理权限。
+
+### 待实现的命令解析层
+
+以下命令类别应在后续版本中通过独立的命令解析层拦截（当前未实现）：
+
 - `rm -rf /` 或 `rm -rf ~`
 - `sudo`
 - `curl | sh` / `wget | sh`
 - 修改 `/etc`、用户 home 配置等沙箱外文件
 - 网络请求到外部 API（除已配置的 Git 远程）
 
-> 说明：MVP 阶段主要依赖 Claude Code `--allowedTools` 限制，后续可增加命令解析层。
+> **重要**：在命令解析层落地之前，本节描述的拦截**不会发生**。任何依赖此保护层的 spec 或文档应明确标注为"待实现"。`--dangerously-skip-permissions` 与本节拦截清单同时出现在 spec 中是历史遗留，**不是描述两层独立保护**--前者使后者失效。
 
 ## 日志记录
 

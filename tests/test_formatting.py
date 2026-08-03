@@ -53,14 +53,13 @@ def test_format_card_markdown_preserves_code_block():
 
 
 def test_format_tool_preview_known_tools():
-    assert "写入文件" in format_tool_preview("Write", {"file_path": "a.py", "content": "x"})
-    assert "修改文件" in format_tool_preview("Edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"})
-    assert "读取文件" in format_tool_preview("Read", {"file_path": "a.py"})
-    assert "执行命令" in format_tool_preview("Bash", {"command": "ls"})
+    assert "更新项目文件" in format_tool_preview("Write", {"file_path": "a.py", "content": "x"})
+    assert "修改项目文件" in format_tool_preview("Edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"})
+    assert "读取项目资料" in format_tool_preview("Read", {"file_path": "a.py"})
+    assert "执行项目内检查或构建" in format_tool_preview("Bash", {"command": "ls"})
 
 
 def test_format_tool_preview_unknown_tool():
     preview = format_tool_preview("CustomTool", {"foo": "bar", "nested": {"x": 1}})
-    assert "CustomTool" in preview
-    assert "foo=bar" in preview
-    assert "nested" not in preview
+    assert preview == "执行内部工具"
+    assert "bar" not in preview

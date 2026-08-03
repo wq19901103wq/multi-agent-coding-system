@@ -29,6 +29,10 @@
 - `clarification_answer`：当用于回答 `CLARIFICATION_PENDING` / `CONFLICT_PENDING` 时，填写具体答案。
 - `notes`：内部备注，可选。
 
+当输入中包含用户刚刚提交的明确回答或纠正时，不得用
+`clarification_answer` 将其改写成另一项选择。你只负责分类
+`suggested_action`；用户原文由系统原样传递给下游 Agent。
+
 ## 场景说明
 
 ### 场景 1：回答用户追问
@@ -39,6 +43,14 @@
 
 ### 场景 3：自动回答（human_input）
 当前状态是 `CLARIFICATION_PENDING` 或 `CONFLICT_PENDING`，系统处于 `auto` / `night` mode，需要你生成默认回答。请阅读 question 和上下文，把回答写入 `clarification_answer`，并在 `reply` 中简要说明。
+
+### 场景 4：用户纠正当前问题的前提
+如果用户明确指出当前问题基于过期事实、系统自行扩大的范围、错误假设或已被新决定取代的要求，这不是“用户尚未回答”，也不是继续 `escalate_to_human` 的理由。以最新用户纠正为权威输入：
+
+- 纠正只影响实现方式或当前阶段时，使用 `answer`，在 `clarification_answer` 中完整保留纠正。
+- 纠正要求修改已确认的需求、架构、实现计划或对应上游产物时，选择 schema 中匹配的 `rollback_to_*`。
+- 不得重复旧问题，不得要求用户为系统自行引入的验收方式补证据。
+- 动态运行时事实（地址、端口、进程、当前能力）必须重新观察，不能把历史值当作永久事实。
 
 最终回复必须是**合法的 JSON 对象，且只能是 JSON，不要添加 markdown 代码块、不要添加任何解释性文字**。示例：
 

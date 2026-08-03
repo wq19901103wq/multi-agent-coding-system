@@ -9,45 +9,24 @@ def router():
     return IntentRouter(high_threshold=0.85, low_threshold=0.5)
 
 
-def test_route_bug_fix(router):
-    decision = router.route_demand("修复 config-validator 的 port 范围校验 bug")
-    assert decision.task_type == "bug_fix"
-    assert decision.initial_state == "BUG_ANALYSIS"
-    assert decision.confidence == 0.85
-    assert not decision.needs_disambiguation
-
-
-def test_route_documentation(router):
-    decision = router.route_demand("给项目写一份 AGENTS.md")
-    assert decision.task_type == "documentation"
-    assert decision.initial_state == "DOC_OUTLINE"
-    assert decision.confidence == 0.85
-    assert not decision.needs_disambiguation
-
-
-def test_route_feature(router):
-    decision = router.route_demand("实现一个 config-validator CLI")
+@pytest.mark.parametrize(
+    "description",
+    [
+        "修复 config-validator 的 port 范围校验 bug",
+        "给项目写一份 AGENTS.md",
+        "实现一个 config-validator CLI",
+        "重构这段代码",
+        "fix the bug",
+        "换一种完全不同的自然语言表达",
+    ],
+)
+def test_untyped_create_uses_same_neutral_workflow_for_every_wording(router, description):
+    decision = router.route_demand(description)
     assert decision.task_type == "feature"
     assert decision.initial_state == "PLANNING_REQUIREMENTS"
-    assert decision.confidence == 0.85
+    assert decision.confidence == 1.0
     assert not decision.needs_disambiguation
-
-
-def test_route_uncovered(router):
-    decision = router.route_demand("重构这段代码")
-    assert decision.task_type is None
-    assert decision.initial_state is None
-    assert decision.confidence == 0.4
-    assert not decision.needs_disambiguation
-
-
-def test_word_boundary_fix_not_feature(router):
-    # "fix" should not match "feature".
-    decision = router.route_demand("fix the bug")
-    assert decision.task_type == "bug_fix"
-    # "feature" should not be classified as bug_fix just because it contains "feat".
-    decision = router.route_demand("新增一个 feature")
-    assert decision.task_type == "feature"
+    assert "关键词" not in decision.reason
 
 
 def test_suggest_name():

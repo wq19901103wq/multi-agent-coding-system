@@ -1,4 +1,4 @@
-# 对话协调层规范（v1）
+# 对话协调层规范
 
 > 版本：v2.1  
 > 状态：Phase 1–3 核心代码已实现，真实飞书分支 E2E 待完成  
@@ -102,6 +102,8 @@ Handler 不再通过关键词直接决定 correction/scope_change，也不在存
 
 - 加载 Session、最近消息、摘要、active project 和 pending interaction。
 - 调用 Coordinator Agent 并校验独立输出 schema。
+- 接收业务 Agent 的 ClarificationRequest，只用仍有效且带来源的确认事实回答；不能回答时统一升级用户。
+- 将需求、纠正和用户回答规范化为带时间与来源的确认事实，并为每个 WorkItem 选择最小相关事实集。
 - 对无副作用动作调用预定义能力。
 - 对有副作用动作交给 Policy Gate。
 - 保存本轮输入、回复、摘要和动作结果。
@@ -112,6 +114,7 @@ Coordinator 不负责：
 - 直接修改正式工作区。
 - 直接选择存在歧义的项目或审批。
 - 直接调用 `orchestrator.tick()`。
+- 把完整用户聊天记录或无关项目事实直接转发给业务 Agent。
 
 ### 4.3 预定义能力
 
@@ -341,6 +344,7 @@ Agent 的 `authorized` 只是语义判断。真正执行仍需 Policy Gate 找�
 - 同一个绑定目录同时只允许一个 mutating Project；只读调研可并发。
 - 服务重启后从数据库恢复 Session、PendingAction、Project 和 Approval。
 - Agent 输出成功但回执失败时不得重新执行动作，只重试通知。
+- 卡片确认可启动长 Agent，但不得在 Agent 运行期间持有用户消息锁；Approval/Interaction 的原子 claim 负责幂等，状态查询、纠正和取消必须可并发进入。
 - Coordinator schema 失败自动重试一次；仍失败时提供安全菜单，不默认执行。
 - 命令和现有卡片路径在 Coordinator 不可用时继续工作。
 
@@ -358,6 +362,8 @@ Agent 的 `authorized` 只是语义判断。真正执行仍需 Policy Gate 找�
 - **AC-COORD-010**：自然语言和卡片确认共用 Delivery Gateway，并产生相同状态结果。
 - **AC-COORD-011**：Coordinator 失败时 `/create`、`/status`、`/confirm` 和现有卡片仍可用。
 - **AC-COORD-012**：真实飞书 E2E 覆盖讨论→检查→执行确认→Project 创建，以及咨询/范围变更/重复点击分支。
+- **AC-COORD-013**：卡片确认启动长 Agent 后，同一私聊中的状态查询不等待 Agent 结束，且不会改变需求。
+- **AC-COORD-014**：阶段产物重新确认时，关闭该阶段由卡片或自然语言产生的用户反馈；质量反馈仍须质量证据关闭。
 
 ## 13. 分阶段实施
 

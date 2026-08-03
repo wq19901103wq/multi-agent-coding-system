@@ -37,18 +37,47 @@
                 "key": {"type": "string", "minLength": 1},
                 "label": {"type": "string", "minLength": 1},
                 "impact": {"type": "string"},
-                "recommended": {"type": "boolean"}
+                "recommended": {"type": "boolean"},
+                "triggers_free_text": {
+                  "type": "boolean",
+                  "description": "Set to true on the option that means 'I want to describe my own answer'. When the user selects it, the handler collects free-text input instead of submitting the option as the final answer. Required on the non-recommended option of any allow_free_text choice question."
+                },
+                "grants_runtime_capabilities": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "items": {"enum": ["HostAutomation"]},
+                  "description": "Explicit machine-readable capabilities granted when this option is submitted. Labels and option keys are never interpreted as permission."
+                }
               }
             }
           },
           "multiple": {"type": "boolean", "default": false},
           "default_assumption": {"type": ["string", "null"]},
           "affected_trace_ids": {"type": "array", "items": {"type": "string"}}
+          ,
+          "sensitivity": {"enum": ["public", "internal", "secret"], "default": "internal"},
+          "secret_env_var": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"}
         },
         "allOf": [
           {
             "if": {"properties": {"kind": {"enum": ["blocking", "decision"]}}},
-            "then": {"anyOf": [{"properties": {"options": {"minItems": 1}}}, {"properties": {"allow_free_text": {"const": true}}}]}
+            "then": {
+              "required": ["decision_key"],
+              "anyOf": [{"properties": {"options": {"minItems": 1}}}, {"properties": {"allow_free_text": {"const": true}}}]
+            }
+          },
+          {
+            "if": {
+              "required": ["sensitivity"],
+              "properties": {"sensitivity": {"const": "secret"}}
+            },
+            "then": {
+              "required": ["secret_env_var"],
+              "properties": {
+                "allow_free_text": {"const": true},
+                "options": {"maxItems": 0}
+              }
+            }
           }
         ]
       }

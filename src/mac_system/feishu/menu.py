@@ -179,7 +179,6 @@ def build_pending_action_card(
         "header": _header("确认执行范围", "orange"),
         "elements": [
             {"tag": "div", "text": _lark_md("\n\n".join(sections))},
-            {"tag": "div", "text": _lark_md(f"执行请求ID：{action_id}")},
             {
                 "tag": "action",
                 "actions": [
@@ -251,9 +250,8 @@ def build_project_control_card(
         }
 
     body = [
-        f"**目标项目**：{project_name}（`{project_id}`）",
+        f"**目标项目**：{project_name}",
         description,
-        f"执行请求ID：{action_id}",
     ]
     return {
         "config": {"wide_screen_mode": True},

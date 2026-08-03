@@ -12,7 +12,17 @@ Agent 使用统一的 `question_batch`，schema 为 `specs/schemas/agent_questio
 {
   "success": true,
   "next_state_event": "ask_user",
-  "completion_reason": "question_requested",
+  "completion_reason": "resolution_requested",
+  "blockers": [{
+    "id": "rr_auth_scope",
+    "category": "ambiguous_requirement",
+    "summary": "权限范围尚未确定",
+    "evidence": ["WorkItem 中没有已确认的权限边界"],
+    "required_resolution": "明确采用团队级还是个人级权限范围",
+    "preferred_resolver": "coordinator",
+    "blocking": true,
+    "affected_acceptance_criterion_ids": ["AC-AUTH-002"]
+  }],
   "question_batch": {
     "batch_key": "requirements_round_2",
     "questions": [
@@ -49,6 +59,10 @@ Agent 使用统一的 `question_batch`，schema 为 `specs/schemas/agent_questio
 - `QuestionAnswer`：答案、展示文本、回答人和时间；
 - `Approval`：当前输入边界及飞书卡片路由信息。
 
+这里的 `ask_user` 是 Agent 输出 schema 的兼容名称。业务 Agent 实际请求对象始终是 Coordinator：Orchestrator 先让 Coordinator 根据当前 WorkItem 和 active confirmed facts 尝试回答，并校验其 `source_fact_ids`；只有无法回答或引用无效时才设置 `escalated_to_user=true` 并创建用户卡片。密钥问题只把 `env:VAR` 能力引用放入事实和 Prompt，原值由 Runtime 注入。
+
+`ask_user` 不是凭证特例。任何无法满足 WorkItem 完成条件、且需要外部信息、能力、权限、依赖或范围决策才能解除的情况，都必须同时输出非空 `blockers`。每项 blocker 遵循 `resolution_request.json`；Runtime 和 Orchestrator 都会拒绝只有问题、没有 ResolutionRequest 的输出。
+
 ## 2. 卡片交互
 
 - **选择题**：合并到一张交互卡片里，使用按钮展示选项；点击选项仅切换卡片上的选中状态，不会直接提交。
@@ -78,7 +92,7 @@ reply.parent_id
 若没有 `parent_id`：
 
 - `/input` 按 approval_id 路由；
-- 普通自由文本按当前聊天、当前用户的 active project 路由；
+- 普通自由文本先由 Coordinator 判断它是否明确回答某个 pending clarification；若是则定向路由，否则作为新话题处理并保留旧问题；
 - 多候选项目时先显示项目选择器，不由 LLM 猜测。
 
 ## 4. 恢复规则
@@ -89,6 +103,7 @@ reply.parent_id
 - resolve 后按 `resume_state` 回到原 Agent：Tester 回 Tester、Reviewer 回 Reviewer，不统一回 Coding 或 Planner。
 - Agent 下一轮 Prompt 注入历史问答，避免重复提问。
 - 同一 `batch_key + origin round` 的重复输出不得创建第二批有效问题；旧 approval 进入 expired。
+- 多个 conversation clarification 可以并存，不能因为创建新问题或用户提出新话题就批量 expire。
 
 ## 5. 多轮原则
 

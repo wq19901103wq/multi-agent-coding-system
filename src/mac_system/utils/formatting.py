@@ -173,44 +173,22 @@ def format_card_markdown(text: str) -> str:
 
 
 def format_tool_preview(name: str, tool_input: dict[str, Any] | None) -> str:
-    """Render a tool call in a concise, human-readable way.
+    """Render a tool call as safe, user-facing progress.
 
-    Avoids dumping raw JSON on the user.
+    Arguments are internal execution details and may contain host paths,
+    commands, URLs, queries, or generated content. Describe intent without
+    echoing those arguments into a user-visible card.
     """
-    inp = tool_input or {}
     if name in {"Write", "write", "BashWrite"}:
-        path = inp.get("file_path") or inp.get("path") or "未知文件"
-        content = inp.get("content", "")
-        length = len(content) if isinstance(content, str) else 0
-        return f"写入文件 `{path}`（{length} 字符）"
+        return "更新项目文件"
     if name in {"Edit", "edit", "BashEdit"}:
-        path = inp.get("file_path") or inp.get("path") or "未知文件"
-        old = inp.get("old_string", "")
-        new = inp.get("new_string", "")
-        old_len = len(old) if isinstance(old, str) else 0
-        new_len = len(new) if isinstance(new, str) else 0
-        return f"修改文件 `{path}`（旧 {old_len} / 新 {new_len} 字符）"
+        return "修改项目文件"
     if name in {"Read", "read", "BashRead"}:
-        path = inp.get("file_path") or inp.get("path") or inp.get("file") or "未知文件"
-        return f"读取文件 `{path}`"
+        return "读取项目资料"
     if name in {"Bash", "bash", "BashTool"}:
-        cmd = str(inp.get("command", "")).strip()
-        return f"执行命令 `{cmd[:120]}{'...' if len(cmd) > 120 else ''}`"
+        return "执行项目内检查或构建"
     if name in {"Glob", "glob"}:
-        pattern = inp.get("pattern") or inp.get("path") or "*"
-        return f"查找文件 `{pattern}`"
+        return "查找项目文件"
     if name in {"Grep", "grep"}:
-        query = inp.get("query") or inp.get("pattern") or ""
-        path = inp.get("path") or ""
-        return f"搜索 `{query[:80]}`{' in `' + path + '`' if path else ''}"
-
-    # Generic fallback: key=value pairs, skipping nested objects/arrays.
-    pairs: list[str] = []
-    for key, value in inp.items():
-        if isinstance(value, str):
-            pairs.append(f"{key}={value[:80]}{'...' if len(value) > 80 else ''}")
-        elif isinstance(value, (int, float, bool)) or value is None:
-            pairs.append(f"{key}={value}")
-    if pairs:
-        return f"调用 `{name}`：{', '.join(pairs)}"
-    return f"调用工具 `{name}`"
+        return "搜索项目内容"
+    return "执行内部工具"

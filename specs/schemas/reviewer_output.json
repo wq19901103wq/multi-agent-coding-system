@@ -6,7 +6,7 @@
   "required": ["success", "next_state_event"],
   "additionalProperties": false,
   "properties": {
-    "success": {"type": "boolean"},
+    "success": {"const": true},
     "next_state_event": {"enum": ["complete", "fail", "ask_user"]},
     "question_batch": {"$ref": "agent_question_batch.json"},
     "result": {"enum": ["pass", "fail"]},
@@ -53,14 +53,27 @@
     "notes": {
       "type": "array",
       "items": {"type": "string"}
-    }
+    },
+    "completion_reason": {"type": "string", "minLength": 1},
+    "blockers": {"type": "array", "items": {"$ref": "resolution_request.json"}},
+    "completion_evidence": {"type": "array", "items": {"type": "string"}},
+    "deferred_obligations": {"type": "array", "items": {"type": "object"}}
   },
   "allOf": [{
     "if": {"properties": {"next_state_event": {"const": "ask_user"}}},
-    "then": {"required": ["question_batch"]},
+    "then": {
+      "required": ["question_batch", "blockers", "completion_reason"],
+      "properties": {
+        "completion_reason": {"const": "resolution_requested"},
+        "blockers": {"minItems": 1}
+      }
+    },
     "else": {
       "required": ["result"],
       "not": {"required": ["question_batch"]}
     }
+  }, {
+    "if": {"properties": {"next_state_event": {"const": "complete"}}},
+    "then": {"properties": {"blockers": {"maxItems": 0}}}
   }]
 }

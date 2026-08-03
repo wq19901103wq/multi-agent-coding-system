@@ -4,8 +4,9 @@
   "title": "Common Agent Turn Output",
   "type": "object",
   "required": ["success", "next_state_event"],
+  "additionalProperties": false,
   "properties": {
-    "success": {"type": "boolean"},
+    "success": {"const": true},
     "next_state_event": {
       "enum": [
         "complete", "fail", "ask_user", "clarify", "conflict",
@@ -14,19 +15,74 @@
       ]
     },
     "question_batch": {"$ref": "agent_question_batch.json"},
-    "completion_reason": {"enum": ["stage_result", "question_requested", "technical_failure"]}
+    "completion_reason": {"type": "string", "minLength": 1},
+    "modified_files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "description": {"type": "string"}
+        }
+      }
+    },
+    "notes": {"type": "array", "items": {"type": "string"}},
+    "blockers": {"type": "array", "items": {"$ref": "resolution_request.json"}},
+    "completion_evidence": {"type": "array", "items": {"type": "string"}},
+    "verified_feedback_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string"}
+    },
+    "addressed_feedback": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["feedback_id", "status", "explanation"],
+        "additionalProperties": false,
+        "properties": {
+          "feedback_id": {"type": "string"},
+          "status": {"enum": ["fixed", "partially_fixed", "disputed", "not_applicable"]},
+          "explanation": {"type": "string"},
+          "files": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "deferred_obligations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "summary", "owner_stage", "allowed_by_contract"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string"},
+          "summary": {"type": "string"},
+          "owner_stage": {"type": "string"},
+          "allowed_by_contract": {"const": true}
+        }
+      }
+    }
   },
   "allOf": [
     {
       "if": {"properties": {"next_state_event": {"const": "ask_user"}}},
       "then": {
-        "required": ["question_batch"],
+        "required": ["question_batch", "blockers", "completion_reason"],
         "properties": {
           "success": {"const": true},
-          "completion_reason": {"const": "question_requested"}
+          "completion_reason": {"const": "resolution_requested"},
+          "blockers": {"minItems": 1}
         }
       },
       "else": {"not": {"required": ["question_batch"]}}
+    },
+    {
+      "if": {"properties": {"next_state_event": {"const": "complete"}}},
+      "then": {
+        "properties": {"blockers": {"maxItems": 0}}
+      }
     }
   ]
 }

@@ -3,10 +3,14 @@ disable_existing_loggers: false
 formatters:
   default:
     format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+filters:
+  redact_secrets:
+    (): mac_system.utils.redaction.SecretRedactionFilter
 handlers:
   console:
     class: logging.StreamHandler
     formatter: default
+    filters: [redact_secrets]
     stream: ext://sys.stdout
 loggers:
   uvicorn:
@@ -22,6 +26,10 @@ loggers:
     handlers: [console]
     propagate: false
   mac_system:
+    level: INFO
+    handlers: [console]
+    propagate: false
+  Lark:
     level: INFO
     handlers: [console]
     propagate: false

@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 from mac_system.utils.formatting import format_card_markdown
@@ -40,14 +41,21 @@ def build_content_card(
     body_elements: list[dict[str, Any]] = [
         {"tag": "markdown", "content": format_card_markdown(content)},
     ]
-    if total > 1:
-        body_elements.append({
-            "tag": "note",
-            "elements": [_plain_text(f"第 {page}/{total} 页")],
-        })
+    # Feishu's message-history API does not return Card 2.0 body JSON; without
+    # a summary it exposes only the generic "upgrade your client" fallback.
+    # A meaningful preview also keeps chat-list/history output observable for
+    # users and black-box checks without introducing a parallel text message.
+    summary_text = re.sub(r"[`*_#>\[\]]", "", f"{header_title}\n{content}")
+    summary_text = re.sub(r"\s+", " ", summary_text).strip()[:500]
+    # Card 2.0 does not support the legacy ``note`` element. Pagination is
+    # already visible in the header, so adding a note makes every multi-page
+    # report fail provider-side while single-page reports keep working.
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True},
+        "config": {
+            "wide_screen_mode": True,
+            "summary": {"content": summary_text},
+        },
         "header": _header(header_title, color),
         "body": {"elements": body_elements},
     }
@@ -182,20 +190,56 @@ def build_confirmation_card(
     chat_id: str | None = None,
     chat_type: str = "p2p",
     show_actions: bool = True,
+    selected_action: str | None = None,
+    resolved_by: str | None = None,
+    resolved_at: str | None = None,
+    resulting_state: str | None = None,
+    resolution_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Build a Feishu interactive confirmation card."""
+    """Build a pending or read-only completed confirmation card.
+
+    A decision card is a projection of its Approval, not a disposable set of
+    buttons.  Once ``selected_action`` is present the original options remain
+    visible, the selected option is marked, actions are disabled, and the
+    resolver/resulting state are shown so Feishu converges with backend state.
+    """
     elements: list[dict[str, Any]] = []
     if summary:
         elements.append({"tag": "div", "text": _lark_md(f"**摘要**：{summary}")})
     for key, value in details.items():
         elements.append({"tag": "div", "text": _lark_md(f"**{key}**：{value}")})
 
-    # Expose the approval id so users can respond via slash commands too.
-    elements.append(
-        {"tag": "div", "text": _lark_md(f"审批ID：{approval_id}\n可用 **/confirm {approval_id}** 或 **/reject {approval_id} [反馈]**")}
-    )
+    selected_label = ""
+    if selected_action is not None:
+        for opt in options:
+            if str(opt.get("action")) == str(selected_action):
+                selected_label = str(opt.get("label") or selected_action)
+                break
+        if not selected_label:
+            selected_label = str(selected_action)
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": _lark_md(f"✅ 已选择：**{selected_label}**"),
+        })
+        if resolved_by:
+            elements.append({
+                "tag": "div", "text": _lark_md(f"**决策者**：{resolved_by}")
+            })
+        if resolved_at:
+            elements.append({
+                "tag": "div", "text": _lark_md(f"**处理时间**：{resolved_at}")
+            })
+        if resolution_reason:
+            elements.append({
+                "tag": "div", "text": _lark_md(f"**依据**：{resolution_reason}")
+            })
+        if resulting_state:
+            elements.append({
+                "tag": "div", "text": _lark_md(f"**项目已进入**：{resulting_state}")
+            })
 
-    if show_actions:
+    if show_actions and selected_action is None:
         actions: list[dict[str, Any]] = []
         for opt in options:
             value = {
@@ -221,7 +265,7 @@ def build_confirmation_card(
 
     return {
         "config": {"wide_screen_mode": True},
-        "header": _header(title, "blue"),
+        "header": _header(title, "green" if selected_action is not None else "blue"),
         "elements": elements,
     }
 
@@ -253,8 +297,6 @@ def build_input_card(
     ]
     if context:
         elements.append({"tag": "div", "text": _lark_md(f"**上下文**：{context}")})
-    elements.append({"tag": "div", "text": _lark_md(f"审批ID：{approval_id}")})
-
     if answered:
         elements.append({"tag": "hr"})
         elements.append({"tag": "div", "text": _lark_md(f"**你的回答**：{answer_text or ''}")})
@@ -303,13 +345,16 @@ _TRANSITION_DISPLAY_NAMES: dict[str, str] = {
     "DOC_OUTLINE": "文档大纲",
     "CODING": "编码",
     "TESTING": "测试",
-    "REVIEW": "Review",
+    "REVIEW": "代码评审",
     "MERGING": "提交代码",
     "REQUIREMENT_CONFIRM_PENDING": "需求确认",
     "ARCHITECTURE_CONFIRM_PENDING": "方案确认",
     "IMPLEMENTATION_SPEC_CONFIRM_PENDING": "实现计划确认",
     "BUG_FIX_CONFIRM_PENDING": "修复方案确认",
     "OUTLINE_CONFIRM_PENDING": "文档大纲确认",
+    "CODING_CONFIRM_PENDING": "编码结果确认",
+    "TESTING_CONFIRM_PENDING": "测试结果确认",
+    "REVIEW_CONFIRM_PENDING": "代码评审确认",
     "ACCEPTANCE_PENDING": "验收确认",
 }
 
@@ -489,15 +534,35 @@ def build_status_card(
     current_state: str,
     display: str,
     recent_events: list[dict[str, Any]],
+    workflow_steps: list[dict[str, Any]] | None = None,
+    action_needed: str | None = None,
+    workspace: str | None = None,
 ) -> dict[str, Any]:
     """Build a Feishu status update card."""
     elements: list[dict[str, Any]] = [
-        {"tag": "div", "text": _lark_md(f"**项目**：{project_id}")},
-        {"tag": "div", "text": _lark_md(f"**当前状态**：{display} ({current_state})")},
+        {"tag": "div", "text": _lark_md(f"**当前状态**：{display}")},
     ]
+    if workflow_steps:
+        chain = " → ".join(
+            (
+                f"**{item.get('label', '')}**"
+                if item.get("current")
+                else str(item.get("label", ""))
+            )
+            for item in workflow_steps
+            if item.get("label")
+        )
+        elements.append({"tag": "div", "text": _lark_md(f"**执行链路**：{chain}")})
+    if workspace:
+        elements.append({"tag": "div", "text": _lark_md(f"**工作目录**：{workspace}")})
+    if action_needed:
+        elements.append({
+            "tag": "div",
+            "text": _lark_md(f"**当前需要你处理**：{action_needed}"),
+        })
     if recent_events:
-        lines = "\n".join(f"- {e.get('level', 'INFO')}: {e.get('message', '')}" for e in recent_events)
-        elements.append({"tag": "div", "text": _lark_md(f"**最近事件**：\n{lines}")})
+        lines = "\n".join(f"- {e.get('message', '')}" for e in recent_events[:4])
+        elements.append({"tag": "div", "text": _lark_md(f"**关键进展**：\n{lines}")})
 
     return {
         "config": {"wide_screen_mode": True},
@@ -506,10 +571,55 @@ def build_status_card(
     }
 
 
+def _inline_free_text_form(
+    approval_id, interaction_id, question_id, state, chat_id, chat_type,
+) -> dict[str, Any]:
+    """Build a Card 2.0 form element for inline free-text submission.
+
+    The form contains a multiline text input and a submit button. On submit,
+    Feishu delivers ``form_value`` keyed by the input ``name`` alongside the
+    button ``value`` payload, so the handler can read the typed text from
+    ``action.extras["inline_free_text_value"]``.
+    """
+    return {
+        "tag": "form",
+        "name": f"inline_free_text_form_{question_id}",
+        "elements": [
+            {
+                "tag": "input",
+                "name": "inline_free_text_value",
+                "required": True,
+                "input_type": "multiline_text",
+                "width": "fill",
+                "placeholder": _plain_text("或直接在此输入你的方案..."),
+            },
+            {
+                "tag": "button",
+                "text": _plain_text("提交自定义答案"),
+                "type": "primary_filled",
+                "form_action_type": "submit",
+                "behaviors": [{
+                    "type": "callback",
+                    "value": {
+                        "approval_id": approval_id,
+                        "interaction_id": interaction_id,
+                        "action": "submit_inline_free_text",
+                        "question_id": question_id,
+                        "state": state,
+                        "chat_id": chat_id,
+                        "chat_type": chat_type,
+                    },
+                }],
+            },
+        ],
+    }
+
+
 def build_question_batch_card(
     approval_id, interaction_id, questions, agent, stage, impact=None,
     state="", project_name="", chat_id=None, chat_type="p2p",
     selected_options=None, submitted_answers=None, awaiting_free_text=False,
+    inline_free_text_question_id=None,
 ):
     """Build a Feishu card that presents a batch of choice questions as buttons.
 
@@ -519,10 +629,22 @@ def build_question_batch_card(
     When ``submitted_answers`` is provided, render a read-only receipt
     state: option buttons are disabled, final answers are highlighted, action
     buttons are hidden, and a status line is appended.
+
+    When ``inline_free_text_question_id`` is set (and the matching question is
+    in ``questions``), an inline form is rendered below that question's option
+    buttons so the user can type a custom answer without going through the
+    2-step "provide_custom -> reply to input card" flow. The card switches to
+    the Feishu Card 2.0 envelope because ``form``/``input`` elements require
+    schema 2.0; legacy 1.0 elements (div/hr/action) remain compatible.
     """
     selected_options = selected_options or {}
     submitted_answers = submitted_answers or {}
     is_submitted = bool(submitted_answers)
+    all_submitted = is_submitted and all(
+        (q.get("question_id") or q.get("db_id") or "") in submitted_answers
+        for q in questions
+    )
+    use_inline_form = bool(inline_free_text_question_id) and not is_submitted
     elements: list[dict[str, Any]] = []
     if impact:
         elements.append({"tag": "div", "text": _lark_md(f"**影响说明**：{impact}")})
@@ -540,11 +662,12 @@ def build_question_batch_card(
         recommended = q.get("recommended_option")
         selected = selected_options.get(qid)
         final_answer = submitted_answers.get(qid)
+        is_q_submitted = bool(qid) and qid in submitted_answers
         kind_badge = {"blocking": "阻塞", "decision": "决策", "non_blocking": "可选"}.get(kind, kind)
         header_line = f"**{question_text}** （{kind_badge}）"
         if reason:
             header_line += f"\n原因：{reason}"
-        if is_submitted:
+        if is_q_submitted:
             if final_answer:
                 final_label = next((opt.get("label", opt.get("key", "")) for opt in options if opt.get("key") == final_answer), final_answer)
                 header_line += f"\n已提交：{final_label}"
@@ -565,7 +688,7 @@ def build_question_batch_card(
             is_selected = key == selected
             is_final = key == final_answer
             is_recommended = key == recommended
-            if is_submitted:
+            if is_q_submitted:
                 btn_type = "primary" if is_final else "default"
             else:
                 btn_type = "primary" if is_selected else ("primary" if is_recommended and selected is None else "default")
@@ -584,14 +707,24 @@ def build_question_batch_card(
                     "chat_type": chat_type,
                 },
             }
-            if is_submitted:
+            if is_q_submitted:
                 button["disabled"] = True
             option_buttons.append(button)
         for i in range(0, len(option_buttons), 4):
             elements.append({"tag": "action", "actions": option_buttons[i:i + 4]})
+        # Inline free-text form: render below the option buttons so the user
+        # can type a custom answer without going through the 2-step flow.
+        if use_inline_form and qid == inline_free_text_question_id:
+            elements.append(_inline_free_text_form(
+                approval_id=approval_id,
+                interaction_id=interaction_id,
+                question_id=qid,
+                state=state,
+                chat_id=chat_id,
+                chat_type=chat_type,
+            ))
     elements.append({"tag": "hr"})
-    elements.append({"tag": "div", "text": _lark_md(f"审批ID：{approval_id}")})
-    if is_submitted:
+    if all_submitted:
         status = (
             "✏️ 选择已提交，请在接下来的输入卡补充具体要求"
             if awaiting_free_text
@@ -618,10 +751,17 @@ def build_question_batch_card(
     title = (
         "等待补充说明"
         if is_submitted and awaiting_free_text
-        else ("已提交" if is_submitted else f"需要确认 {len(questions)} 个问题")
+        else ("已提交" if all_submitted else f"需要确认 {len(questions)} 个问题")
     )
     prefix = f"[{project_name}] " if project_name else ""
-    header_color = "green" if is_submitted else "orange"
+    header_color = "green" if all_submitted else "orange"
+    if use_inline_form:
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": _header(f"{prefix}[{stage_label}] {title}", header_color),
+            "body": {"elements": elements},
+        }
     return {"config": {"wide_screen_mode": True},
             "header": _header(f"{prefix}[{stage_label}] {title}", header_color),
             "elements": elements}

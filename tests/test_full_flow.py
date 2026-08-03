@@ -61,6 +61,7 @@ def _make_runtime(extra: dict | None = None) -> FakeRuntime:
                     "requirement_ids": ["REQ-001"],
                     "statement": "功能可用",
                     "verification_method": "automated_test",
+                    "evidence_source": "system_observable",
                 }
             ],
             "tech_stack": ["Python"],
@@ -165,6 +166,27 @@ def _make_runtime(extra: dict | None = None) -> FakeRuntime:
             "summary": "Review 通过",
             "notes": [],
         },
+        "acceptance_agent": {
+            "success": True,
+            "result": "pass",
+            "summary": "真实入口黑盒验收通过",
+            "criteria": [{
+                "acceptance_criterion_id": "AC-001",
+                "evidence_source": "system_observable",
+                "result": "pass",
+                "method": "从公开入口执行核心功能",
+                "expected": "功能可用",
+                "actual": "功能按预期返回",
+                "evidence": ["blackbox:core-flow:pass"],
+                "limitations": [],
+            }],
+            "user_input_requests": [],
+            "environment": {
+                "entry_points": ["local://fake-entry"],
+                "started_services": [],
+                "artifacts": [],
+            },
+        },
         "acceptance_evaluator": {
             "success": True,
             "next_state_event": "complete",
@@ -191,10 +213,42 @@ def _make_runtime(extra: dict | None = None) -> FakeRuntime:
             "artifact_versions": {"requirements": 1, "specs": 1, "coder_output": 1},
             "recommendation": {"action": "confirm", "reason": "通过"},
         },
+        "conversation_coordinator": {
+            "success": True,
+            "action": "confirm",
+            "reason": "阶段产物覆盖当前合同且没有未解决 blocker",
+            "evidence_refs": [".mac/REQUIREMENTS.json"],
+        },
     }
     if extra:
         outputs.update(extra)
     return FakeRuntime(outputs)
+
+
+@pytest.mark.asyncio
+async def test_normal_ai_first_flow_completes_without_user_approval(base_orchestrator):
+    service, wm, renderer = base_orchestrator
+    oc = AgentOrchestrator(service, wm, _make_runtime(), renderer)
+    project = await service.create_project(
+        name="ai-first-flow",
+        task_type="feature",
+        description="实现一个简单功能",
+        approval_mode="normal",
+    )
+
+    for _ in range(20):
+        await oc.tick(project.id)
+        project = service.require_project(project.id)
+        if project.current_state in {"COMPLETED", "FAILED", "CANCELLED"}:
+            break
+
+    assert project.current_state == "COMPLETED"
+    approvals = service.session.exec(
+        select(Approval).where(Approval.project_id == project.id)
+    ).all()
+    assert approvals
+    assert all(item.responded_by != "test_user" for item in approvals)
+    assert service.get_project_status(project.id)["pending_approval"] is None
 
 
 async def _resolve_pending(service: ProjectService, project: Project, action: str, payload: dict | None = None):
@@ -233,7 +287,7 @@ async def test_full_feature_flow_confirm_all(base_orchestrator):
         name="feature-flow",
         task_type="feature",
         description="实现一个简单功能",
-        approval_mode="normal",
+        approval_mode="strict",
     )
 
     # PLANNING_REQUIREMENTS -> REQUIREMENT_CONFIRM_PENDING
@@ -274,14 +328,19 @@ async def test_full_feature_flow_confirm_all(base_orchestrator):
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
 
-    # ACCEPTANCE_PENDING
+    # Strict mode retains the explicit final acceptance boundary.
     project, _ = await _tick_until_pending(oc, service, project.id)
     assert project.current_state == "ACCEPTANCE_PENDING"
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
-
-    project = service.require_project(project.id)
-    assert project.current_state == "COMPLETED"
+    assert service.require_project(project.id).current_state == "COMPLETED"
+    assert service.session.exec(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.agent_type == "acceptance_agent",
+            Task.status == "completed",
+        )
+    ).first() is not None
 
 
 @pytest.mark.asyncio
@@ -294,7 +353,7 @@ async def test_full_feature_flow_reject_requirements(base_orchestrator):
         name="feature-reject",
         task_type="feature",
         description="实现一个简单功能",
-        approval_mode="normal",
+        approval_mode="strict",
     )
 
     project, _ = await _tick_until_pending(oc, service, project.id)
@@ -341,7 +400,7 @@ async def test_full_feature_flow_rework_from_acceptance(base_orchestrator):
         name="feature-rework",
         task_type="feature",
         description="实现一个简单功能",
-        approval_mode="normal",
+        approval_mode="strict",
     )
 
     # Advance to ACCEPTANCE_PENDING
@@ -386,7 +445,7 @@ async def test_full_feature_flow_pause_and_resume(base_orchestrator):
         name="feature-pause",
         task_type="feature",
         description="实现一个简单功能",
-        approval_mode="normal",
+        approval_mode="strict",
     )
 
     project, _ = await _tick_until_pending(oc, service, project.id)
@@ -413,7 +472,7 @@ async def test_full_bug_fix_flow_confirm(base_orchestrator):
         name="bug-fix-flow",
         task_type="bug_fix",
         description="修复端口校验 bug",
-        approval_mode="normal",
+        approval_mode="strict",
     )
 
     # BUG_ANALYSIS -> BUG_FIX_CONFIRM_PENDING
@@ -440,14 +499,12 @@ async def test_full_bug_fix_flow_confirm(base_orchestrator):
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
 
-    # ACCEPTANCE_PENDING
+    # Strict mode retains the explicit final acceptance boundary.
     project, _ = await _tick_until_pending(oc, service, project.id)
     assert project.current_state == "ACCEPTANCE_PENDING"
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
-
-    project = service.require_project(project.id)
-    assert project.current_state == "COMPLETED"
+    assert service.require_project(project.id).current_state == "COMPLETED"
 
 
 @pytest.mark.asyncio
@@ -460,7 +517,7 @@ async def test_full_documentation_flow_confirm(base_orchestrator):
         name="doc-flow",
         task_type="documentation",
         description="写一份 AGENTS.md",
-        approval_mode="normal",
+        approval_mode="strict",
     )
 
     # DOC_OUTLINE -> OUTLINE_CONFIRM_PENDING
@@ -481,14 +538,12 @@ async def test_full_documentation_flow_confirm(base_orchestrator):
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
 
-    # ACCEPTANCE_PENDING
+    # Strict mode retains the explicit final acceptance boundary.
     project, _ = await _tick_until_pending(oc, service, project.id)
     assert project.current_state == "ACCEPTANCE_PENDING"
     await _resolve_pending(service, project, "confirm")
     await oc.tick(project.id)
-
-    project = service.require_project(project.id)
-    assert project.current_state == "COMPLETED"
+    assert service.require_project(project.id).current_state == "COMPLETED"
 
 
 @pytest.mark.asyncio
@@ -498,7 +553,7 @@ async def test_full_feature_flow_reject_architecture(base_orchestrator):
     oc = AgentOrchestrator(service, wm, runtime, renderer)
     project = await service.create_project(
         name="reject-arch", task_type="feature",
-        description="实现一个简单功能", approval_mode="normal",
+        description="实现一个简单功能", approval_mode="strict",
     )
     project, _ = await _tick_until_pending(oc, service, project.id)
     assert project.current_state == "REQUIREMENT_CONFIRM_PENDING"
@@ -523,7 +578,7 @@ async def test_full_feature_flow_reject_specs(base_orchestrator):
     oc = AgentOrchestrator(service, wm, runtime, renderer)
     project = await service.create_project(
         name="reject-specs", task_type="feature",
-        description="实现一个简单功能", approval_mode="normal",
+        description="实现一个简单功能", approval_mode="strict",
     )
     for exp in ("REQUIREMENT_CONFIRM_PENDING", "ARCHITECTURE_CONFIRM_PENDING"):
         project, _ = await _tick_until_pending(oc, service, project.id)
@@ -549,7 +604,7 @@ async def test_full_feature_flow_reject_coding_quality_gate(base_orchestrator):
     oc = AgentOrchestrator(service, wm, runtime, renderer)
     project = await service.create_project(
         name="reject-coding", task_type="feature",
-        description="实现一个简单功能", approval_mode="normal",
+        description="实现一个简单功能", approval_mode="strict",
     )
     for exp in ("REQUIREMENT_CONFIRM_PENDING", "ARCHITECTURE_CONFIRM_PENDING",
                 "IMPLEMENTATION_SPEC_CONFIRM_PENDING"):
@@ -575,7 +630,7 @@ async def test_full_feature_flow_reject_testing_quality_gate(base_orchestrator):
     oc = AgentOrchestrator(service, wm, runtime, renderer)
     project = await service.create_project(
         name="reject-test", task_type="feature",
-        description="实现一个简单功能", approval_mode="normal",
+        description="实现一个简单功能", approval_mode="strict",
     )
     for exp in ("REQUIREMENT_CONFIRM_PENDING", "ARCHITECTURE_CONFIRM_PENDING",
                 "IMPLEMENTATION_SPEC_CONFIRM_PENDING", "CODING_CONFIRM_PENDING"):
@@ -601,7 +656,7 @@ async def test_full_feature_flow_reject_review_quality_gate(base_orchestrator):
     oc = AgentOrchestrator(service, wm, runtime, renderer)
     project = await service.create_project(
         name="reject-review", task_type="feature",
-        description="实现一个简单功能", approval_mode="normal",
+        description="实现一个简单功能", approval_mode="strict",
     )
     for exp in ("REQUIREMENT_CONFIRM_PENDING", "ARCHITECTURE_CONFIRM_PENDING",
                 "IMPLEMENTATION_SPEC_CONFIRM_PENDING", "CODING_CONFIRM_PENDING",
@@ -630,7 +685,7 @@ async def test_full_feature_flow_architecture_confirmation_has_no_option_selecti
     oc = AgentOrchestrator(service, wm, runtime, renderer)
     project = await service.create_project(
         name="select-opt", task_type="feature",
-        description="实现一个简单功能", approval_mode="normal",
+        description="实现一个简单功能", approval_mode="strict",
     )
     project, _ = await _tick_until_pending(oc, service, project.id)
     assert project.current_state == "REQUIREMENT_CONFIRM_PENDING"
