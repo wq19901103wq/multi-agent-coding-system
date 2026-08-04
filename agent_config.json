@@ -29,5 +29,15 @@
       "mode": "desktop_only"
     }
   },
+  "codex_agent_roles": {
+    "analyst": {
+      "enabled": true,
+      "description": "Use for a bounded, independent requirements or architecture analysis when a separate view adds value. Return findings and tradeoffs; do not implement the change."
+    },
+    "reviewer": {
+      "enabled": true,
+      "description": "Use for independent verification of completed work against the user's request and observable test evidence. Report actionable findings; do not reimplement the change."
+    }
+  },
   "agents": {}
 }

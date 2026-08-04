@@ -166,3 +166,31 @@ def test_project_status_has_no_workflow_projection(service):
     status = service.get_project_status("p")
     assert status["current_state"] == "ACTIVE"
     assert "workflow_steps" not in status
+
+
+def test_restart_recovery_supersedes_only_stale_projection_updates(service):
+    stale = service.enqueue_notification(
+        dedupe_key="stale-progress",
+        recipient_id="chat",
+        recipient_type="chat_id",
+        intent_type="progress",
+        payload={"projection_key": "root-agent:p:activity"},
+        project_id=None,
+    )
+    unrelated = service.enqueue_notification(
+        dedupe_key="unrelated-report",
+        recipient_id="chat",
+        recipient_type="chat_id",
+        intent_type="report",
+        payload={"projection_key": "root-result:turn-1"},
+        project_id=None,
+    )
+
+    assert service.supersede_projection_notifications(
+        {"root-agent:p:activity"}, reason="restart recovery"
+    ) == 1
+    service.session.refresh(stale)
+    service.session.refresh(unrelated)
+    assert stale.status == "terminal_failed"
+    assert stale.last_error == "restart recovery"
+    assert unrelated.status == "pending"

@@ -403,27 +403,7 @@ async def _show_current(ctx: FeishuHandlerContext, open_id: str) -> None:
     await _send_card(ctx, open_id, "当前会话", "\n\n".join(lines))
 
 
-def _directory_change_blockers(
-    ctx: FeishuHandlerContext, open_id: str
-) -> list[Project]:
-    return [
-        project
-        for project in ctx.service.list_projects_for_chat(_chat_id(ctx, open_id))
-        if project.status in {"active", "paused"}
-    ]
-
-
 async def _show_directory_card(ctx: FeishuHandlerContext, open_id: str) -> None:
-    blockers = _directory_change_blockers(ctx, open_id)
-    if blockers:
-        await _send_card(
-            ctx,
-            open_id,
-            "暂时不能切换目录",
-            "请先取消当前会话中的活跃或暂停项目。",
-            color="orange",
-        )
-        return
     candidates = ProjectService.scan_candidate_repositories(get_allowed_bind_roots())
     await _send_interactive(
         ctx,
@@ -435,15 +415,6 @@ async def _show_directory_card(ctx: FeishuHandlerContext, open_id: str) -> None:
 async def _bind_directory(
     ctx: FeishuHandlerContext, open_id: str, directory: str
 ) -> None:
-    if _directory_change_blockers(ctx, open_id):
-        await _send_card(
-            ctx,
-            open_id,
-            "绑定失败",
-            "当前会话存在活跃或暂停项目，请先取消后再更换目录。",
-            color="orange",
-        )
-        return
     try:
         binding = ctx.service.bind_directory_to_chat(
             _chat_id(ctx, open_id), directory, bound_by=open_id
@@ -461,15 +432,6 @@ async def _bind_directory(
 
 
 async def _unbind_directory(ctx: FeishuHandlerContext, open_id: str) -> None:
-    if _directory_change_blockers(ctx, open_id):
-        await _send_card(
-            ctx,
-            open_id,
-            "解绑失败",
-            "当前会话存在活跃或暂停项目，请先取消后再解绑。",
-            color="orange",
-        )
-        return
     removed = ctx.service.unbind_directory_from_chat(_chat_id(ctx, open_id))
     await _send_card(
         ctx,

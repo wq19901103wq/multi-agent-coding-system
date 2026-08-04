@@ -6,6 +6,7 @@ from mac_system.agents.root_runtime import (
     ToolContext,
 )
 from mac_system.core.root_sessions import (
+    SHUTDOWN_INTERRUPTED_ERROR,
     RootSessionStore,
     recover_interrupted_native_turns,
 )
@@ -128,7 +129,7 @@ def test_service_restart_recovers_interrupted_native_turn(session):
     session.add(interaction)
     session.commit()
 
-    assert recover_interrupted_native_turns(session) == 1
+    assert recover_interrupted_native_turns(session) == ["proj-1"]
 
     session.expire_all()
     root = session.exec(select(RootAgentSession)).one()
@@ -138,3 +139,22 @@ def test_service_restart_recovers_interrupted_native_turn(session):
     assert session.get(Project, "proj-1").execution_status == "idle"
     assert session.get(Approval, "approval-1").status == "expired"
     assert session.get(QuestionInteraction, "interaction-1").status == "expired"
+
+
+def test_restart_reconciles_turn_cancelled_during_graceful_shutdown(session):
+    store = RootSessionStore(session)
+    store.set_native_thread("proj-1", "thread-1")
+    store.set_turn(
+        "proj-1",
+        turn_id=None,
+        status="idle",
+        error=SHUTDOWN_INTERRUPTED_ERROR,
+    )
+
+    assert recover_interrupted_native_turns(session) == ["proj-1"]
+    root = session.exec(select(RootAgentSession)).one()
+    assert root.status == "idle"
+    assert root.last_error == (
+        "Previous native Codex turn was interrupted by service restart"
+    )
+    assert recover_interrupted_native_turns(session) == []

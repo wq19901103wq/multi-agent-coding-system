@@ -47,7 +47,7 @@ MAC 不重新实现以上控制语义。升级 Codex 版本时先更新源码映
 | ProjectService | 保存项目、Root thread identity、问题、通知、成本和展示投影 |
 | Feishu adapter | 把用户消息 steer 到活跃 turn，或启动新 turn；把原生问题和事件渲染为卡片 |
 | External agent adapter | 把 Claude Code、Codex、Kimi、Pi 等后端包装成 Root Agent 可调用的额外执行工具 |
-| Runtime/hosting | 进程、服务地址、日志、计费与恢复 |
+| Runtime/hosting | 单一受管服务进程、服务地址、日志、计费与恢复 |
 
 不存在以下组件：
 
@@ -74,6 +74,8 @@ Project 只表达长期项目关系：`active / paused / cancelled`。一次 Roo
 ## 会话与上下文
 
 - 一个项目对应一个持久 Root thread id；每条项目消息进入或 steer 到该 thread。
+- 服务进程内复用同一个 app-server client 和已连接的 Root thread；turn 结束只释放本轮状态，
+  不重复启动进程或回放历史。服务重启时才使用持久 thread id 恢复。
 - Codex 自己负责 rollout、历史截断、compaction 和 Child Agent `fork_turns`。
 - MAC 不把工具日志、Child Agent 全文结果或历史测试输出重新拼进下一轮 Prompt。
 - 项目目录是 Root Agent 的 cwd 和写入范围；workspace-write 下仍可按 Codex 原生权限读取
@@ -87,23 +89,46 @@ Project 只表达长期项目关系：`active / paused / cancelled`。一次 Roo
 - 只有偏好、授权或系统无法取得的外部事实才询问用户。
 - `request_user_input` 在原 turn 中等待飞书答案；回答后继续同一个 turn，不创建“恢复阶段”。
 - 用户在运行中发送新消息时使用 `turn/steer`；Root idle 时开始下一 turn。
-- 飞书收到消息后在用户原消息上添加回应；只有原生 turn 真正开始后才创建本轮进度卡。
+- 飞书收到消息后立即在用户原消息上添加回应并创建本轮进度卡；同一张卡持续投影准备、
+  模型、工具、Child Agent、外部 Provider、等待和终态，不能用伪造百分比表示进度。
+- 长时间没有新事件时，进度卡显示已等待时间和最后真实活动时间；服务重启中止 turn 时，
+  原卡片变为“已中止并恢复空闲”，后台状态同步回到 `idle`。
 - 面向用户的输出全部使用卡片。进度可以充分，但不得展示内部 task path、thread id、
   协议字段和原始工具日志。
+- `/bind` 只改变“下一次新建项目”使用的目录，并清除当前选择；它不会取消、暂停或迁移已有
+  项目。用户之后仍可用 `/switch` 回到旧项目，因此已有项目不应阻止绑定或解绑目录。
 
 ## 外部 provider 选择
 
 - `run_external_agent` 的 `provider` 由 Root Agent 在调用时显式选择，runtime 严格执行该
   provider，不静默 fallback。
-- 工具向 Root 提供启用状态、非敏感配置说明，以及最近执行的完成率、平均耗时和已报告
-  成本；只提供聚合指标，不暴露其他项目的任务内容。
+- 工具向 Root 提供启用状态、非敏感配置说明，以及最近执行的进程完成率、平均耗时、平均
+  工具调用数和已报告成本；这些指标只说明执行后端是否正常返回，不等于产物语义验收通过，
+  且不暴露其他项目的任务内容。
 - 用户显式指定 provider 时优先遵从；否则 Root 根据任务和上述证据动态决定，不使用关键词
   路由，也不按固定角色绑定 provider。
-- 每次调用必须提供简短的用户可见选择理由。飞书进度卡显示 provider、选择理由和外部 CLI
-  的真实活动状态。
+- 每次调用必须提供简短的用户可见选择理由，跟随用户当前语言且不含内部路由或协议黑话。
+  飞书进度卡显示 provider、选择理由和外部 CLI 的真实活动状态。
 - Codex 原生 Child Agent 角色与外部 provider 是两个维度：角色描述任务责任，provider 描述
   外部执行后端。普通委派优先使用 Codex 原生 Child Agent，只有独立 CLI 执行确有价值时才
   使用外部 provider。
+
+## 动态工具与可配置角色
+
+- 外部 CLI 作为 app-server `thread/start` 的 dynamic tool 注入；Codex 的 `thread/resume`
+  不接受新的 dynamic tool 定义，因此不能假设旧 thread 会自动获得新 schema。
+- MAC 为影响模型调用契约的 dynamic tool 名称和 input schema 计算版本指纹。指纹变化时为
+  该项目启动一个兼容的新 Root thread；只改展示文案或运行指标不会无意义地重建 thread。
+- `analyst`、`reviewer` 等可选角色通过 Codex 原生 `[agents.<role>]` 配置提供，仅描述委派时
+  的责任和边界，不组成固定流水线；内置 worker 继续承担普通实现任务。
+
+## 服务托管与恢复
+
+- 本机服务由一个 launchd job 持有；启动脚本只安装、拉起并核对真实监听 PID，禁止同时
+  存在 reload 进程、旧后台进程和新服务进程。
+- 正常关闭会将正在执行的 native turn 标记为“被服务重启中止”。下次启动只消费一次该
+  标记，恢复项目为 `idle`，并更新原有进度/问题卡，避免后台已恢复而前端仍显示运行中。
+- 恢复不是伪造 turn 成功。未完成工作需要用户继续发送消息，由持久项目会话续接。
 
 ## MAC 扩展边界
 
@@ -128,6 +153,7 @@ MAC 只增加 Codex 产品本身没有的能力：
 6. 一轮结束后项目保持可继续迭代。
 7. 外部 Agent 后端必须适配相同的任务、消息、打断、状态和成本语义，不能反向引入阶段流。
 8. 不为单个用户措辞、项目名或错误文本增加关键词分支。
+9. 同一服务进程内相邻 turn 复用 app-server；动态工具调用契约改变时才迁移 Root thread。
 
 ## 验证
 

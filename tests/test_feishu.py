@@ -237,6 +237,43 @@ async def test_switch_is_explicit_project_selection(ctx):
 
 
 @pytest.mark.asyncio
+async def test_bind_directory_preserves_existing_project_and_targets_next_project(
+    ctx, tmp_path, monkeypatch
+):
+    existing = await ctx.service.create_project(
+        "existing",
+        "feature",
+        "keep iterating",
+        creator_open_id="ou-user",
+        feishu_chat_id="oc-chat",
+    )
+    repository = (tmp_path / "existing-repository").resolve()
+    repository.mkdir()
+    monkeypatch.setattr(
+        "mac_system.core.project_service.path_within_allowed_bind_roots",
+        lambda _path: True,
+    )
+
+    await handle_text_message(ctx, message(f"/bind {repository}"))
+
+    binding = ctx.service.get_chat_directory_binding("oc-chat")
+    assert binding is not None
+    assert binding.directory == str(repository)
+    assert ctx.service.require_project(existing.id).status == "active"
+    assert ctx.service.get_chat_user_selected_project("oc-chat", "ou-user") is None
+
+    await handle_text_message(ctx, message("/create 修复已有仓库的 README"))
+    selected = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert selected is not None
+    assert selected.id != existing.id
+    assert selected.workspace_path == str(repository)
+    assert ctx.orchestrator.scheduled[-1] == (
+        selected.id,
+        "修复已有仓库的 README",
+    )
+
+
+@pytest.mark.asyncio
 async def test_request_user_input_card_updates_then_resolves(ctx, monkeypatch):
     project = await ctx.service.create_project(
         "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"

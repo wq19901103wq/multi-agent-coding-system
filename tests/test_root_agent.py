@@ -1,19 +1,32 @@
 import asyncio
 import subprocess
+from datetime import datetime, timezone
 
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from mac_system.agents.root_runtime import AgentEvent, ToolContext, TurnResult
-from mac_system.agents.runtime import FakeRuntime
+import mac_system.core.root_agent as root_agent_module
+from mac_system.agents.root_runtime import (
+    AgentEvent,
+    DynamicTool,
+    ToolContext,
+    TurnResult,
+)
+from mac_system.agents.runtime import AgentRuntimeResult, FakeRuntime
 from mac_system.config import Settings
 from mac_system.core.project_service import ProjectService
 from mac_system.core.root_agent import (
     RootAgentEngine,
+    _ProgressState,
+    _codex_role_overrides,
     _external_progress_label,
+    _external_tool_summary,
     _native_activity_card,
+    _native_child_summary,
     _native_status_card,
+    _progress_card_body,
     _provider_selection_guidance,
+    _root_profile_key,
     _turn_completion_card,
     resolve_root_user_input,
 )
@@ -29,6 +42,8 @@ from mac_system.models import (
 
 @pytest.fixture
 def root_context(tmp_path):
+    with root_agent_module._ROOT_THREADS_GUARD:
+        root_agent_module._ROOT_THREADS.clear()
     db = create_engine("sqlite:///:memory:")
     SQLModel.metadata.create_all(db)
     workspace = tmp_path / "project"
@@ -53,6 +68,8 @@ def root_context(tmp_path):
             Settings(PROJECTS_DIR=tmp_path),
         )
         yield session, engine
+    with root_agent_module._ROOT_THREADS_GUARD:
+        root_agent_module._ROOT_THREADS.clear()
 
 
 @pytest.mark.asyncio
@@ -101,9 +118,31 @@ async def test_root_uses_native_codex_environment_and_multi_agent(
     assert [tool.name for tool in captured["tools"]] == ["run_external_agent"]
     assert captured["developer_instructions"] is None
     assert captured["thread_config"] == {
+        "model_provider": "mac_openai_https",
+        "model_providers.mac_openai_https": {
+            "name": "OpenAI HTTPS",
+            "wire_api": "responses",
+            "requires_openai_auth": True,
+            "supports_websockets": False,
+        },
+        "model_auto_compact_token_limit": 80_000,
         "features.multi_agent_v2": True,
         "features.default_mode_request_user_input": True,
         "sandbox_workspace_write.network_access": True,
+        "agents.analyst": {
+            "description": (
+                "Use for a bounded, independent requirements or architecture "
+                "analysis when a separate view adds value. Return findings and "
+                "tradeoffs; do not implement the change."
+            )
+        },
+        "agents.reviewer": {
+            "description": (
+                "Use for independent verification of completed work against the "
+                "user's request and observable test evidence. Report actionable "
+                "findings; do not reimplement the change."
+            )
+        },
     }
     root = session.exec(select(RootAgentSession)).one()
     assert root.native_thread_id == "root-thread"
@@ -155,7 +194,6 @@ async def test_project_messages_resume_the_same_native_root_thread(
     assert calls == [
         ("create", "persistent-root"),
         ("turn", "第一轮"),
-        ("resume", "persistent-root"),
         ("turn", "第二轮"),
     ]
 
@@ -256,6 +294,43 @@ def test_native_retry_error_updates_progress_without_ending_turn():
         "running",
     )
     assert _native_status_card("warning", {"message": "notice"}) is None
+
+
+def test_progress_card_reports_elapsed_and_stale_wait_without_fake_activity():
+    state = _ProgressState(
+        started_monotonic=100.0,
+        last_event_monotonic=115.0,
+        last_event_at=datetime(2026, 8, 5, 1, 2, 3, tzinfo=timezone.utc),
+        label="正在检查或验证项目",
+        child_summary="运行中 2，已完成 1",
+    )
+
+    fresh = _progress_card_body(state, now_monotonic=125.0)
+    assert "已用时间**：25 秒" in fresh
+    assert "最近事件" in fresh
+    assert "10 秒前" in fresh
+    assert "子 Agent**：运行中 2，已完成 1" in fresh
+    assert "等待模型或工具返回" not in fresh
+
+    stale = _progress_card_body(state, now_monotonic=150.0)
+    assert "已用时间**：50 秒" in stale
+    assert "35 秒前" in stale
+    assert "暂未收到新的 Codex 事件" in stale
+
+
+def test_native_child_summary_uses_official_states_without_thread_ids():
+    summary = _native_child_summary(
+        {
+            "agentsStates": {
+                "thread-secret-1": {"status": "running", "message": "work"},
+                "thread-secret-2": {"status": "completed"},
+                "thread-secret-3": {"status": "running"},
+            }
+        }
+    )
+
+    assert summary == "运行中 2，已完成 1"
+    assert "thread-secret" not in summary
 
 
 def test_native_turn_terminal_status_closes_shared_progress_projection():
@@ -365,7 +440,7 @@ async def test_failed_turn_releases_transport_and_resumes_same_thread(
     await engine.run("proj-root", "第二轮")
 
     assert ("resume", "durable-thread") in calls
-    assert calls.count(("close", "durable-thread")) == 2
+    assert calls.count(("close", "durable-thread")) == 1
 
 
 @pytest.mark.asyncio
@@ -532,6 +607,16 @@ def test_external_tool_exposes_provider_evidence_without_routing_rules(root_cont
     assert "FakeRuntime" in tool.description
     assert "no recent execution samples" in tool.description
     assert "selection_reason" in tool.input_schema["required"]
+    assert "timeout_seconds" in tool.input_schema["required"]
+    reason_description = tool.input_schema["properties"]["selection_reason"][
+        "description"
+    ]
+    assert "same language as the user's request" in reason_description
+    assert "avoid internal routing or protocol jargon" in reason_description
+    assert (
+        tool.input_schema["properties"]["timeout_seconds"]["maximum"]
+        == engine.settings.agent_timeout_seconds
+    )
 
 
 def test_provider_guidance_reports_only_aggregate_process_metrics():
@@ -547,6 +632,7 @@ def test_provider_guidance_reports_only_aggregate_process_metrics():
                 "sample_count": 4,
                 "completed_count": 3,
                 "average_duration_seconds": 12.5,
+                "average_tool_calls": 2.5,
                 "average_cost_usd": 0.08,
             }
         },
@@ -554,8 +640,66 @@ def test_provider_guidance_reports_only_aggregate_process_metrics():
 
     assert "recent CLI completion 3/4" in guidance
     assert "average duration 12.5s" in guidance
+    assert "average tool calls 2.5" in guidance
     assert "average reported cost $0.08" in guidance
     assert "headless_cli" in guidance
+
+
+def test_codex_roles_are_operator_config_and_use_official_fields_only():
+    overrides = _codex_role_overrides(
+        {
+            "codex_agent_roles": {
+                "analyst": {
+                    "enabled": True,
+                    "description": "Analyze only.",
+                    "nickname_candidates": ["Ada"],
+                    "custom_pipeline": "forbidden",
+                },
+                "disabled": {
+                    "enabled": False,
+                    "description": "Do not expose.",
+                },
+            }
+        }
+    )
+
+    assert overrides == {
+        "agents.analyst": {
+            "description": "Analyze only.",
+            "nickname_candidates": ["Ada"],
+        }
+    }
+
+
+def test_persisted_root_profile_changes_when_dynamic_tool_contract_changes():
+    base = DynamicTool(
+        name="bridge",
+        description="old description",
+        input_schema={
+            "type": "object",
+            "required": ["provider"],
+            "properties": {"provider": {"type": "string"}},
+        },
+        handler=lambda _arguments, _context: {},
+    )
+    description_only = DynamicTool(
+        name="bridge",
+        description="new description and metrics",
+        input_schema=base.input_schema,
+        handler=base.handler,
+    )
+    changed_schema = DynamicTool(
+        name="bridge",
+        description=base.description,
+        input_schema={
+            **base.input_schema,
+            "required": ["provider", "timeout_seconds"],
+        },
+        handler=base.handler,
+    )
+
+    assert _root_profile_key([base]) == _root_profile_key([description_only])
+    assert _root_profile_key([base]) != _root_profile_key([changed_schema])
 
 
 def test_external_progress_is_user_facing_and_does_not_expose_tool_input():
@@ -563,6 +707,18 @@ def test_external_progress_is_user_facing_and_does_not_expose_tool_input():
     label = _external_progress_label("codex", "tool", detail)
     assert label == "Codex 正在查看项目资料"
     assert "/secret/path" not in label
+
+
+def test_external_tool_summary_excludes_inputs_and_outputs():
+    summary = _external_tool_summary(
+        [
+            {"name": "Read", "input": {"file_path": "/secret"}},
+            {"name": "Read", "output": "large output"},
+            {"tool": "Bash", "input": {"command": "secret"}},
+        ]
+    )
+    assert summary == {"count": 3, "names": ["Read", "Bash"]}
+    assert "secret" not in str(summary)
 
 
 @pytest.mark.asyncio
@@ -577,6 +733,7 @@ async def test_external_provider_is_one_explicit_tool_call(root_context):
             "task_name": "ui-check",
             "message": "检查界面",
             "access": "read_only",
+            "timeout_seconds": 60,
         },
         ToolContext("thread-1", "turn-1", "call-1", tool.name),
     )
@@ -587,5 +744,58 @@ async def test_external_provider_is_one_explicit_tool_call(root_context):
     assert agent.status == "completed"
     assert agent.objective == "检查界面"
     assert agent.result["selection_reason"] == "用于独立检查界面"
+    assert agent.result["timeout_seconds"] == 60
+    assert "tool_calls" not in result
+    assert result["tool_activity"] == {"count": 0, "names": []}
     updated_tool = engine._extension_tools(project)[0]
     assert "recent CLI completion 1/1" in updated_tool.description
+
+
+@pytest.mark.asyncio
+async def test_external_provider_returns_failure_and_compact_activity_to_root(
+    root_context,
+):
+    session, engine = root_context
+
+    class RecordingRuntime(FakeRuntime):
+        def __init__(self):
+            super().__init__({})
+            self.timeout_seconds = None
+
+        async def execute(self, *args, **kwargs):
+            self.timeout_seconds = kwargs["timeout_seconds"]
+            return AgentRuntimeResult(
+                success=False,
+                output_json=None,
+                output_files=[],
+                logs="provider failed with a long diagnostic",
+                cost_info=None,
+                tool_calls=[
+                    {"name": "Read", "input": {"file_path": "/secret/path"}}
+                ],
+                failure={"message": "provider unavailable"},
+            )
+
+    runtime = RecordingRuntime()
+    engine.runtime = runtime
+    project = engine.service.require_project("proj-root")
+    tool = engine._extension_tools(project)[0]
+    result = await tool.handler(
+        {
+            "provider": "RecordingRuntime",
+            "selection_reason": "独立执行",
+            "task_name": "bounded-check",
+            "message": "检查项目",
+            "access": "read_only",
+            "timeout_seconds": 37,
+        },
+        ToolContext("thread-1", "turn-1", "call-failure", tool.name),
+    )
+
+    assert runtime.timeout_seconds == 37
+    assert result["success"] is False
+    assert "provider unavailable" in result["error"]
+    assert result["tool_activity"] == {"count": 1, "names": ["Read"]}
+    assert "/secret/path" not in str(result)
+    agent = session.exec(select(AgentSession)).one()
+    assert agent.result["tool_calls"][0]["input"]["file_path"] == "/secret/path"

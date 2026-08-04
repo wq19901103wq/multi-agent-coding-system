@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VENV_DIR="$PROJECT_ROOT/.worktrees/feat-core/.venv"
+SERVICE_LABEL="com.mac-system.dev"
+SERVICE_TARGET="gui/$(id -u)/$SERVICE_LABEL"
+LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
+LAUNCH_AGENT_PATH="$LAUNCH_AGENT_DIR/$SERVICE_LABEL.plist"
+TEMPLATE_PATH="$PROJECT_ROOT/scripts/$SERVICE_LABEL.plist.template"
 
-VENV_DIR="$(pwd)/.worktrees/feat-core/.venv"
-source "$VENV_DIR/bin/activate"
+cd "$PROJECT_ROOT"
 set -a
 source .env
 set +a
-export PYTHONUNBUFFERED=1
-
-LOG_FILE="server_$(date +%Y%m%d_%H%M%S).log"
 SERVER_PORT="${MCS_PORT:-18080}"
 
 listener_pid() {
@@ -27,60 +29,94 @@ is_mac_server() {
     ]]
 }
 
-# A PID file is only advisory.  A prior crash can leave it pointing at a reused
-# PID, while an older server may still own the port.  Resolve the real listener
-# before starting so a healthy response from the old process cannot be mistaken
-# for successful startup of the new code.
+service_loaded() {
+    launchctl print "$SERVICE_TARGET" >/dev/null 2>&1
+}
+
+service_pid() {
+    launchctl print "$SERVICE_TARGET" 2>/dev/null \
+        | awk '/^[[:space:]]*pid = [0-9]+$/ {print $3; exit}'
+}
+
+install_launch_agent() {
+    mkdir -p "$LAUNCH_AGENT_DIR"
+    sed "s|__PROJECT_ROOT__|$PROJECT_ROOT|g" "$TEMPLATE_PATH" >"$LAUNCH_AGENT_PATH"
+    plutil -lint "$LAUNCH_AGENT_PATH" >/dev/null
+}
+
+wait_for_health() {
+    local expected_pid="$1"
+    local attempt=0
+    while [ "$attempt" -lt 300 ]; do
+        local running_pid
+        running_pid="$(service_pid || true)"
+        if [ -n "$running_pid" ] && [ "$running_pid" != "$expected_pid" ]; then
+            expected_pid="$running_pid"
+        fi
+        if [ -n "$expected_pid" ] && ! kill -0 "$expected_pid" 2>/dev/null; then
+            expected_pid=""
+        fi
+        if curl --silent --fail --max-time 1 \
+            "http://127.0.0.1:${SERVER_PORT}/admin/projects" >/dev/null; then
+            local bound_pid
+            bound_pid="$(listener_pid || true)"
+            if [ -n "$bound_pid" ] && [ "$bound_pid" = "$expected_pid" ]; then
+                echo "$bound_pid" >uvicorn.pid
+                echo "Server started under launchd (PID $bound_pid, port $SERVER_PORT)"
+                echo "Logs: $PROJECT_ROOT/server_launchctl.log"
+                return 0
+            fi
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    echo "Server did not become healthy under $SERVICE_LABEL; see $PROJECT_ROOT/server_launchctl.log" >&2
+    return 1
+}
+
 RUNNING_PID="$(listener_pid || true)"
+LAUNCHD_PID="$(service_pid || true)"
 if [ -n "$RUNNING_PID" ]; then
-    if is_mac_server "$RUNNING_PID"; then
-        echo "$RUNNING_PID" > uvicorn.pid
-        echo "Server already running (PID $RUNNING_PID, port $SERVER_PORT)"
-        exit 0
-    fi
-    echo "Port $SERVER_PORT is occupied by an unrelated process (PID $RUNNING_PID)" >&2
-    exit 1
-fi
-rm -f uvicorn.pid
-
-# Use logging.yaml for mac_system logs and redirect uvicorn stdout/stderr to a
-# timestamped file so restarts do not overwrite the previous session's log.
-nohup "$VENV_DIR/bin/uvicorn" mac_system.api.main:app \
-    --host 0.0.0.0 --port "$SERVER_PORT" --log-config logging.yaml \
-    </dev/null >"$LOG_FILE" 2>&1 &
-SERVER_PID=$!
-echo "$SERVER_PID" > uvicorn.pid
-
-# Startup includes stale-task recovery and the Feishu WebSocket bootstrap.  Five
-# seconds is too short on a repository with history and can kill a healthy
-# process while it is still initializing.  Keep each probe short, but allow the
-# service up to 30 seconds to become ready.
-for ((attempt = 0; attempt < 300; attempt++)); do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "Server exited during startup; see $(pwd)/$LOG_FILE" >&2
-        rm -f uvicorn.pid
+    if ! is_mac_server "$RUNNING_PID"; then
+        echo "Port $SERVER_PORT is occupied by an unrelated process (PID $RUNNING_PID)" >&2
         exit 1
     fi
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:${SERVER_PORT}/admin/projects" >/dev/null; then
-        break
+    if [ -n "$LAUNCHD_PID" ] && [ "$RUNNING_PID" = "$LAUNCHD_PID" ]; then
+        echo "$RUNNING_PID" >uvicorn.pid
+        echo "Server already running under launchd (PID $RUNNING_PID, port $SERVER_PORT)"
+        exit 0
     fi
-    sleep 0.1
-done
-
-BOUND_PID="$(listener_pid || true)"
-if [ "$BOUND_PID" != "$SERVER_PID" ]; then
-    echo "Server process $SERVER_PID does not own port $SERVER_PORT (listener: ${BOUND_PID:-none})" >&2
-    kill "$SERVER_PID" 2>/dev/null || true
-    rm -f uvicorn.pid
-    exit 1
+    echo "Stopping unmanaged MAC server (PID $RUNNING_PID) before launchd takeover"
+    kill "$RUNNING_PID"
+    for _ in $(seq 1 150); do
+        kill -0 "$RUNNING_PID" 2>/dev/null || break
+        sleep 0.1
+    done
 fi
 
-if ! curl --silent --fail --max-time 2 "http://127.0.0.1:${SERVER_PORT}/admin/projects" >/dev/null; then
-    echo "Server did not become healthy; see $(pwd)/$LOG_FILE" >&2
-    kill "$SERVER_PID" 2>/dev/null || true
-    rm -f uvicorn.pid
-    exit 1
+install_launch_agent
+if service_loaded; then
+    launchctl kickstart -k "$SERVICE_TARGET"
+else
+    BOOTSTRAPPED=false
+    for _ in $(seq 1 50); do
+        if launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH" 2>/dev/null; then
+            BOOTSTRAPPED=true
+            break
+        fi
+        # launchd may report the job unloaded before a preceding bootout has
+        # completely released its label. Retry that bounded handoff instead
+        # of leaving the service silently stopped after stop && start.
+        if service_loaded; then
+            BOOTSTRAPPED=true
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$BOOTSTRAPPED" != true ]; then
+        echo "Failed to load launchd service $SERVICE_LABEL" >&2
+        exit 1
+    fi
 fi
 
-echo "Server started (PID $SERVER_PID, port $SERVER_PORT)"
-echo "Logs: $(pwd)/$LOG_FILE"
+wait_for_health "$(service_pid || true)"

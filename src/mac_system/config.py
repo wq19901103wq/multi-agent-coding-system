@@ -82,7 +82,12 @@ def get_settings() -> Settings:
 
 @lru_cache
 def get_agent_config() -> dict[str, Any]:
-    path = get_settings().agent_config_path
+    return load_agent_config(get_settings().agent_config_path)
+
+
+def load_agent_config(path: Path) -> dict[str, Any]:
+    """Load operator-owned runtime and native Codex role configuration."""
+
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:

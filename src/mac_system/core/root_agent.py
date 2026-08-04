@@ -9,6 +9,7 @@ Reference: openai/codex commit 44918ea10c0f99151c6710411b4322c2f5c96bea.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
@@ -16,6 +17,7 @@ from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 
 from sqlmodel import Session
@@ -28,11 +30,14 @@ from mac_system.agents.root_runtime import (
     TurnResult,
 )
 from mac_system.agents.runtime import AgentRuntime
-from mac_system.config import Settings
+from mac_system.config import Settings, load_agent_config
 from mac_system.core.lock_manager import get_default_lock_manager
 from mac_system.core.notification_service import deliver_card
 from mac_system.core.project_service import ProjectService, generate_id
-from mac_system.core.root_sessions import RootSessionStore
+from mac_system.core.root_sessions import (
+    SHUTDOWN_INTERRUPTED_ERROR,
+    RootSessionStore,
+)
 from mac_system.feishu.card import build_content_card, build_question_batch_card
 from mac_system.models import AgentSession, Approval, Project
 from mac_system.utils.formatting import split_markdown_sections
@@ -43,7 +48,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-_ROOT_PROFILE = "codex-native-root-v1"
+_ROOT_PROFILE_VERSION = "codex-native-root-v2"
 
 
 @dataclass
@@ -59,6 +64,17 @@ class _PendingUserRequest:
     item_id: str
     loop: asyncio.AbstractEventLoop
     future: asyncio.Future[dict[str, Any]]
+
+
+@dataclass
+class _ProgressState:
+    started_monotonic: float
+    last_event_monotonic: float
+    last_event_at: datetime
+    label: str
+    color: str = "purple"
+    detail: str | None = None
+    child_summary: str | None = None
 
 
 _ROOT_THREADS: dict[str, _RootHandle] = {}
@@ -183,7 +199,8 @@ def _provider_selection_guidance(
             completed = int(metric.get("completed_count") or 0)
             measured = (
                 f"recent CLI completion {completed}/{sample_count}, "
-                f"average duration {metric.get('average_duration_seconds')}s"
+                f"average duration {metric.get('average_duration_seconds')}s, "
+                f"average tool calls {metric.get('average_tool_calls')}"
             )
             if "average_cost_usd" in metric:
                 measured += f", average reported cost ${metric['average_cost_usd']}"
@@ -192,6 +209,47 @@ def _provider_selection_guidance(
         suffix = f" ({', '.join(configured)})" if configured else ""
         lines.append(f"- {provider}: {description}{suffix}; {measured}.")
     return "\n".join(lines)
+
+
+def _codex_role_overrides(agent_config: dict[str, Any]) -> dict[str, Any]:
+    """Translate operator config to Codex's official ``agents.<role>`` layer."""
+
+    configured = agent_config.get("codex_agent_roles")
+    if not isinstance(configured, dict):
+        return {}
+    overrides: dict[str, Any] = {}
+    official_fields = ("description", "config_file", "nickname_candidates")
+    for role_name, raw_role in configured.items():
+        if not isinstance(role_name, str) or not isinstance(raw_role, dict):
+            continue
+        if raw_role.get("enabled", True) is not True:
+            continue
+        role = {
+            field: raw_role[field]
+            for field in official_fields
+            if raw_role.get(field) is not None
+        }
+        if role:
+            overrides[f"agents.{role_name}"] = role
+    return overrides
+
+
+def _root_profile_key(tools: list[DynamicTool]) -> str:
+    """Version persisted threads by the dynamic-tool protocol they contain.
+
+    Codex 0.144.1 accepts dynamic tools only on ``thread/start``. Its official
+    ``thread/resume`` protocol cannot replace them, so resuming a thread with a
+    changed schema would give the model and MAC handler different contracts.
+    """
+
+    contract = [
+        {"name": tool.name, "input_schema": tool.input_schema}
+        for tool in sorted(tools, key=lambda item: item.name)
+    ]
+    digest = hashlib.sha256(
+        json.dumps(contract, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{_ROOT_PROFILE_VERSION}:{digest}"
 
 
 def _external_progress_label(provider: str, kind: str, detail: str) -> str | None:
@@ -221,6 +279,81 @@ def _external_progress_label(provider: str, kind: str, detail: str) -> str | Non
     else:
         action = "正在继续执行任务"
     return f"{display} {action}"
+
+
+def _external_tool_summary(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return useful activity evidence without reinjecting tool payloads."""
+    names: list[str] = []
+    for call in tool_calls:
+        name = call.get("name") or call.get("tool") or call.get("type")
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return {"count": len(tool_calls), "names": names[:12]}
+
+
+def _duration_label(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, remaining = divmod(total, 60)
+    if minutes:
+        return f"{minutes} 分 {remaining} 秒"
+    return f"{remaining} 秒"
+
+
+def _progress_card_body(
+    state: _ProgressState,
+    *,
+    now_monotonic: float | None = None,
+) -> str:
+    """Render only observed state; elapsed time is not synthetic progress."""
+
+    current = monotonic() if now_monotonic is None else now_monotonic
+    elapsed = _duration_label(current - state.started_monotonic)
+    since_event = max(0, int(current - state.last_event_monotonic))
+    lines = [
+        f"**当前进展**：{state.label}",
+        f"**已用时间**：{elapsed}",
+        (
+            "**最近事件**："
+            f"{state.last_event_at.astimezone().strftime('%H:%M:%S')}"
+            f"（{since_event} 秒前）"
+        ),
+    ]
+    if state.child_summary:
+        lines.append(f"**子 Agent**：{state.child_summary}")
+    if state.detail:
+        lines.append(f"**补充信息**：{state.detail}")
+    if since_event >= 30:
+        lines.append(
+            "**状态说明**：暂未收到新的 Codex 事件；本轮仍在运行，"
+            "通常表示正在等待模型或工具返回。"
+        )
+    return "\n\n".join(lines)
+
+
+def _native_child_summary(item: dict[str, Any]) -> str | None:
+    """Summarize Codex's official child-agent states without exposing IDs."""
+
+    raw_states = item.get("agentsStates")
+    if not isinstance(raw_states, dict) or not raw_states:
+        return None
+    labels = {
+        "pendingInit": "准备中",
+        "running": "运行中",
+        "interrupted": "已中止",
+        "completed": "已完成",
+        "errored": "异常",
+        "shutdown": "已关闭",
+        "notFound": "不可用",
+    }
+    counts: dict[str, int] = {}
+    for value in raw_states.values():
+        status = value.get("status") if isinstance(value, dict) else value
+        status_text = str(status or "unknown")
+        counts[status_text] = counts.get(status_text, 0) + 1
+    return "，".join(
+        f"{labels.get(status, status)} {count}"
+        for status, count in counts.items()
+    )
 
 
 def _durable_native_event(event: AgentEvent) -> AgentEvent | None:
@@ -258,9 +391,19 @@ def _durable_native_event(event: AgentEvent) -> AgentEvent | None:
                 "tool",
                 "senderThreadId",
                 "receiverThreadIds",
+                "model",
+                "reasoningEffort",
             )
             if key in item
         }
+        if item_type == "collabAgentToolCall":
+            raw_states = item.get("agentsStates")
+            if isinstance(raw_states, dict):
+                compact_item["agentsStates"] = {
+                    str(thread_id): {"status": state.get("status")}
+                    for thread_id, state in raw_states.items()
+                    if isinstance(state, dict) and state.get("status")
+                }
         if item_type == "commandExecution":
             output = _compact_text(item.get("aggregatedOutput"))
             if output is not None:
@@ -400,6 +543,8 @@ class RootAgentEngine:
         self.service = ProjectService(session)
         self.store = RootSessionStore(session)
         self.project: Project | None = None
+        self._progress: dict[str, _ProgressState] = {}
+        self._agent_config = load_agent_config(settings.agent_config_path)
 
     async def run(self, project_id: str, trigger: str) -> TurnResult:
         project = self.service.require_project(project_id)
@@ -409,11 +554,29 @@ class RootAgentEngine:
             self.session.expire_all()
             project = self.service.require_project(project_id)
             root: CodexAppServerThread | None = None
+            heartbeat: asyncio.Task[None] | None = None
             try:
-                root = await self._root_thread(project)
                 self.store.set_turn(project_id, turn_id=None, status="running")
                 self.service.set_execution_status(project_id, "running")
+                current = monotonic()
+                self._progress[project_id] = _ProgressState(
+                    started_monotonic=current,
+                    last_event_monotonic=current,
+                    last_event_at=datetime.now().astimezone(),
+                    label="正在准备 Codex 项目上下文",
+                )
+                await self._publish_progress_snapshot(
+                    project_id,
+                    event_identity=generate_id("root-start"),
+                )
+                heartbeat = asyncio.create_task(
+                    self._progress_heartbeat(project_id),
+                    name=f"mac-progress-{project_id}",
+                )
+                root = await self._root_thread(project)
                 result = await root.run_turn(trigger)
+                await self._stop_progress_heartbeat(heartbeat)
+                heartbeat = None
                 self.store.set_turn(project_id, turn_id=None, status="idle")
                 refreshed = self.service.require_project(project_id)
                 if refreshed.execution_status != "waiting_user":
@@ -437,6 +600,8 @@ class RootAgentEngine:
                         )
                 return result
             except BaseException as exc:
+                await self._stop_progress_heartbeat(heartbeat)
+                heartbeat = None
                 if root is not None:
                     try:
                         await self._release_root(project_id, root)
@@ -451,22 +616,18 @@ class RootAgentEngine:
                 # A failed commit leaves SQLAlchemy's Session unusable until a
                 # rollback. Recovery uses a new short transaction so cleanup
                 # cannot be prevented by the failure that triggered it.
-                self._recover_failed_turn(project_id, exc)
+                reported_exc = (
+                    exc
+                    if isinstance(exc, Exception)
+                    else RuntimeError(SHUTDOWN_INTERRUPTED_ERROR)
+                )
+                self._recover_failed_turn(project_id, reported_exc)
                 if isinstance(exc, Exception):
-                    await self._publish_failure_safely(project_id, exc)
+                    await self._publish_failure_safely(project_id, reported_exc)
                 raise
             finally:
-                if root is not None:
-                    # The persisted thread id, not a process-local transport,
-                    # is the resumable Codex session boundary.
-                    try:
-                        await self._release_root(project_id, root)
-                    except Exception:
-                        logger.warning(
-                            "Failed to close native Codex transport for %s",
-                            project_id,
-                            exc_info=True,
-                        )
+                await self._stop_progress_heartbeat(heartbeat)
+                self._progress.pop(project_id, None)
 
     async def steer(self, project_id: str, text: str) -> bool:
         row = self.store.ensure(project_id)
@@ -512,6 +673,8 @@ class RootAgentEngine:
 
     async def _root_thread(self, project: Project) -> CodexAppServerThread:
         current_loop = asyncio.get_running_loop()
+        extension_tools = self._extension_tools(project)
+        root_profile = _root_profile_key(extension_tools)
         with _ROOT_THREADS_GUARD:
             handle = _ROOT_THREADS.get(project.id)
         root = handle.runtime if handle is not None else None
@@ -527,7 +690,7 @@ class RootAgentEngine:
             root = CodexAppServerThread(
                 codex_bin=self.settings.codex_bin,
                 cwd=Path(project.workspace_path),
-                tools=self._extension_tools(project),
+                tools=extension_tools,
                 # Do not replace or augment Codex's native workflow prompt.
                 developer_instructions=None,
                 event_handler=lambda event: self._on_event(project.id, event),
@@ -541,11 +704,31 @@ class RootAgentEngine:
                 ephemeral=False,
                 environments=None,
                 thread_config={
+                    # The built-in OpenAI provider enables Responses over
+                    # WebSocket and cannot be overridden. This environment's
+                    # proxy accepts HTTPS but makes every WebSocket turn burn
+                    # through Codex's retry budget before falling back. Define
+                    # an equivalent authenticated provider through Codex's
+                    # official per-thread config surface and select HTTPS from
+                    # the start instead of reimplementing transport fallback.
+                    "model_provider": "mac_openai_https",
+                    "model_providers.mac_openai_https": {
+                        "name": "OpenAI HTTPS",
+                        "wire_api": "responses",
+                        "requires_openai_auth": True,
+                        "supports_websockets": False,
+                    },
+                    # Keep long-lived mobile projects responsive using Codex's
+                    # native compactor. The default follows the model's very
+                    # large context window; real MAC history had reached 110k
+                    # input tokens before that threshold was approached.
+                    "model_auto_compact_token_limit": 80_000,
                     "features.multi_agent_v2": True,
                     "features.default_mode_request_user_input": True,
                     # Official Codex workspace-write config. MAC projects are
                     # explicitly authorized to run their real API/E2E checks.
                     "sandbox_workspace_write.network_access": True,
+                    **_codex_role_overrides(self._agent_config),
                 },
                 # Use the normal Codex home so installed skills and standard
                 # configuration behave exactly as they do in Codex.
@@ -554,14 +737,16 @@ class RootAgentEngine:
             with _ROOT_THREADS_GUARD:
                 _ROOT_THREADS[project.id] = _RootHandle(root, current_loop)
         else:
-            root.tools = {tool.name: tool for tool in self._extension_tools(project)}
+            root.tools = {tool.name: tool for tool in extension_tools}
             root.event_handler = lambda event: self._on_event(project.id, event)
             root.server_request_handler = lambda method, params: self._on_server_request(
                 project.id, method, params
             )
 
         durable = self.store.ensure(project.id)
-        profile_current = (project.context or {}).get("root_agent_profile") == _ROOT_PROFILE
+        profile_current = (
+            (project.context or {}).get("root_agent_profile") == root_profile
+        )
         if root.thread_id is None:
             if durable.native_thread_id and durable.status != "failed" and profile_current:
                 await root.resume_thread(durable.native_thread_id)
@@ -571,7 +756,7 @@ class RootAgentEngine:
                 project.context = {
                     **(project.context or {}),
                     "orchestration_mode": "root_agent",
-                    "root_agent_profile": _ROOT_PROFILE,
+                    "root_agent_profile": root_profile,
                 }
                 project.current_state = "ACTIVE"
                 project.updated_at = _now()
@@ -605,6 +790,7 @@ class RootAgentEngine:
                         "task_name",
                         "message",
                         "access",
+                        "timeout_seconds",
                     ],
                     "properties": {
                         "provider": {
@@ -619,7 +805,9 @@ class RootAgentEngine:
                             "minLength": 1,
                             "maxLength": 300,
                             "description": (
-                                "Short user-facing reason this provider adds value for this task."
+                                "Short user-facing reason this provider adds value for "
+                                "this task. Use the same language as the user's request "
+                                "and avoid internal routing or protocol jargon."
                             ),
                         },
                         "task_name": {
@@ -639,6 +827,16 @@ class RootAgentEngine:
                                 "workspace_write",
                                 "host_automation",
                             ],
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "minimum": 10,
+                            "maximum": max(10, self.settings.agent_timeout_seconds),
+                            "description": (
+                                "Hard deadline for this provider call. Choose a value "
+                                "that matches the bounded task; the process is stopped "
+                                "when the deadline expires."
+                            ),
                         },
                     },
                 },
@@ -664,6 +862,7 @@ class RootAgentEngine:
             task_name = str(arguments["task_name"])
             message = str(arguments["message"])
             access = str(arguments["access"])
+            timeout_seconds = int(arguments["timeout_seconds"])
             capabilities = {
                 "read_only": ["Read"],
                 "workspace_write": ["Read", "Edit", "Write", "Bash"],
@@ -737,7 +936,7 @@ class RootAgentEngine:
                 output_schema=None,
                 allowed_tools=capabilities,
                 readonly_dirs=[],
-                timeout_seconds=self.settings.agent_timeout_seconds,
+                timeout_seconds=timeout_seconds,
                 task_id=agent.id,
                 progress_callback=on_progress,
             )
@@ -745,20 +944,32 @@ class RootAgentEngine:
             if answer is None and result.output_json is not None:
                 answer = json.dumps(result.output_json, ensure_ascii=False)
             answer = redact_text(answer or "")
-            payload = {
+            failure_detail = None
+            if not result.success:
+                if result.failure:
+                    failure_detail = redact_text(
+                        json.dumps(result.failure, ensure_ascii=False)
+                    )
+                elif result.logs:
+                    failure_detail = _compact_text(
+                        redact_text(result.logs), limit=4_000
+                    )
+            stored_payload = {
                 "success": result.success,
                 "provider": provider,
                 "selection_reason": selection_reason,
                 "task_name": task_name,
+                "timeout_seconds": timeout_seconds,
                 "message": answer,
+                "error": failure_detail,
                 "cost": result.cost_info,
                 "tool_calls": result.tool_calls,
             }
             self.store.update_agent(
                 agent,
                 status="completed" if result.success else "failed",
-                latest_message=answer or None,
-                result=payload,
+                latest_message=answer or failure_detail,
+                result=stored_payload,
             )
             estimated_cost = (result.cost_info or {}).get("estimated_cost_usd")
             if isinstance(estimated_cost, (int, float)):
@@ -768,22 +979,85 @@ class RootAgentEngine:
                 project.updated_at = _now()
                 self.session.add(project)
                 self.session.commit()
-            return payload
+            return {
+                "success": result.success,
+                "provider": provider,
+                "selection_reason": selection_reason,
+                "task_name": task_name,
+                "timeout_seconds": timeout_seconds,
+                "message": _compact_text(answer, limit=8_000) or "",
+                "message_truncated": len(answer) > 8_000,
+                "error": failure_detail,
+                "cost": result.cost_info,
+                "tool_activity": _external_tool_summary(result.tool_calls),
+            }
 
         return await self.store.execute_tool_once(
             project.id, context, arguments, execute
         )
 
-    async def _project_external_agent_activity(
+    @staticmethod
+    async def _stop_progress_heartbeat(
+        task: asyncio.Task[None] | None,
+    ) -> None:
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _progress_heartbeat(self, project_id: str) -> None:
+        """Refresh elapsed/staleness fields without inventing Agent activity."""
+
+        while True:
+            await asyncio.sleep(15)
+            await self._publish_progress_snapshot(
+                project_id,
+                event_identity=generate_id("root-heartbeat"),
+            )
+
+    def _update_progress(
         self,
         project_id: str,
-        agent_id: str,
-        provider: str,
-        selection_reason: str,
-        activity: str,
+        *,
+        label: str | None = None,
+        color: str | None = None,
+        detail: str | None = None,
+        child_summary: str | None = None,
+        observed_event: bool = True,
     ) -> None:
-        """Update the shared progress card from actual external CLI events."""
-        if self.feishu_bridge is None:
+        state = self._progress.get(project_id)
+        if state is None:
+            current = monotonic()
+            state = _ProgressState(
+                started_monotonic=current,
+                last_event_monotonic=current,
+                last_event_at=datetime.now().astimezone(),
+                label=label or "Codex 正在处理本轮消息",
+            )
+            self._progress[project_id] = state
+        if label is not None:
+            state.label = label
+        if color is not None:
+            state.color = color
+        if detail is not None:
+            state.detail = detail
+        if child_summary is not None:
+            state.child_summary = child_summary
+        if observed_event:
+            state.last_event_monotonic = monotonic()
+            state.last_event_at = datetime.now().astimezone()
+
+    async def _publish_progress_snapshot(
+        self,
+        project_id: str,
+        *,
+        event_identity: str,
+    ) -> None:
+        state = self._progress.get(project_id)
+        if state is None or self.feishu_bridge is None:
             return
         try:
             with Session(self.bind) as projection_session:
@@ -791,26 +1065,20 @@ class RootAgentEngine:
                 project = service.require_project(project_id)
                 if not project.feishu_chat_id:
                     return
-                card = build_content_card(
-                    f"[{self._project_display_name(project)}] 项目进展",
-                    (
-                        f"**当前进展**：{activity}\n\n"
-                        f"**选择原因**：{selection_reason}"
-                    ),
-                    color="purple",
-                )
                 projection_key = f"root-agent:{project.id}:activity"
                 projection = service.get_card_projection(projection_key)
                 await deliver_card(
                     service,
                     self.feishu_bridge,
-                    dedupe_key=(
-                        f"{projection_key}:external:{agent_id}:{activity}"
-                    ),
+                    dedupe_key=f"{projection_key}:{event_identity}",
                     recipient_id=project.feishu_chat_id,
                     recipient_type="chat_id",
                     intent_type="progress",
-                    card=card,
+                    card=build_content_card(
+                        f"[{self._project_display_name(project)}] 项目进展",
+                        _progress_card_body(state),
+                        color=state.color,
+                    ),
                     project_id=project.id,
                     update_message_id=(
                         projection.provider_message_id
@@ -825,9 +1093,27 @@ class RootAgentEngine:
                     resulting_state=project.execution_status,
                 )
         except Exception:
-            logger.warning(
-                "Failed to project external Agent activity", exc_info=True
-            )
+            logger.warning("Failed to project Root Agent progress", exc_info=True)
+
+    async def _project_external_agent_activity(
+        self,
+        project_id: str,
+        agent_id: str,
+        provider: str,
+        selection_reason: str,
+        activity: str,
+    ) -> None:
+        """Update the shared progress card from actual external CLI events."""
+        self._update_progress(
+            project_id,
+            label=activity,
+            color="purple",
+            detail=f"选择 {provider}：{selection_reason}",
+        )
+        await self._publish_progress_snapshot(
+            project_id,
+            event_identity=f"external:{agent_id}:{activity}",
+        )
 
     async def _on_event(self, project_id: str, event: AgentEvent) -> None:
         # Codex owns token streaming. Persist stable event boundaries only;
@@ -859,6 +1145,7 @@ class RootAgentEngine:
                 durable.kind,
                 exc_info=True,
             )
+        self._update_progress(project_id)
         await self._project_native_activity(project_id, durable)
 
     async def _project_native_activity(self, project_id: str, event: AgentEvent) -> None:
@@ -873,47 +1160,19 @@ class RootAgentEngine:
             event_identity = f"{event.turn_id or 'turn'}:{message}"
         if activity is None:
             return
-        if self.feishu_bridge is None:
-            return
-        try:
-            with Session(self.bind) as projection_session:
-                service = ProjectService(projection_session)
-                project = service.require_project(project_id)
-                if not project.feishu_chat_id:
-                    return
-
-                label, color, lifecycle = activity
-
-                card = build_content_card(
-                    f"[{self._project_display_name(project)}] 项目进展",
-                    f"**当前进展**：{label}",
-                    color=color,
-                )
-                projection_key = f"root-agent:{project.id}:activity"
-                projection = service.get_card_projection(projection_key)
-                await deliver_card(
-                    service,
-                    self.feishu_bridge,
-                    dedupe_key=f"{projection_key}:{event_identity}:{event.kind}",
-                    recipient_id=project.feishu_chat_id,
-                    recipient_type="chat_id",
-                    intent_type="progress",
-                    card=card,
-                    project_id=project.id,
-                    update_message_id=(
-                        projection.provider_message_id
-                        if projection is not None
-                        and projection.lifecycle_status == "running"
-                        else None
-                    ),
-                    projection_key=projection_key,
-                    subject_type="root_agent",
-                    subject_id=project.id,
-                    lifecycle_status=lifecycle,
-                    resulting_state=project.execution_status,
-                )
-        except Exception:
-            logger.warning("Failed to project native Agent activity", exc_info=True)
+        label, color, _lifecycle = activity
+        child_summary = _native_child_summary(item) if isinstance(item, dict) else None
+        self._update_progress(
+            project_id,
+            label=label,
+            color=color,
+            child_summary=child_summary,
+            observed_event=False,
+        )
+        await self._publish_progress_snapshot(
+            project_id,
+            event_identity=f"{event_identity}:{event.kind}",
+        )
 
     async def _publish_turn_status(
         self, project: Project, result: TurnResult
@@ -925,6 +1184,17 @@ class RootAgentEngine:
         projection_key = f"root-agent:{project.id}:activity"
         projection = self.service.get_card_projection(projection_key)
         label, color, lifecycle = _turn_completion_card(result.status)
+        state = self._progress.get(project.id)
+        if state is not None:
+            self._update_progress(
+                project.id,
+                label=label,
+                color=color,
+                observed_event=True,
+            )
+            body = _progress_card_body(state)
+        else:
+            body = f"**当前进展**：{label}"
         await deliver_card(
             self.service,
             self.feishu_bridge,
@@ -934,7 +1204,7 @@ class RootAgentEngine:
             intent_type="progress",
             card=build_content_card(
                 f"[{self._project_display_name(project)}] 项目进展",
-                f"**当前进展**：{label}",
+                body,
                 color=color,
             ),
             project_id=project.id,
@@ -1257,6 +1527,12 @@ class RootAgentEngine:
             return
         projection_key = f"root-agent:{project.id}:activity"
         try:
+            self._update_progress(
+                project.id,
+                label="本轮未完成，已停止；可以直接重试",
+                color="red",
+            )
+            state = self._progress.get(project.id)
             projection = delivery_service.get_card_projection(projection_key)
             await deliver_card(
                 delivery_service,
@@ -1267,7 +1543,11 @@ class RootAgentEngine:
                 intent_type="progress",
                 card=build_content_card(
                     f"[{self._project_display_name(project)}] 项目进展",
-                    "**当前进展**：本轮未完成，已停止；可以直接重试。",
+                    (
+                        _progress_card_body(state)
+                        if state is not None
+                        else "**当前进展**：本轮未完成，已停止；可以直接重试。"
+                    ),
                     color="red",
                 ),
                 project_id=project.id,

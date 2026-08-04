@@ -801,6 +801,34 @@ class ProjectService:
             ).all()
         )
 
+    def supersede_projection_notifications(
+        self,
+        projection_keys: set[str],
+        *,
+        reason: str,
+    ) -> int:
+        """Prevent stale pending card updates from overwriting a newer state."""
+
+        if not projection_keys:
+            return 0
+        changed = 0
+        rows = self.session.exec(
+            select(NotificationOutbox).where(
+                NotificationOutbox.status.in_(["pending", "failed"])
+            )
+        ).all()
+        for row in rows:
+            if (row.payload or {}).get("projection_key") not in projection_keys:
+                continue
+            row.status = "terminal_failed"
+            row.last_error = reason
+            row.updated_at = _now()
+            self.session.add(row)
+            changed += 1
+        if changed:
+            self.session.commit()
+        return changed
+
     def upsert_card_projection(
         self,
         *,

@@ -14,10 +14,11 @@ from sqlmodel import select
 
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.config import get_settings
-from mac_system.core.notification_service import retry_notification
+from mac_system.core.notification_service import deliver_card, retry_notification
 from mac_system.core.project_service import ProjectNotFoundError, ProjectService
 from mac_system.database import init_db, session_scope
 from mac_system.feishu import NullFeishuBridge
+from mac_system.feishu.card import build_content_card
 from mac_system.feishu.handlers import (
     FeishuHandlerContext,
     handle_card_action,
@@ -44,6 +45,98 @@ from mac_system.api.dependencies import (
 
 
 logger = logging.getLogger(__name__)
+
+
+async def _reconcile_interrupted_root_cards(project_ids: list[str]) -> None:
+    """Make durable Feishu projections match restart-recovered root turns."""
+
+    if not project_ids:
+        return
+    settings = get_settings()
+    if not settings.feishu_app_id or not settings.feishu_app_secret:
+        return
+    from mac_system.feishu.bridge import FeishuBridge
+
+    bridge = FeishuBridge(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret,
+        encrypt_key=settings.feishu_encrypt_key,
+        verification_token=settings.feishu_verification_token,
+    )
+    try:
+        with session_scope() as session:
+            service = ProjectService(session)
+            for project_id in project_ids:
+                project = service.get_project(project_id)
+                if project is None or not project.feishu_chat_id:
+                    continue
+                projections = service.get_project_card_projections(project_id)
+                progress_key = f"root-agent:{project_id}:activity"
+                recoverable = {
+                    projection.projection_key
+                    for projection in projections
+                    if projection.projection_key == progress_key
+                    or (
+                        projection.card_kind == "question"
+                        and projection.lifecycle_status == "pending"
+                    )
+                }
+                service.supersede_projection_notifications(
+                    recoverable,
+                    reason="superseded by native turn restart recovery",
+                )
+                display_name = str(project.name or "").strip()
+                if not display_name or len(display_name) > 24 or "\n" in display_name:
+                    display_name = "当前项目"
+                for projection in projections:
+                    if (
+                        projection.projection_key not in recoverable
+                        or not projection.provider_message_id
+                    ):
+                        continue
+                    is_progress = projection.projection_key == progress_key
+                    title = (
+                        f"[{display_name}] 项目进展"
+                        if is_progress
+                        else f"[{display_name}] 问题已失效"
+                    )
+                    content = (
+                        "**当前进展**：服务重启中止了上一轮；项目已恢复为空闲，"
+                        "可以直接继续发送消息。"
+                        if is_progress
+                        else "服务重启中止了提出该问题的 Codex turn；旧答案不会再提交，"
+                        "请直接继续发送消息。"
+                    )
+                    lifecycle = "interrupted" if is_progress else "expired"
+                    try:
+                        await deliver_card(
+                            service,
+                            bridge,
+                            dedupe_key=(
+                                f"restart-recovery:{projection.projection_key}:"
+                                f"{projection.projection_version}"
+                            ),
+                            recipient_id=project.feishu_chat_id,
+                            recipient_type="chat_id",
+                            intent_type="progress" if is_progress else "question",
+                            card=build_content_card(title, content, color="orange"),
+                            project_id=project_id,
+                            update_message_id=projection.provider_message_id,
+                            projection_key=projection.projection_key,
+                            subject_type=projection.subject_type,
+                            subject_id=projection.subject_id,
+                            lifecycle_status=lifecycle,
+                            resolved_by="system_restart" if not is_progress else None,
+                            resulting_state="idle",
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to reconcile recovered card %s",
+                            projection.projection_key,
+                            exc_info=True,
+                        )
+    finally:
+        await bridge.close()
 
 
 async def _drain_notification_outbox() -> None:
@@ -88,12 +181,13 @@ async def lifespan(app: FastAPI):
     from mac_system.core.root_sessions import recover_interrupted_native_turns
 
     with session_scope() as recovery_session:
-        recovered = recover_interrupted_native_turns(recovery_session)
-    if recovered:
+        recovered_projects = recover_interrupted_native_turns(recovery_session)
+    if recovered_projects:
         logger.warning(
             "Recovered %s native Codex turn(s) interrupted by service restart",
-            recovered,
+            len(recovered_projects),
         )
+        await _reconcile_interrupted_root_cards(recovered_projects)
     settings = get_settings()
     ws_client: FeishuWebSocketClient | None = None
     if (

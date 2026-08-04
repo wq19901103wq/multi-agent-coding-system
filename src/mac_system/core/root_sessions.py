@@ -24,6 +24,11 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
+SHUTDOWN_INTERRUPTED_ERROR = (
+    "MAC service shutdown interrupted the native Codex turn"
+)
+
+
 class RootSessionStore:
     """Small transactional API; it does not decide project workflow."""
 
@@ -204,6 +209,14 @@ class RootSessionStore:
                 "average_duration_seconds": round(
                     sum(durations) / len(durations), 1
                 ),
+                "average_tool_calls": round(
+                    sum(
+                        len(row.result.get("tool_calls") or [])
+                        for row in provider_rows
+                    )
+                    / len(provider_rows),
+                    1,
+                ),
             }
             if costs:
                 metric["average_cost_usd"] = round(sum(costs) / len(costs), 4)
@@ -264,7 +277,7 @@ class RootSessionStore:
         return row
 
 
-def recover_interrupted_native_turns(session: Session) -> int:
+def recover_interrupted_native_turns(session: Session) -> list[str]:
     """Normalize native turns whose app-server process no longer exists.
 
     Codex thread ids remain resumable, but an in-flight turn and its server
@@ -273,21 +286,20 @@ def recover_interrupted_native_turns(session: Session) -> int:
     waiting, so the durable projection must no longer advertise either state.
     """
 
-    interrupted = list(
-        session.exec(
-            select(RootAgentSession).where(
-                RootAgentSession.status.in_(("running", "waiting_user"))
-            )
-        ).all()
-    )
+    interrupted = [
+        row
+        for row in session.exec(select(RootAgentSession)).all()
+        if row.status in {"running", "waiting_user"}
+        or row.last_error == SHUTDOWN_INTERRUPTED_ERROR
+    ]
     if not interrupted:
-        return 0
+        return []
 
     project_ids = {row.project_id for row in interrupted}
     for row in interrupted:
         row.status = "idle"
         row.active_turn_id = None
-        row.last_error = "MAC restarted while the native Codex turn was active"
+        row.last_error = "Previous native Codex turn was interrupted by service restart"
         row.updated_at = _now()
         session.add(row)
 
@@ -326,4 +338,4 @@ def recover_interrupted_native_turns(session: Session) -> int:
         session.add(interaction)
 
     session.commit()
-    return len(interrupted)
+    return sorted(project_ids)
