@@ -78,6 +78,8 @@ Project 只表达长期项目关系：`active / paused / cancelled`。一次 Roo
   不重复启动进程或回放历史。服务重启时才使用持久 thread id 恢复。
 - Codex 自己负责 rollout、历史截断、compaction 和 Child Agent `fork_turns`。
 - MAC 不把工具日志、Child Agent 全文结果或历史测试输出重新拼进下一轮 Prompt。
+- 默认始终恢复同一 thread。只有用户显式发送 `/newthread` 时，MAC 才调用原生
+  `thread/start` 并替换项目绑定的 thread id；项目和目录保留，旧历史不 fork、不注入新会话。
 - 项目目录是 Root Agent 的 cwd 和写入范围；workspace-write 下仍可按 Codex 原生权限读取
   相关参考目录。
 - 项目中的 `AGENTS.md`、skills、工具和 Codex 用户配置按 Codex 原生加载机制生效。

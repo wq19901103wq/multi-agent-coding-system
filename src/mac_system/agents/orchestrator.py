@@ -65,6 +65,11 @@ class AgentOrchestrator:
     async def steer_root_agent(self, project_id: str, text: str) -> bool:
         return await self._engine().steer(project_id, text)
 
+    async def start_new_root_thread(self, project_id: str) -> tuple[str | None, str]:
+        """Apply the explicit project-level new-thread control."""
+
+        return await self._engine().start_new_thread(project_id)
+
     async def tick(self, project_id: str) -> None:
         await self.run_root_agent(project_id)
 

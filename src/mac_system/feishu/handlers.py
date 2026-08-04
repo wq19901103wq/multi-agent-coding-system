@@ -249,6 +249,7 @@ async def _handle_command(
                     "- `/projects`：查看当前会话项目\n"
                     "- `/switch [项目ID]`：切换项目\n"
                     "- `/current`：查看当前项目和目录\n"
+                    "- `/newthread`：保留项目目录，开始全新的 Codex 会话\n"
                     "- `/bind [目录]`、`/unbind`：管理工作目录\n"
                     "- `/pause`、`/resume`、`/cancel`：控制当前项目"
                 ),
@@ -286,6 +287,27 @@ async def _handle_command(
 
     if command == "/current":
         await _show_current(ctx, open_id)
+        return
+
+    if command == "/newthread":
+        project = _active_project(ctx, open_id)
+        if project is None:
+            await _send_card(
+                ctx, open_id, "无法新建会话", "请先创建或切换项目。", color="orange"
+            )
+            return
+        try:
+            await ctx.orchestrator.start_new_root_thread(project.id)
+        except RuntimeError as exc:
+            await _send_card(ctx, open_id, "暂时无法新建会话", str(exc), color="orange")
+            return
+        await _send_card(
+            ctx,
+            open_id,
+            "已开始新的 Codex 会话",
+            "项目和工作目录保持不变；后续消息不会携带旧对话历史。",
+            color="green",
+        )
         return
 
     if command == "/bind":
@@ -382,7 +404,7 @@ async def _switch_project(
         ctx,
         open_id,
         "已切换项目",
-        f"后续消息将进入 **{project.name or project.id}** 的同一个 Codex 会话。",
+        f"后续消息将进入“{project.name or project.id}”的同一个 Codex 会话。",
         color="green",
     )
 

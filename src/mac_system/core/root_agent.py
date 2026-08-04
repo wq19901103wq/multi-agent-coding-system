@@ -671,6 +671,63 @@ class RootAgentEngine:
             return False
         return True
 
+    async def start_new_thread(self, project_id: str) -> tuple[str | None, str]:
+        """Start a fresh native Codex thread for an idle project.
+
+        This deliberately uses Codex ``thread/start`` rather than ``thread/fork``:
+        the project and workspace stay the same, while old conversation history
+        is not copied into the new thread.
+        """
+
+        lock = await get_default_lock_manager().acquire(project_id)
+        async with lock:
+            self.session.expire_all()
+            project = self.service.require_project(project_id)
+            durable = self.store.ensure(project_id)
+            if (
+                project.execution_status != "idle"
+                or durable.status != "idle"
+                or durable.active_turn_id is not None
+            ):
+                raise RuntimeError("当前项目仍在处理消息，请等本轮结束后再新建会话。")
+
+            old_thread_id = durable.native_thread_id
+            with _ROOT_THREADS_GUARD:
+                handle = _ROOT_THREADS.pop(project_id, None)
+            if handle is not None:
+                current = asyncio.get_running_loop()
+                if handle.loop is current:
+                    await handle.runtime.close()
+                elif handle.loop.is_running():
+                    pending = asyncio.run_coroutine_threadsafe(
+                        handle.runtime.close(), handle.loop
+                    )
+                    await asyncio.wrap_future(pending)
+                else:
+                    # A stopped owner loop cannot safely service the old JSON-RPC
+                    # client. It has already been detached from MAC and the next
+                    # line prevents the rollout from being resumed.
+                    logger.warning(
+                        "Discarding Codex transport owned by a stopped loop for %s",
+                        project_id,
+                    )
+
+            self.store.clear_native_thread(project_id)
+            root = await self._root_thread(project)
+            assert root.thread_id is not None
+            new_thread_id = root.thread_id
+            await self.service.log_event(
+                project_id,
+                "INFO",
+                "Native Codex thread replaced by explicit user command",
+                {
+                    "old_thread_id": old_thread_id,
+                    "new_thread_id": new_thread_id,
+                },
+            )
+            self.session.commit()
+            return old_thread_id, new_thread_id
+
     async def _root_thread(self, project: Project) -> CodexAppServerThread:
         current_loop = asyncio.get_running_loop()
         extension_tools = self._extension_tools(project)

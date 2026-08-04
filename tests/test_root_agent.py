@@ -199,6 +199,79 @@ async def test_project_messages_resume_the_same_native_root_thread(
 
 
 @pytest.mark.asyncio
+async def test_explicit_new_thread_replaces_history_without_changing_project(
+    root_context, monkeypatch
+):
+    session, engine = root_context
+    created: list[str] = []
+    closed: list[str] = []
+
+    class FakeRoot:
+        def __init__(self, **kwargs):
+            self.thread_id = None
+            self.tools = {}
+            self.event_handler = kwargs.get("event_handler")
+            self.server_request_handler = kwargs.get("server_request_handler")
+
+        async def create_thread(self):
+            self.thread_id = f"thread-{len(created) + 1}"
+            created.append(self.thread_id)
+            return self.thread_id
+
+        async def resume_thread(self, thread_id):
+            self.thread_id = thread_id
+            return thread_id
+
+        async def run_turn(self, _text):
+            return TurnResult(
+                thread_id=self.thread_id,
+                turn_id="turn-1",
+                status="completed",
+                final_message=None,
+                events=(),
+            )
+
+        async def close(self):
+            closed.append(self.thread_id)
+
+    monkeypatch.setattr("mac_system.core.root_agent.CodexAppServerThread", FakeRoot)
+
+    await engine.run("proj-root", "第一轮")
+    project_before = session.get(Project, "proj-root")
+    workspace_before = project_before.workspace_path
+
+    old_thread, new_thread = await engine.start_new_thread("proj-root")
+
+    assert (old_thread, new_thread) == ("thread-1", "thread-2")
+    assert created == ["thread-1", "thread-2"]
+    assert closed == ["thread-1"]
+    root = session.exec(select(RootAgentSession)).one()
+    assert root.native_thread_id == "thread-2"
+    assert session.get(Project, "proj-root").workspace_path == workspace_before
+    event = session.exec(
+        select(EventLog).where(
+            EventLog.message == "Native Codex thread replaced by explicit user command"
+        )
+    ).one()
+    assert event.meta == {
+        "old_thread_id": "thread-1",
+        "new_thread_id": "thread-2",
+    }
+
+
+@pytest.mark.asyncio
+async def test_explicit_new_thread_rejects_active_turn(root_context):
+    session, engine = root_context
+    engine.store.set_turn("proj-root", turn_id="turn-active", status="running")
+    engine.service.set_execution_status("proj-root", "running")
+
+    with pytest.raises(RuntimeError, match="当前项目仍在处理消息"):
+        await engine.start_new_thread("proj-root")
+
+    assert session.exec(select(RootAgentSession)).one().active_turn_id == "turn-active"
+
+
+@pytest.mark.asyncio
 async def test_native_event_projection_skips_stream_deltas_and_compacts_output(
     root_context,
 ):

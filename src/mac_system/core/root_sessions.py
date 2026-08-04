@@ -61,6 +61,23 @@ class RootSessionStore:
         self.session.commit()
         return row
 
+    def clear_native_thread(self, project_id: str) -> RootAgentSession:
+        """Detach the project from its current Codex thread.
+
+        This is only used by the explicit project-level ``/newthread`` control.
+        The old Codex rollout remains on disk; MAC simply stops resuming it.
+        """
+
+        row = self.ensure(project_id)
+        row.native_thread_id = None
+        row.active_turn_id = None
+        row.status = "idle"
+        row.last_error = None
+        row.updated_at = _now()
+        self.session.add(row)
+        self.session.commit()
+        return row
+
     def set_turn(
         self, project_id: str, *, turn_id: str | None, status: str, error: str | None = None
     ) -> RootAgentSession:

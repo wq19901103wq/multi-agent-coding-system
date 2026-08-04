@@ -38,6 +38,7 @@ class Orchestrator:
         self.scheduled = []
         self.steered = []
         self.cancelled = []
+        self.new_threads = []
         self.steer_result = True
 
     def schedule_root_agent(self, project_id, text):
@@ -50,6 +51,10 @@ class Orchestrator:
     async def cancel_project(self, project_id, reason=""):
         self.cancelled.append((project_id, reason))
         await self.project_service.cancel_project(project_id, reason)
+
+    async def start_new_root_thread(self, project_id):
+        self.new_threads.append(project_id)
+        return "old-thread", "new-thread"
 
 
 def _card_nodes(value):
@@ -234,6 +239,28 @@ async def test_switch_is_explicit_project_selection(ctx):
     await handle_text_message(ctx, message(f"/switch {first.id}"))
     assert ctx.service.get_chat_user_selected_project("oc-chat", "ou-user").id == first.id
     assert first.id != second.id
+    card = ctx.bridge.cards[-1][2]
+    markdown = card["body"]["elements"][0]["content"]
+    assert markdown == "后续消息将进入“first”的同一个 Codex 会话。"
+    assert "**" not in markdown
+
+
+@pytest.mark.asyncio
+async def test_newthread_is_explicit_project_control(ctx):
+    project = await ctx.service.create_project(
+        "site",
+        "feature",
+        "initial",
+        creator_open_id="ou-user",
+        feishu_chat_id="oc-chat",
+    )
+
+    await handle_text_message(ctx, message("/newthread"))
+
+    assert ctx.orchestrator.new_threads == [project.id]
+    card = ctx.bridge.cards[-1][2]
+    assert card["header"]["title"]["content"] == "已开始新的 Codex 会话"
+    assert "后续消息不会携带旧对话历史" in card["body"]["elements"][0]["content"]
 
 
 @pytest.mark.asyncio

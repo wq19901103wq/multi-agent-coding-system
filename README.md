@@ -38,6 +38,7 @@ curl http://127.0.0.1:18080/admin/projects
 - `/bind [目录]`：绑定已有 Git 项目；
 - `/switch`：切换项目；
 - `/current`：查看当前项目和目录；
+- `/newthread`：保留项目目录并开始全新的 Codex 会话；
 - `/status`：查看状态；
 - `/cancel`：终止当前项目运行。
 
