@@ -6,11 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session
 
 from mac_system.agents.orchestrator import AgentOrchestrator
-from mac_system.agents.prompts import PromptRenderer
 from mac_system.agents.runtime import build_agent_runtime
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
-from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.database import get_session
 from mac_system.feishu import FeishuBridge
 from mac_system.feishu.handlers import FeishuHandlerContext, handle_card_action, handle_text_message
@@ -36,11 +34,9 @@ def get_orchestrator_with_bridge(
 ) -> AgentOrchestrator:
     settings = get_settings()
     service = ProjectService(session)
-    worktree_manager = WorktreeManager(settings.projects_dir)
     agent_config = get_agent_config()
     runtime = build_agent_runtime(settings, agent_config)
-    renderer = PromptRenderer(agent_config)
-    return AgentOrchestrator(service, worktree_manager, runtime, renderer, feishu_bridge=bridge)
+    return AgentOrchestrator(service, runtime, feishu_bridge=bridge)
 
 
 @router.post("/events")

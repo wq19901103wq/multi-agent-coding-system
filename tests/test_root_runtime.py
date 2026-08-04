@@ -3,9 +3,9 @@ import json
 
 import pytest
 
-from mac_system.agents.coordinator_runtime import (
-    CodexAppServerCoordinator,
-    CoordinatorTool,
+from mac_system.agents.root_runtime import (
+    CodexAppServerThread,
+    DynamicTool,
 )
 
 
@@ -68,7 +68,7 @@ class _FakeProcess:
                         "turnId": "turn-1",
                         "callId": "call-1",
                         "namespace": None,
-                        "tool": "mac_spawn_agent",
+                        "tool": "run_external_agent",
                         "arguments": {"provider": "claude_code", "message": "inspect"},
                     },
                 }
@@ -102,7 +102,7 @@ class _FakeProcess:
                     },
                 }
             )
-        elif method == "turn/steer":
+        elif method in {"turn/steer", "turn/interrupt"}:
             self._feed({"jsonrpc": "2.0", "id": request_id, "result": {}})
 
     def terminate(self):
@@ -117,7 +117,7 @@ class _FakeProcess:
 
 
 @pytest.mark.asyncio
-async def test_codex_coordinator_keeps_tool_result_in_same_turn(monkeypatch, tmp_path):
+async def test_codex_root_keeps_tool_result_in_same_turn(monkeypatch, tmp_path):
     process = _FakeProcess()
     process_args = None
 
@@ -133,13 +133,13 @@ async def test_codex_coordinator_keeps_tool_result_in_same_turn(monkeypatch, tmp
         calls.append(arguments)
         return {"task": "agent-1", "status": "running"}
 
-    runtime = CodexAppServerCoordinator(
+    runtime = CodexAppServerThread(
         codex_bin="codex",
         cwd=tmp_path,
-        developer_instructions="Coordinate with MAC tools.",
+        developer_instructions=None,
         tools=[
-            CoordinatorTool(
-                name="mac_spawn_agent",
+            DynamicTool(
+                name="run_external_agent",
                 description="Start a coding-agent backend",
                 input_schema={"type": "object"},
                 handler=spawn,
@@ -152,7 +152,7 @@ async def test_codex_coordinator_keeps_tool_result_in_same_turn(monkeypatch, tmp
         await runtime.close()
 
     assert calls == [{"provider": "claude_code", "message": "inspect"}]
-    assert process_args[-2:] == ("--disable", "code_mode_host")
+    assert process_args == ("codex", "app-server", "--stdio")
     assert result.thread_id == "thread-1"
     assert result.turn_id == "turn-1"
     assert result.status == "completed"
@@ -189,7 +189,7 @@ async def test_root_codex_home_isolated_from_global_tools_and_reuses_only_auth(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
-    runtime = CodexAppServerCoordinator(
+    runtime = CodexAppServerThread(
         codex_bin="codex",
         cwd=tmp_path,
         developer_instructions="Coordinate.",
@@ -208,7 +208,7 @@ async def test_root_codex_home_isolated_from_global_tools_and_reuses_only_auth(
 
 
 @pytest.mark.asyncio
-async def test_codex_coordinator_registers_native_tools_and_can_resume_and_steer(
+async def test_codex_root_registers_native_tools_and_can_resume_and_steer(
     monkeypatch, tmp_path
 ):
     process = _FakeProcess()
@@ -217,13 +217,13 @@ async def test_codex_coordinator_registers_native_tools_and_can_resume_and_steer
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
-    runtime = CodexAppServerCoordinator(
+    runtime = CodexAppServerThread(
         codex_bin="codex",
         cwd=tmp_path,
         developer_instructions="Coordinate.",
         tools=[
-            CoordinatorTool(
-                name="mac_spawn_agent",
+            DynamicTool(
+                name="run_external_agent",
                 description="Start an agent",
                 input_schema={"type": "object", "additionalProperties": False},
                 handler=lambda _: "ok",
@@ -234,12 +234,13 @@ async def test_codex_coordinator_registers_native_tools_and_can_resume_and_steer
         await runtime.create_thread()
         await runtime.resume_thread("thread-1")
         await runtime.steer("turn-active", "new user correction")
+        await runtime.interrupt("turn-active")
     finally:
         await runtime.close()
 
     start = next(message for message in process.messages if message.get("method") == "thread/start")
     assert start["params"]["ephemeral"] is False
-    assert start["params"]["dynamicTools"][0]["name"] == "mac_spawn_agent"
+    assert start["params"]["dynamicTools"][0]["name"] == "run_external_agent"
     resume = next(
         message for message in process.messages if message.get("method") == "thread/resume"
     )
@@ -247,10 +248,17 @@ async def test_codex_coordinator_registers_native_tools_and_can_resume_and_steer
     steer = next(message for message in process.messages if message.get("method") == "turn/steer")
     assert steer["params"]["expectedTurnId"] == "turn-active"
     assert steer["params"]["input"][0]["text"] == "new user correction"
+    interrupt = next(
+        message for message in process.messages if message.get("method") == "turn/interrupt"
+    )
+    assert interrupt["params"] == {
+        "threadId": "thread-1",
+        "turnId": "turn-active",
+    }
 
 
 @pytest.mark.asyncio
-async def test_codex_coordinator_can_disable_execution_environment_without_hiding_host_tools(
+async def test_codex_root_can_disable_execution_environment_without_hiding_host_tools(
     monkeypatch, tmp_path
 ):
     process = _FakeProcess()
@@ -259,13 +267,13 @@ async def test_codex_coordinator_can_disable_execution_environment_without_hidin
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
-    runtime = CodexAppServerCoordinator(
+    runtime = CodexAppServerThread(
         codex_bin="codex",
         cwd=tmp_path,
         developer_instructions="Delegate all project work.",
         tools=[
-            CoordinatorTool(
-                name="mac_spawn_agent",
+            DynamicTool(
+                name="run_external_agent",
                 description="Start an agent",
                 input_schema={"type": "object"},
                 handler=lambda _: "ok",
@@ -282,4 +290,4 @@ async def test_codex_coordinator_can_disable_execution_environment_without_hidin
     start = next(message for message in process.messages if message.get("method") == "thread/start")
     assert start["params"]["environments"] == []
     assert start["params"]["config"] == {"features.multi_agent": False}
-    assert [tool["name"] for tool in start["params"]["dynamicTools"]] == ["mac_spawn_agent"]
+    assert [tool["name"] for tool in start["params"]["dynamicTools"]] == ["run_external_agent"]

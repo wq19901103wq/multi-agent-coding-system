@@ -7,12 +7,7 @@ from typing import Any
 
 import httpx
 
-from mac_system.feishu.card import (
-    build_confirmation_card,
-    build_content_card,
-    build_input_card,
-    build_status_card,
-)
+from mac_system.feishu.card import build_content_card
 from mac_system.feishu.crypto import decrypt_feishu, verify_signature
 from mac_system.utils.formatting import (
     split_markdown_sections,
@@ -34,6 +29,20 @@ def _strip_mention_placeholders(text: str) -> str:
 
 class FeishuBridgeError(Exception):
     pass
+
+
+class FeishuHTTPStatusError(httpx.HTTPStatusError):
+    """HTTP error that preserves Feishu's structured response body."""
+
+
+def _status_error(exc: httpx.HTTPStatusError) -> FeishuHTTPStatusError:
+    body = exc.response.text.strip()
+    detail = f"{exc}; response={body[:2000]}" if body else str(exc)
+    return FeishuHTTPStatusError(
+        detail,
+        request=exc.request,
+        response=exc.response,
+    )
 
 
 class FeishuBridge:
@@ -113,10 +122,12 @@ class FeishuBridge:
                 if isinstance(exc, httpx.HTTPStatusError):
                     status = exc.response.status_code
                     if status < 500 and status != 429:
-                        raise
+                        raise _status_error(exc) from exc
                 last_exc = exc
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5 * (2 ** attempt))
+        if isinstance(last_exc, httpx.HTTPStatusError):
+            raise _status_error(last_exc) from last_exc
         raise last_exc
 
     async def get_bot_open_id(self) -> str | None:
@@ -213,60 +224,6 @@ class FeishuBridge:
             )
             message_ids.append(message_id)
         return message_ids
-
-    async def send_confirmation_card(
-        self,
-        open_id: str,
-        approval_id: str,
-        title: str,
-        summary: str,
-        details: dict[str, Any],
-        options: list[dict[str, Any]],
-        receive_id_type: str = "open_id",
-        chat_id: str | None = None,
-        chat_type: str = "p2p",
-        show_actions: bool = True,
-    ) -> str:
-        state = details.get("state", "")
-        card = build_confirmation_card(
-            title, summary, details, options, approval_id, state,
-            chat_id=chat_id, chat_type=chat_type, show_actions=show_actions,
-        )
-        return await self._send_interactive(open_id, card, receive_id_type=receive_id_type)
-
-    async def send_input_card(
-        self,
-        open_id: str,
-        approval_id: str,
-        title: str,
-        question: str,
-        context: str,
-        receive_id_type: str = "open_id",
-        chat_id: str | None = None,
-        chat_type: str = "p2p",
-    ) -> str:
-        card = build_input_card(
-            title, question, context, approval_id, "",
-            chat_id=chat_id, chat_type=chat_type,
-        )
-        return await self._send_interactive(open_id, card, receive_id_type=receive_id_type)
-
-    async def send_status_card(
-        self,
-        open_id: str,
-        project_id: str,
-        current_state: str,
-        display: str,
-        recent_events: list[dict[str, Any]],
-    ) -> str:
-        card = build_status_card(
-            f"项目状态：{project_id}",
-            project_id,
-            current_state,
-            display,
-            recent_events,
-        )
-        return await self._send_interactive(open_id, card)
 
     async def update_card(self, message_id: str, card_content: dict[str, Any]) -> None:
         """Update an existing interactive card."""
@@ -435,39 +392,6 @@ class NullFeishuBridge:
 
     async def _send_interactive_to_chat(
         self, chat_id: str, card: dict[str, Any]
-    ) -> str:
-        return ""
-
-    async def send_confirmation_card(
-        self,
-        open_id: str,
-        approval_id: str,
-        title: str,
-        summary: str,
-        details: dict[str, Any],
-        options: list[dict[str, Any]],
-        receive_id_type: str = "open_id",
-    ) -> str:
-        return ""
-
-    async def send_input_card(
-        self,
-        open_id: str,
-        approval_id: str,
-        title: str,
-        question: str,
-        context: str,
-        receive_id_type: str = "open_id",
-    ) -> str:
-        return ""
-
-    async def send_status_card(
-        self,
-        open_id: str,
-        project_id: str,
-        current_state: str,
-        display: str,
-        recent_events: list[dict[str, Any]],
     ) -> str:
         return ""
 

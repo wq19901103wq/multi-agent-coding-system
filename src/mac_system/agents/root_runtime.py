@@ -1,10 +1,8 @@
-"""Native, event-driven runtime contract for the MAC Coordinator.
+"""Thin Codex app-server client used by MAC's persistent root Agent.
 
-The contract intentionally mirrors the Codex app-server protocol instead of
-asking the model to return a complete workflow graph.  A Coordinator owns a
-persistent thread, emits tool calls, receives their results, and continues the
-same turn.  Other providers can implement the same contract with their native
-session and tool protocols.
+The turn loop, built-in tools, context management, multi-Agent control and
+sub-Agent sessions remain owned by Codex. MAC only transports user input,
+answers app-server requests and projects native events onto its UI/storage.
 """
 
 from __future__ import annotations
@@ -14,6 +12,7 @@ import inspect
 import json
 import logging
 import os
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,19 +21,20 @@ from typing import Any
 
 JsonObject = dict[str, Any]
 ToolHandler = Callable[..., Awaitable[Any] | Any]
-EventHandler = Callable[["CoordinatorEvent"], Awaitable[None] | None]
+EventHandler = Callable[["AgentEvent"], Awaitable[None] | None]
+ServerRequestHandler = Callable[[str, JsonObject], Awaitable[JsonObject] | JsonObject]
 logger = logging.getLogger(__name__)
 _APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 _PROCESS_CLOSED_METHOD = "mac/process/closed"
 
 
-class CoordinatorProtocolError(RuntimeError):
-    """Raised when a native Coordinator runtime violates its event protocol."""
+class AppServerProtocolError(RuntimeError):
+    """Raised when the Codex app-server violates its JSON-RPC contract."""
 
 
 @dataclass(frozen=True)
-class CoordinatorTool:
-    """One host tool advertised to the Coordinator model."""
+class DynamicTool:
+    """One MAC extension advertised through Codex dynamic tools."""
 
     name: str
     description: str
@@ -53,8 +53,8 @@ class CoordinatorTool:
 
 
 @dataclass(frozen=True)
-class CoordinatorEvent:
-    """Provider-neutral event projected from a native Coordinator session."""
+class AgentEvent:
+    """Native app-server event projected to MAC storage and UI."""
 
     kind: str
     thread_id: str
@@ -63,7 +63,7 @@ class CoordinatorEvent:
 
 
 @dataclass(frozen=True)
-class CoordinatorToolContext:
+class ToolContext:
     thread_id: str
     turn_id: str
     call_id: str
@@ -71,31 +71,27 @@ class CoordinatorToolContext:
 
 
 @dataclass(frozen=True)
-class CoordinatorTurnResult:
+class TurnResult:
     thread_id: str
     turn_id: str
     status: str
     final_message: str | None
-    events: tuple[CoordinatorEvent, ...]
+    events: tuple[AgentEvent, ...]
 
 
-class CodexAppServerCoordinator:
-    """Drive a persistent Codex Coordinator through app-server JSON-RPC.
-
-    Codex executes its own model/tool continuation loop.  MAC only responds to
-    host tool requests and consumes lifecycle events; it does not parse a
-    model-authored DAG or replay tool logs into a fresh prompt.
-    """
+class CodexAppServerThread:
+    """Drive one persistent Codex root thread through app-server JSON-RPC."""
 
     def __init__(
         self,
         *,
         codex_bin: Path | str,
         cwd: Path,
-        tools: list[CoordinatorTool],
-        developer_instructions: str,
+        tools: list[DynamicTool],
+        developer_instructions: str | None = None,
         model: str | None = None,
         event_handler: EventHandler | None = None,
+        server_request_handler: ServerRequestHandler | None = None,
         request_timeout_seconds: float = 60.0,
         sandbox: str = "read-only",
         approval_policy: str = "never",
@@ -110,6 +106,7 @@ class CodexAppServerCoordinator:
         self.developer_instructions = developer_instructions
         self.model = model
         self.event_handler = event_handler
+        self.server_request_handler = server_request_handler
         self.request_timeout_seconds = request_timeout_seconds
         self.sandbox = sandbox
         self.approval_policy = approval_policy
@@ -135,6 +132,7 @@ class CodexAppServerCoordinator:
         self._inbound: asyncio.Queue[JsonObject] = asyncio.Queue()
         self._write_lock = asyncio.Lock()
         self._turn_lock = asyncio.Lock()
+        self._stderr_lines: deque[str] = deque(maxlen=80)
 
     async def start(self) -> None:
         if self._process is not None:
@@ -156,12 +154,6 @@ class CodexAppServerCoordinator:
             self.codex_bin,
             "app-server",
             "--stdio",
-            # Codex 0.144.x may route external tools through the unsigned
-            # code-mode host on macOS.  That host fails before app-server can
-            # emit ``item/tool/call``. Select direct function tools, matching
-            # the existing Codex task runtime's stable configuration.
-            "--disable",
-            "code_mode_host",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -174,17 +166,17 @@ class CodexAppServerCoordinator:
             limit=_APP_SERVER_STREAM_LIMIT,
         )
         self._reader_task = asyncio.create_task(
-            self._read_messages(), name="mac-codex-coordinator-reader"
+            self._read_messages(), name="mac-codex-root-reader"
         )
         self._stderr_task = asyncio.create_task(
-            self._drain_stderr(), name="mac-codex-coordinator-stderr"
+            self._drain_stderr(), name="mac-codex-root-stderr"
         )
         await self._request(
             "initialize",
             {
                 "clientInfo": {
                     "name": "mac-system",
-                    "title": "MAC Coordinator",
+                    "title": "MAC",
                     "version": "1.0",
                 },
                 "capabilities": {"experimentalApi": True},
@@ -210,7 +202,7 @@ class CodexAppServerCoordinator:
             self._stderr_task.cancel()
             await asyncio.gather(self._stderr_task, return_exceptions=True)
             self._stderr_task = None
-        error = CoordinatorProtocolError("Codex app-server closed")
+        error = AppServerProtocolError("Codex app-server closed")
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(error)
@@ -222,10 +214,11 @@ class CodexAppServerCoordinator:
             "cwd": str(self.cwd),
             "sandbox": self.sandbox,
             "approvalPolicy": self.approval_policy,
-            "developerInstructions": self.developer_instructions,
             "dynamicTools": [tool.codex_spec() for tool in self.tools.values()],
             "ephemeral": self.ephemeral,
         }
+        if self.developer_instructions is not None:
+            params["developerInstructions"] = self.developer_instructions
         if self.environments is not None:
             params["environments"] = self.environments
         if self.thread_config:
@@ -243,8 +236,9 @@ class CodexAppServerCoordinator:
             "cwd": str(self.cwd),
             "sandbox": self.sandbox,
             "approvalPolicy": self.approval_policy,
-            "developerInstructions": self.developer_instructions,
         }
+        if self.developer_instructions is not None:
+            params["developerInstructions"] = self.developer_instructions
         if self.thread_config:
             params["config"] = self.thread_config
         if self.model:
@@ -253,11 +247,11 @@ class CodexAppServerCoordinator:
         self.thread_id = self._extract_thread_id(response)
         return self.thread_id
 
-    async def run_turn(self, text: str) -> CoordinatorTurnResult:
+    async def run_turn(self, text: str) -> TurnResult:
         async with self._turn_lock:
             return await self._run_turn_locked(text)
 
-    async def _run_turn_locked(self, text: str) -> CoordinatorTurnResult:
+    async def _run_turn_locked(self, text: str) -> TurnResult:
         if self.thread_id is None:
             await self.create_thread()
         assert self.thread_id is not None
@@ -270,35 +264,54 @@ class CodexAppServerCoordinator:
         )
         turn = response.get("turn")
         if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
-            raise CoordinatorProtocolError("turn/start response has no turn id")
+            raise AppServerProtocolError("turn/start response has no turn id")
         turn_id = turn["id"]
-        events: list[CoordinatorEvent] = []
+        events: list[AgentEvent] = []
         final_message: str | None = None
 
         while True:
             message = await self._inbound.get()
             method = str(message.get("method") or "")
             if method == _PROCESS_CLOSED_METHOD:
-                raise CoordinatorProtocolError(
+                raise AppServerProtocolError(
                     str((message.get("params") or {}).get("error") or "Codex app-server closed")
                 )
             params = message.get("params")
             params = params if isinstance(params, dict) else {}
 
             if "id" in message:
-                if method != "item/tool/call":
-                    await self._respond_error(message["id"], f"Unsupported request: {method}")
-                    continue
-                if params.get("threadId") != self.thread_id or params.get("turnId") != turn_id:
-                    await self._respond_error(message["id"], "Tool call belongs to another turn")
-                    continue
-                event = CoordinatorEvent("tool_call", self.thread_id, turn_id, params)
+                request_thread_id = str(params.get("threadId") or self.thread_id or "")
+                request_turn_id = str(params.get("turnId") or turn_id or "") or None
+                event = AgentEvent(
+                    "tool_call" if method == "item/tool/call" else "server_request",
+                    request_thread_id,
+                    request_turn_id,
+                    {"method": method, **params},
+                )
                 events.append(event)
                 await self._emit(event)
-                await self._execute_tool_request(message["id"], params)
+                if method == "item/tool/call":
+                    await self._execute_tool_request(message["id"], params)
+                elif self.server_request_handler is not None:
+                    try:
+                        response = self.server_request_handler(method, params)
+                        if inspect.isawaitable(response):
+                            response = await response
+                        await self._respond_result(message["id"], response)
+                    except Exception as exc:
+                        await self._respond_error(message["id"], str(exc))
+                else:
+                    await self._respond_error(
+                        message["id"], f"Unsupported request: {method}"
+                    )
                 continue
 
-            event = CoordinatorEvent(method, self.thread_id, turn_id, params)
+            event = AgentEvent(
+                method,
+                str(params.get("threadId") or self.thread_id or ""),
+                str(params.get("turnId") or turn_id or "") or None,
+                params,
+            )
             events.append(event)
             await self._emit(event)
             if method == "item/completed":
@@ -312,7 +325,7 @@ class CodexAppServerCoordinator:
                 completed = completed if isinstance(completed, dict) else {}
                 if completed.get("id") != turn_id:
                     continue
-                return CoordinatorTurnResult(
+                return TurnResult(
                     thread_id=self.thread_id,
                     turn_id=turn_id,
                     status=str(completed.get("status") or "unknown"),
@@ -322,7 +335,7 @@ class CodexAppServerCoordinator:
 
     async def steer(self, turn_id: str, text: str) -> None:
         if self.thread_id is None:
-            raise CoordinatorProtocolError("Cannot steer before creating a thread")
+            raise AppServerProtocolError("Cannot steer before creating a thread")
         await self._request(
             "turn/steer",
             {
@@ -330,6 +343,16 @@ class CodexAppServerCoordinator:
                 "expectedTurnId": turn_id,
                 "input": [{"type": "text", "text": text, "textElements": []}],
             },
+        )
+
+    async def interrupt(self, turn_id: str) -> None:
+        """Interrupt the active turn using Codex's native v2 protocol."""
+
+        if self.thread_id is None:
+            raise AppServerProtocolError("Cannot interrupt before creating a thread")
+        await self._request(
+            "turn/interrupt",
+            {"threadId": self.thread_id, "turnId": turn_id},
         )
 
     async def _execute_tool_request(self, request_id: Any, params: JsonObject) -> None:
@@ -341,7 +364,7 @@ class CodexAppServerCoordinator:
         arguments = params.get("arguments")
         arguments = arguments if isinstance(arguments, dict) else {}
         try:
-            context = CoordinatorToolContext(
+            context = ToolContext(
                 thread_id=str(params.get("threadId") or ""),
                 turn_id=str(params.get("turnId") or ""),
                 call_id=str(params.get("callId") or ""),
@@ -381,6 +404,11 @@ class CodexAppServerCoordinator:
             }
         )
 
+    async def _respond_result(self, request_id: Any, result: JsonObject) -> None:
+        await self._send(
+            {"jsonrpc": "2.0", "id": request_id, "result": result}
+        )
+
     async def _request(self, method: str, params: JsonObject) -> JsonObject:
         self._request_id += 1
         request_id = self._request_id
@@ -395,12 +423,12 @@ class CodexAppServerCoordinator:
             self._pending.pop(request_id, None)
         error = message.get("error")
         if isinstance(error, dict):
-            raise CoordinatorProtocolError(
+            raise AppServerProtocolError(
                 f"{method} failed: {error.get('message') or error}"
             )
         result = message.get("result")
         if not isinstance(result, dict):
-            raise CoordinatorProtocolError(f"{method} returned a non-object result")
+            raise AppServerProtocolError(f"{method} returned a non-object result")
         return result
 
     async def _notify(self, method: str, params: JsonObject | None = None) -> None:
@@ -412,7 +440,7 @@ class CodexAppServerCoordinator:
     async def _send(self, message: Mapping[str, Any]) -> None:
         process = self._process
         if process is None or process.stdin is None:
-            raise CoordinatorProtocolError("Codex app-server is not running")
+            raise AppServerProtocolError("Codex app-server is not running")
         data = json.dumps(dict(message), ensure_ascii=False, separators=(",", ":"))
         async with self._write_lock:
             process.stdin.write((data + "\n").encode("utf-8"))
@@ -425,7 +453,7 @@ class CodexAppServerCoordinator:
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError as exc:
-                    raise CoordinatorProtocolError("Invalid JSON-RPC from app-server") from exc
+                    raise AppServerProtocolError("Invalid JSON-RPC from app-server") from exc
                 if not isinstance(message, dict):
                     continue
                 if "method" in message:
@@ -435,7 +463,13 @@ class CodexAppServerCoordinator:
                 future = self._pending.get(request_id)
                 if future is not None and not future.done():
                     future.set_result(message)
-            error = CoordinatorProtocolError("Codex app-server stdout closed")
+            await self._process.wait()
+            await asyncio.sleep(0)
+            stderr = "\n".join(self._stderr_lines)
+            error = AppServerProtocolError(
+                "Codex app-server stdout closed"
+                + (f"; stderr: {stderr[-4000:]}" if stderr else "")
+            )
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(error)
@@ -458,9 +492,10 @@ class CodexAppServerCoordinator:
         while line := await self._process.stderr.readline():
             message = line.decode("utf-8", errors="replace").rstrip()
             if message:
+                self._stderr_lines.append(message)
                 logger.debug("Codex app-server stderr: %s", message)
 
-    async def _emit(self, event: CoordinatorEvent) -> None:
+    async def _emit(self, event: AgentEvent) -> None:
         if self.event_handler is None:
             return
         result = self.event_handler(event)
@@ -471,5 +506,5 @@ class CodexAppServerCoordinator:
     def _extract_thread_id(response: JsonObject) -> str:
         thread = response.get("thread")
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
-            raise CoordinatorProtocolError("thread response has no thread id")
+            raise AppServerProtocolError("thread response has no thread id")
         return thread["id"]

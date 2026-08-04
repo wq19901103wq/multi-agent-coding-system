@@ -18,11 +18,9 @@ import time
 from typing import Any
 
 from mac_system.agents.orchestrator import AgentOrchestrator
-from mac_system.agents.prompts import PromptRenderer
 from mac_system.agents.runtime import build_agent_runtime
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
-from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.database import session_scope
 from mac_system.feishu.bridge import FeishuBridge
 from datetime import datetime, timedelta, timezone
@@ -662,15 +660,11 @@ class _WsHandlerContext:
             verification_token=self.settings.feishu_verification_token,
         )
         service = ProjectService(self.session)
-        worktree_manager = WorktreeManager(self.settings.projects_dir)
         agent_config = get_agent_config()
         runtime = build_agent_runtime(self.settings, agent_config)
-        renderer = PromptRenderer(agent_config)
         orchestrator = AgentOrchestrator(
             service,
-            worktree_manager,
             runtime,
-            renderer,
             feishu_bridge=bridge,
             background_scheduler=self.background_scheduler,
         )

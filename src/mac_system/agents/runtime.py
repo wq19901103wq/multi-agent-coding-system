@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def normalize_optional_nulls(
-    output: dict[str, Any], output_schema: Path
+    output: dict[str, Any], output_schema: Path | dict[str, Any]
 ) -> dict[str, Any]:
     """Omit nulls only where the schema declares an optional non-null field.
 
@@ -34,7 +34,11 @@ def normalize_optional_nulls(
     therefore still fail or pass through the normal validator.
     """
     try:
-        root = json.loads(output_schema.read_text(encoding="utf-8"))
+        root = (
+            output_schema
+            if isinstance(output_schema, dict)
+            else json.loads(output_schema.read_text(encoding="utf-8"))
+        )
     except (OSError, json.JSONDecodeError):
         return output
 
@@ -277,7 +281,7 @@ class AgentRuntime(ABC):
         workspace: Path,
         worktree: Path,
         context_files: list[Path],
-        output_schema: Path,
+        output_schema: Path | None,
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
@@ -464,7 +468,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         workspace: Path,
         worktree: Path,
         context_files: list[Path],
-        output_schema: Path,
+        output_schema: Path | None,
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
@@ -508,7 +512,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         task_prompt: str,
         system_prompt_file: Path,
         worktree: Path,
-        output_schema: Path,
+        output_schema: Path | None,
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
@@ -822,64 +826,38 @@ class ClaudeCodeRuntime(AgentRuntime):
                         tool_calls=tool_calls,
                         failure=api_failure,
                     )
-                raw_result = result_event.get("result", "")
+                raw_result = str(result_event.get("result", "") or "")
+                if output_schema is None:
+                    return AgentRuntimeResult(
+                        success=not result_event.get("is_error", False),
+                        output_json=None,
+                        output_files=_result_output_files(),
+                        logs=logs,
+                        cost_info=self._extract_cost_info(result_event),
+                        tool_calls=tool_calls,
+                        raw_result=raw_result.strip() or None,
+                    )
                 output_json = self._parse_json_output(raw_result)
                 if output_json is None:
-                    # Coder / Tester / Reviewer are required to persist the
-                    # same schema object in a canonical .mac artifact. Some
-                    # providers nevertheless replace the final stdout with a
-                    # prose acknowledgement after a successful Write/Edit.
-                    # Treat the persisted, schema-validated artifact as the
-                    # authoritative result instead of discarding completed
-                    # work. This also supports retries that intentionally
-                    # reuse a previously written artifact.
-                    output_json = self._read_canonical_output_artifact(
-                        agent_type, worktree, output_schema
-                    )
-                    if output_json is None:
-                        preview = (raw_result or "")[:500]
-                        logger.warning(
-                            "agent output JSON parse failed; task_id=%s preview=%r",
-                            task_id,
-                            preview,
-                        )
-                        return AgentRuntimeResult(
-                            success=False,
-                            output_json=None,
-                            output_files=_result_output_files(),
-                            logs=logs + "\nInvalid agent output: result is not a JSON object",
-                            cost_info=self._extract_cost_info(result_event),
-                            tool_calls=tool_calls,
-                            raw_result=str(raw_result or "").strip() or None,
-                        )
-                    logger.info(
-                        "using canonical agent artifact after non-JSON stdout; "
-                        "task_id=%s agent_type=%s",
+                    preview = raw_result[:500]
+                    logger.warning(
+                        "agent output JSON parse failed; task_id=%s preview=%r",
                         task_id,
-                        agent_type,
+                        preview,
+                    )
+                    return AgentRuntimeResult(
+                        success=False,
+                        output_json=None,
+                        output_files=_result_output_files(),
+                        logs=logs + "\nInvalid agent output: result is not a JSON object",
+                        cost_info=self._extract_cost_info(result_event),
+                        tool_calls=tool_calls,
+                        raw_result=raw_result.strip() or None,
                     )
                 output_json = normalize_optional_nulls(
                     redact_secrets(output_json), output_schema
                 )
                 contract_error = validate_agent_output(output_json, output_schema)
-                if contract_error:
-                    # Some providers return a schema-external wrapper on stdout
-                    # even after writing a valid canonical stage artifact. The
-                    # artifact is the durable Agent contract, so prefer it over
-                    # spending another model attempt solely to repair stdout.
-                    canonical_output = self._read_canonical_output_artifact(
-                        agent_type, worktree, output_schema
-                    )
-                    if canonical_output is not None and canonical_output != output_json:
-                        logger.info(
-                            "using canonical agent artifact after schema-invalid stdout; "
-                            "task_id=%s agent_type=%s stdout_error=%s",
-                            task_id,
-                            agent_type,
-                            contract_error,
-                        )
-                        output_json = canonical_output
-                        contract_error = None
                 if contract_error:
                     try:
                         preview = json.dumps(output_json, ensure_ascii=False)[:800]
@@ -979,36 +957,6 @@ class ClaudeCodeRuntime(AgentRuntime):
             except ProcessLookupError:
                 pass
         return [task_id for task_id, _ in active]
-
-    @staticmethod
-    def _read_canonical_output_artifact(
-        agent_type: str, worktree: Path, output_schema: Path
-    ) -> dict[str, Any] | None:
-        """Read a canonical stage artifact when stdout is only prose.
-
-        Planner artifacts intentionally have a different schema from their
-        turn output, so only agents whose artifact and stdout share one schema
-        are eligible for this fallback.
-        """
-        filenames = {
-            "coder": "CODER_OUTPUT.json",
-            "tester": "TESTER_OUTPUT.json",
-            "reviewer": "REVIEWER_OUTPUT.json",
-        }
-        filename = filenames.get(agent_type)
-        if filename is None:
-            return None
-        path = worktree / ".mac" / filename
-        try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        parsed = normalize_optional_nulls(redact_secrets(parsed), output_schema)
-        if validate_agent_output(parsed, output_schema) is not None:
-            return None
-        return parsed
 
     @staticmethod
     def active_task_ids() -> list[str]:
@@ -1159,7 +1107,7 @@ class ClaudeCodeRuntime(AgentRuntime):
             "domain": "upstream_api",
             "status_code": status,
             "retryable": retryable,
-            "suggested_resolver": "agent" if retryable else "coordinator",
+            "suggested_resolver": "root_agent",
         }
 
     def _extract_cost_info(self, data: dict[str, Any] | str | None) -> dict[str, Any] | None:
@@ -1257,7 +1205,7 @@ class _JsonLineCliRuntime(AgentRuntime):
         workspace: Path,
         worktree: Path,
         context_files: list[Path],
-        output_schema: Path,
+        output_schema: Path | None,
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
@@ -1267,15 +1215,20 @@ class _JsonLineCliRuntime(AgentRuntime):
         max_tool_calls: int | None = None,
         preferred_provider: str | None = None,
     ) -> AgentRuntimeResult:
-        prompt = (
-            "<system_contract>\n"
-            + system_prompt
-            + "\n</system_contract>\n\n<task>\n"
-            + task_prompt
-            + "\n</task>\n\n"
-            "Follow the system contract above. Return exactly one JSON object; "
-            "do not wrap it in Markdown."
-        )
+        prompt = task_prompt
+        if system_prompt:
+            prompt = (
+                "<system_contract>\n"
+                + system_prompt
+                + "\n</system_contract>\n\n<task>\n"
+                + task_prompt
+                + "\n</task>"
+            )
+        if output_schema is not None:
+            prompt += (
+                "\n\nFollow the system contract above. Return exactly one JSON "
+                "object; do not wrap it in Markdown."
+            )
         cmd = self.build_command(prompt, worktree, allowed_tools)
 
         def _result_output_files() -> list[Path]:
@@ -1413,11 +1366,17 @@ class _JsonLineCliRuntime(AgentRuntime):
                     cost_info,
                     tool_calls,
                 )
-            output_json = self._parse_json_output(final_text or "")
-            if output_json is None:
-                output_json = ClaudeCodeRuntime._read_canonical_output_artifact(
-                    agent_type, worktree, output_schema
+            if output_schema is None:
+                return AgentRuntimeResult(
+                    True,
+                    None,
+                    _result_output_files(),
+                    logs,
+                    cost_info,
+                    tool_calls,
+                    raw_result=(final_text or "").strip() or None,
                 )
+            output_json = self._parse_json_output(final_text or "")
             if output_json is None:
                 return AgentRuntimeResult(
                     False,
@@ -1432,13 +1391,6 @@ class _JsonLineCliRuntime(AgentRuntime):
                 redact_secrets(output_json), output_schema
             )
             contract_error = validate_agent_output(output_json, output_schema)
-            if contract_error:
-                canonical = ClaudeCodeRuntime._read_canonical_output_artifact(
-                    agent_type, worktree, output_schema
-                )
-                if canonical is not None:
-                    output_json = canonical
-                    contract_error = None
             if contract_error:
                 return AgentRuntimeResult(
                     False,
@@ -1804,7 +1756,12 @@ class PiRuntime(_JsonLineCliRuntime):
 
 
 class RuntimeRouter(AgentRuntime):
-    """Route each Agent to an explicitly configured coding CLI provider."""
+    """Route a request to exactly the provider selected by the caller.
+
+    This transport does not invent retry or fallback policy. A failed external
+    tool call is returned to the Codex root Agent, whose native turn loop owns
+    the next decision.
+    """
 
     _USAGE_FIELDS = (
         "input_tokens",
@@ -1908,69 +1865,25 @@ class RuntimeRouter(AgentRuntime):
             self._cancelled_task_ids.discard(task_id)
             with _ACTIVE_PROCESS_LOCK:
                 _CANCELLED_TASK_IDS.discard(task_id)
-        provider = (
-            preferred_provider
-            if preferred_provider in self.providers
-            else self.provider_for(agent_type)
-        )
+        if preferred_provider is not None and preferred_provider not in self.providers:
+            return AgentRuntimeResult(
+                success=False,
+                output_json=None,
+                output_files=[],
+                logs=f"runtime provider is unavailable: {preferred_provider}",
+                cost_info=None,
+                failure={
+                    "domain": "provider_unavailable",
+                    "provider": preferred_provider,
+                },
+            )
+        provider = preferred_provider or self.provider_for(agent_type)
         logger.info("runtime route agent_type=%s provider=%s", agent_type, provider)
         try:
             result = await self.providers[provider].execute(agent_type, *args, **kwargs)
-            runtime_blocked = bool(
-                result.output_json
-                and any(
-                    isinstance(blocker, dict)
-                    and blocker.get("blocking") is True
-                    and blocker.get("preferred_resolver") == "runtime"
-                    for blocker in result.output_json.get("blockers", [])
-                )
-            )
-            globally_cancelled = False
-            if task_id:
-                with _ACTIVE_PROCESS_LOCK:
-                    globally_cancelled = task_id in _CANCELLED_TASK_IDS
-            if task_id and (
-                task_id in self._cancelled_task_ids or globally_cancelled
-            ):
-                self._attach_runtime_attempts(
-                    result,
-                    [self._runtime_attempt(provider, result)],
-                )
-                result.logs = f"runtime_provider={provider} cancelled_before_fallback\n" + result.logs
-                return result
-            if provider != self.default_provider and (not result.success or runtime_blocked):
-                primary_attempt = self._runtime_attempt(
-                    provider,
-                    result,
-                    runtime_blocked=runtime_blocked,
-                )
-                logger.warning(
-                    "runtime provider %s could not complete %s reason=%s; retrying with %s",
-                    provider,
-                    agent_type,
-                    primary_attempt.get("failure_reason"),
-                    self.default_provider,
-                )
-                primary_logs = result.logs
-                result = await self.providers[self.default_provider].execute(
-                    agent_type, *args, **kwargs
-                )
-                self._attach_runtime_attempts(
-                    result,
-                    [
-                        primary_attempt,
-                        self._runtime_attempt(self.default_provider, result),
-                    ],
-                )
-                result.logs = (
-                    f"runtime_provider={provider} fallback={self.default_provider}\n"
-                    f"--- primary provider logs ---\n{primary_logs}\n"
-                    f"--- fallback provider logs ---\n{result.logs}"
-                )
-                return result
             self._attach_runtime_attempts(
                 result,
-                [self._runtime_attempt(provider, result, runtime_blocked=runtime_blocked)],
+                [self._runtime_attempt(provider, result)],
             )
             result.logs = f"runtime_provider={provider}\n" + result.logs
             return result
@@ -2061,7 +1974,7 @@ class FakeRuntime(AgentRuntime):
         workspace: Path,
         worktree: Path,
         context_files: list[Path],
-        output_schema: Path,
+        output_schema: Path | None,
         allowed_tools: list[str],
         readonly_dirs: list[Path],
         timeout_seconds: int,
@@ -2071,35 +1984,16 @@ class FakeRuntime(AgentRuntime):
         max_tool_calls: int | None = None,
         preferred_provider: str | None = None,
     ) -> AgentRuntimeResult:
-        planning_aliases = {
-            "requirements_analyst": "planner",
-            "architect": "planner",
-            "spec_writer": "planner",
-            "bug_analyst": "planner",
-            "documentation_planner": "planner",
-        }
         output = self.outputs.get(agent_type)
-        if output is None and agent_type in planning_aliases:
-            output = self.outputs.get(planning_aliases[agent_type])
         if output is None:
-            output = {"success": True, "next_state_event": "complete"}
-        default_tool_calls = {
-            "coder": [{"name": "Write", "input": {"file_path": "fake"}}],
-            "tester": [{"name": "Bash", "input": {"command": "fake-test"}}],
-            "reviewer": [{"name": "Read", "input": {"file_path": "fake"}}],
-        }
+            output = {"success": True}
         return AgentRuntimeResult(
             success=output.get("success", True),
             output_json=output,
             output_files=[],
             logs=str(output.get("_runtime_logs", "fake runtime")),
             cost_info=None,
-            tool_calls=list(
-                output.get(
-                    "_runtime_tool_calls",
-                    default_tool_calls.get(agent_type, []),
-                )
-            ),
+            tool_calls=list(output.get("_runtime_tool_calls", [])),
             failure=(
                 dict(output["_runtime_failure"])
                 if isinstance(output.get("_runtime_failure"), dict)

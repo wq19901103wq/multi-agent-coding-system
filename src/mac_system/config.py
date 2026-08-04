@@ -20,8 +20,6 @@ class Settings(BaseSettings):
     mcs_port: int = Field(default=18080, alias="MCS_PORT")
     database_url: str = Field(default="sqlite:///./mac_system.db", alias="DATABASE_URL")
     projects_dir: Path = Field(default=Path("./projects"), alias="PROJECTS_DIR")
-    state_machines_dir: Path = Field(default=Path("./state_machines"), alias="STATE_MACHINES_DIR")
-    workflow_profiles_dir: Path = Field(default=Path("./workflow_profiles"), alias="WORKFLOW_PROFILES_DIR")
     agent_config_path: Path = Field(default=Path("./agent_config.json"), alias="AGENT_CONFIG_PATH")
     secret_store_path: Path = Field(
         default=Path("./.mac-secrets.json"), alias="MAC_SECRET_STORE_PATH"
@@ -43,14 +41,6 @@ class Settings(BaseSettings):
     # Agent in agent_config.json; these paths only describe local executables.
     kimi_bin: Path = Field(default=Path("kimi"), alias="KIMI_BIN")
     codex_bin: Path = Field(default=Path("codex"), alias="CODEX_BIN")
-    coordinator_codex_home: Path = Field(
-        default=Path("~/.mac-system/codex-coordinator"),
-        alias="MAC_COORDINATOR_CODEX_HOME",
-    )
-    agent_codex_home: Path = Field(
-        default=Path("~/.mac-system/codex-agents"),
-        alias="MAC_AGENT_CODEX_HOME",
-    )
     pi_bin: Path = Field(default=Path("pi"), alias="PI_BIN")
     zcode_bin: Path = Field(
         default=Path("/Applications/ZCode.app/Contents/MacOS/ZCode"),
@@ -72,17 +62,7 @@ class Settings(BaseSettings):
     git_user_email: str = Field(default="mac@example.com", alias="GIT_USER_EMAIL")
 
     # Runtime
-    max_agent_retries: int = Field(default=3, alias="MAX_AGENT_RETRIES")
-    max_test_retries: int = Field(default=2, alias="MAX_TEST_RETRIES")
-    max_review_retries: int = Field(default=2, alias="MAX_REVIEW_RETRIES")
     agent_timeout_seconds: int = Field(default=600, alias="AGENT_TIMEOUT_SECONDS")
-
-    # Intent router
-    intent_high_threshold: float = Field(default=0.85, alias="INTENT_HIGH_THRESHOLD")
-    intent_low_threshold: float = Field(default=0.5, alias="INTENT_LOW_THRESHOLD")
-
-    # Agent progress
-    debug_agent_progress: bool = Field(default=False, alias="DEBUG_AGENT_PROGRESS")
 
     # Admin panel
     admin_token: str | None = Field(default=None, alias="ADMIN_TOKEN")
@@ -107,25 +87,6 @@ def get_agent_config() -> dict[str, Any]:
         return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def _load_json(path: Path, *, label: str) -> dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"{label} not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_state_machine() -> dict[str, Any]:
-    """Load the single delivery state-machine template."""
-    path = get_settings().state_machines_dir / "delivery.json"
-    return _load_json(path, label="Delivery state machine")
-
-
-def load_workflow_profile(task_type: str) -> dict[str, Any]:
-    """Load task-specific stages without duplicating lifecycle transitions."""
-    path = get_settings().workflow_profiles_dir / f"{task_type}.json"
-    return _load_json(path, label=f"Workflow profile for task_type={task_type}")
 
 
 def get_allowed_bind_roots() -> list[Path]:

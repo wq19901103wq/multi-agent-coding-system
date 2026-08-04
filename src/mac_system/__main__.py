@@ -1,193 +1,99 @@
-"""MAC System CLI entry point."""
+"""MAC command-line entry point."""
+
+from __future__ import annotations
 
 import asyncio
-import os
 import sys
 
 import click
 import uvicorn
 
 from mac_system.agents.orchestrator import AgentOrchestrator
-from mac_system.agents.prompts import PromptRenderer
 from mac_system.agents.runtime import build_agent_runtime
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
-from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.database import init_db, session_scope
-from mac_system.state_machine import StateMachine
 
 
 @click.group()
-@click.option("--debug", is_flag=True, help="Enable debug logging.")
-def cli(debug: bool) -> None:
-    """Multi-Agent Coding System CLI."""
-    if debug:
-        # Re-create settings with debug enabled is not trivial due to lru_cache;
-        # just set the env var for subprocesses.
-        os.environ["DEBUG"] = "true"
+def cli() -> None:
+    """MAC: Codex on a mobile-friendly Feishu surface."""
+
     init_db()
 
 
 @cli.command("server")
-@click.option("--host", default="127.0.0.1", help="Bind host.")
-@click.option("--port", default=get_settings().mcs_port, help="Bind port.")
-@click.option("--reload", is_flag=True, help="Enable auto-reload.")
-def server(host: str, port: int, reload: bool) -> None:
-    """Start the FastAPI server."""
-    uvicorn.run(
-        "mac_system.api.main:app",
-        host=host,
-        port=port,
-        reload=reload,
-    )
+@click.option("--host", default="127.0.0.1")
+@click.option("--port", default=get_settings().mcs_port, type=int)
+def server(host: str, port: int) -> None:
+    """Start the API and Feishu WebSocket service without hot reload."""
+
+    uvicorn.run("mac_system.api.main:app", host=host, port=port, reload=False)
 
 
 @cli.command("create-project")
-@click.option("--name", required=True, help="Project name.")
-@click.option(
-    "--task-type",
-    default="feature",
-    help="Task type (feature, iteration, bug_fix, documentation).",
-)
-@click.option("--description", required=True, help="Task description.")
-@click.option("--approval-mode", default="auto", help="Approval mode (strict, normal, night, auto).")
-@click.option("--creator-open-id", default=None, help="Creator Feishu open_id.")
-def create_project(
-    name: str,
-    task_type: str,
-    description: str,
-    approval_mode: str,
-    creator_open_id: str | None,
-) -> None:
-    """Create a new project and advance it from INIT."""
-    with session_scope() as session:
-        service = ProjectService(session)
-        project = asyncio.run(
-            service.create_project(
+@click.option("--name", required=True)
+@click.option("--description", required=True)
+@click.option("--directory", default=None)
+def create_project(name: str, description: str, directory: str | None) -> None:
+    """Create one persistent native Codex project thread."""
+
+    async def create() -> None:
+        with session_scope() as session:
+            project = await ProjectService(session).create_project(
                 name=name,
-                task_type=task_type,
+                task_type="feature",
                 description=description,
-                approval_mode=approval_mode,
-                creator_open_id=creator_open_id,
+                bound_directory=directory,
+                initial_context={"orchestration_mode": "root_agent"},
             )
-        )
-        click.echo(f"Created project {project.id}")
-        click.echo(f"Workspace: {project.workspace_path}")
-        click.echo(f"Current state: {project.current_state}")
+            click.echo(project.id)
+            click.echo(project.workspace_path)
+
+    asyncio.run(create())
 
 
 @cli.command("status")
 @click.argument("project_id")
 def status(project_id: str) -> None:
-    """Show project status."""
     with session_scope() as session:
-        service = ProjectService(session)
-        project = service.get_project(project_id)
+        project = ProjectService(session).get_project(project_id)
         if project is None:
-            click.echo(f"Project {project_id} not found", err=True)
-            sys.exit(1)
-        click.echo(f"Project: {project.id}")
-        click.echo(f"Name: {project.name}")
-        click.echo(f"Status: {project.status}")
-        click.echo(f"Current state: {project.current_state}")
-        click.echo(f"Previous state: {project.previous_state}")
-        click.echo(f"Workspace: {project.workspace_path}")
-
-
-@cli.command("tick")
-@click.argument("project_id")
-def tick(project_id: str) -> None:
-    """Execute a single orchestrator tick for a project."""
-    settings = get_settings()
-
-    async def _tick() -> None:
-        with session_scope() as session:
-            service = ProjectService(session)
-            wm = WorktreeManager(settings.projects_dir)
-            renderer = PromptRenderer(get_agent_config())
-            runtime = build_agent_runtime(settings, get_agent_config())
-            orchestrator = AgentOrchestrator(service, wm, runtime, renderer)
-            await orchestrator.tick(project_id)
-            project = service.get_project(project_id)
-            click.echo(f"Tick complete. Current state: {project.current_state}")
-
-    asyncio.run(_tick())
+            click.echo("PROJECT_NOT_FOUND", err=True)
+            raise SystemExit(1)
+        click.echo(f"{project.id} {project.status} {project.execution_status}")
+        click.echo(project.workspace_path)
 
 
 @cli.command("run")
-@click.option("--name", required=True, help="Project name.")
-@click.option("--task-type", default="feature", help="Task type.")
-@click.option("--description", required=True, help="Task description.")
-@click.option("--approval-mode", default="auto", help="Approval mode.")
-@click.option("--max-ticks", default=50, help="Maximum ticks before aborting.")
-@click.option("--auto-accept", is_flag=True, help="Auto-confirm ACCEPTANCE_PENDING (use with care).")
-@click.option("--agent-timeout", default=None, type=int, help="Per-agent timeout in seconds (overrides AGENT_TIMEOUT_SECONDS).")
-def run(
-    name: str,
-    task_type: str,
-    description: str,
-    approval_mode: str,
-    max_ticks: int,
-    auto_accept: bool,
-    agent_timeout: int | None,
-) -> None:
-    """Create a project and run orchestrator ticks until terminal or human pending."""
-    async def _run() -> None:
-        if agent_timeout is not None:
-            os.environ["AGENT_TIMEOUT_SECONDS"] = str(agent_timeout)
-            get_settings.cache_clear()
-        run_settings = get_settings()
+@click.option("--name", required=True)
+@click.option("--description", required=True)
+@click.option("--directory", default=None)
+def run(name: str, description: str, directory: str | None) -> None:
+    """Create a project and run exactly one Codex turn."""
 
+    async def execute() -> None:
+        settings = get_settings()
         with session_scope() as session:
             service = ProjectService(session)
             project = await service.create_project(
                 name=name,
-                task_type=task_type,
+                task_type="feature",
                 description=description,
-                approval_mode=approval_mode,
+                bound_directory=directory,
+                initial_context={"orchestration_mode": "root_agent"},
             )
-            project_id = project.id
-            click.echo(f"Created project {project_id} at state {project.current_state}")
-
-        wm = WorktreeManager(run_settings.projects_dir)
-        renderer = PromptRenderer(get_agent_config())
-        runtime = build_agent_runtime(run_settings, get_agent_config())
-
-        for i in range(max_ticks):
-            with session_scope() as session:
-                service = ProjectService(session)
-                project = service.get_project(project_id)
-                state_machine = StateMachine(project.task_type)
-                if project.status in ("paused", "cancelled"):
-                    click.echo(f"Project {project_id} is {project.status}. Stopping.")
-                    break
-                if state_machine.is_terminal(project.current_state):
-                    click.echo(f"Reached terminal state {project.current_state}")
-                    break
-
-                if project.current_state == "ACCEPTANCE_PENDING" and not auto_accept:
-                    click.echo(
-                        f"Project {project_id} reached ACCEPTANCE_PENDING. "
-                        "Run with --auto-accept to continue, or use the API to submit a decision."
-                    )
-                    break
-
-                orchestrator = AgentOrchestrator(service, wm, runtime, renderer)
-                await orchestrator.tick(project_id)
-                project = service.get_project(project_id)
-                click.echo(f"Tick {i + 1}: {project.current_state}")
-
-                if project.current_state == "ACCEPTANCE_PENDING" and auto_accept:
-                    await service.transition_state(
-                        project_id, "confirm", triggered_by="cli_auto_accept"
-                    )
-                    project = service.get_project(project_id)
-                    click.echo(f"Auto-accepted, state: {project.current_state}")
+            orchestrator = AgentOrchestrator(
+                service,
+                build_agent_runtime(settings, get_agent_config()),
+            )
+            result = await orchestrator.run_root_agent(project.id, description)
+            click.echo(result.final_message or result.status)
 
     try:
-        asyncio.run(_run())
-    except Exception as e:
-        click.echo(f"Run failed: {e}", err=True)
+        asyncio.run(execute())
+    except Exception as exc:
+        click.echo(str(exc), err=True)
         sys.exit(1)
 
 

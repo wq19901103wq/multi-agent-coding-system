@@ -8,11 +8,9 @@ from fastapi import Depends, Header, HTTPException
 from sqlmodel import Session
 
 from mac_system.agents.orchestrator import AgentOrchestrator
-from mac_system.agents.prompts import PromptRenderer
 from mac_system.agents.runtime import build_agent_runtime
 from mac_system.config import get_agent_config, get_settings
 from mac_system.core.project_service import ProjectService
-from mac_system.core.worktree_manager import WorktreeManager
 from mac_system.database import get_session
 from mac_system.feishu import FeishuBridge
 
@@ -41,10 +39,8 @@ def _build_orchestrator(session: Session) -> AgentOrchestrator:
     """Build a fresh AgentOrchestrator for the given DB session."""
     settings = get_settings()
     service = ProjectService(session)
-    worktree_manager = WorktreeManager(settings.projects_dir)
     agent_config = get_agent_config()
     runtime = build_agent_runtime(settings, agent_config)
-    renderer = PromptRenderer(agent_config)
     bridge = None
     if settings.feishu_app_id and settings.feishu_app_secret:
         bridge = FeishuBridge(
@@ -53,7 +49,7 @@ def _build_orchestrator(session: Session) -> AgentOrchestrator:
             encrypt_key=settings.feishu_encrypt_key,
             verification_token=settings.feishu_verification_token,
         )
-    return AgentOrchestrator(service, worktree_manager, runtime, renderer, feishu_bridge=bridge)
+    return AgentOrchestrator(service, runtime, feishu_bridge=bridge)
 
 
 def get_orchestrator(session: Session = Depends(get_session)) -> AgentOrchestrator:

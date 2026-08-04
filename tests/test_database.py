@@ -56,18 +56,13 @@ def test_migrations_add_missing_columns_and_tables(tmp_path: Path):
     assert "pending_intents" in tables
     assert "processed_events" in tables
     assert "project_users" in tables
-    assert "project_context_records" in tables
     assert "notification_outbox" in tables
+    assert "root_agent_sessions" in tables
+    assert "dynamic_tool_calls" in tables
 
     task_columns = {c["name"] for c in inspect(engine).get_columns("tasks")}
-    assert "context_version" in task_columns
-    assert "attempt_id" in task_columns
-    assert "attempt_number" in task_columns
-    assert "superseded_by_task_id" in task_columns
-    assert "cancellation_reason" in task_columns
-
-    assert "task_failure_reports" in tables
-    assert "acceptance_evidence" in tables
+    assert "input_data" in task_columns
+    assert "output_data" in task_columns
     assert "execution_status" in columns
     assert "waiting_reason" in columns
     assert "waiting_since" in columns
