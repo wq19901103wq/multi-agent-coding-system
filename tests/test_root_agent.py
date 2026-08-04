@@ -10,8 +10,10 @@ from mac_system.config import Settings
 from mac_system.core.project_service import ProjectService
 from mac_system.core.root_agent import (
     RootAgentEngine,
+    _external_progress_label,
     _native_activity_card,
     _native_status_card,
+    _provider_selection_guidance,
     _turn_completion_card,
     resolve_root_user_input,
 )
@@ -237,6 +239,11 @@ def test_native_activity_cards_cover_official_item_lifecycle_without_fake_comple
 
 
 def test_native_retry_error_updates_progress_without_ending_turn():
+    assert _native_status_card("turn/started", {}) == (
+        "Codex 已开始处理本轮消息。",
+        "purple",
+        "running",
+    )
     assert _native_status_card(
         "error",
         {
@@ -516,6 +523,48 @@ def test_extension_tool_list_does_not_reimplement_codex_multi_agent(root_context
     assert not ({"spawn_agent", "send_message", "wait", "reviewer"} & set(names))
 
 
+def test_external_tool_exposes_provider_evidence_without_routing_rules(root_context):
+    _, engine = root_context
+    project = engine.service.require_project("proj-root")
+    tool = engine._extension_tools(project)[0]
+
+    assert "Select a provider deliberately" in tool.description
+    assert "FakeRuntime" in tool.description
+    assert "no recent execution samples" in tool.description
+    assert "selection_reason" in tool.input_schema["required"]
+
+
+def test_provider_guidance_reports_only_aggregate_process_metrics():
+    guidance = _provider_selection_guidance(
+        {
+            "codex": {
+                "description": "Independent execution.",
+                "mode": "headless_cli",
+            }
+        },
+        {
+            "codex": {
+                "sample_count": 4,
+                "completed_count": 3,
+                "average_duration_seconds": 12.5,
+                "average_cost_usd": 0.08,
+            }
+        },
+    )
+
+    assert "recent CLI completion 3/4" in guidance
+    assert "average duration 12.5s" in guidance
+    assert "average reported cost $0.08" in guidance
+    assert "headless_cli" in guidance
+
+
+def test_external_progress_is_user_facing_and_does_not_expose_tool_input():
+    detail = '{"name":"Read","input":{"file_path":"/secret/path"}}'
+    label = _external_progress_label("codex", "tool", detail)
+    assert label == "Codex 正在查看项目资料"
+    assert "/secret/path" not in label
+
+
 @pytest.mark.asyncio
 async def test_external_provider_is_one_explicit_tool_call(root_context):
     session, engine = root_context
@@ -524,6 +573,7 @@ async def test_external_provider_is_one_explicit_tool_call(root_context):
     result = await tool.handler(
         {
             "provider": "FakeRuntime",
+            "selection_reason": "用于独立检查界面",
             "task_name": "ui-check",
             "message": "检查界面",
             "access": "read_only",
@@ -536,3 +586,6 @@ async def test_external_provider_is_one_explicit_tool_call(root_context):
     agent = session.exec(select(AgentSession)).one()
     assert agent.status == "completed"
     assert agent.objective == "检查界面"
+    assert agent.result["selection_reason"] == "用于独立检查界面"
+    updated_tool = engine._extension_tools(project)[0]
+    assert "recent CLI completion 1/1" in updated_tool.description

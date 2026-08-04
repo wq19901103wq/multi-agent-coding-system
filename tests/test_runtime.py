@@ -194,6 +194,26 @@ async def test_runtime_router_honors_explicit_provider(tmp_path):
     assert claude.calls == 0
 
 
+def test_runtime_router_exposes_only_available_provider_profiles():
+    router = RuntimeRouter(
+        {
+            "claude_code": FakeRuntime({}),
+            "codex": FakeRuntime({}),
+        },
+        {},
+        provider_profiles={
+            "claude_code": {"description": "Claude"},
+            "codex": {"description": "Codex", "model": "configured-model"},
+            "unavailable": {"description": "Must not be exposed"},
+        },
+    )
+
+    assert router.provider_profiles() == {
+        "claude_code": {"description": "Claude"},
+        "codex": {"description": "Codex", "model": "configured-model"},
+    }
+
+
 @pytest.mark.asyncio
 async def test_fake_runtime_is_deterministic(tmp_path):
     runtime = FakeRuntime({"external": {"success": True, "reply": "done"}})

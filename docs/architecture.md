@@ -14,7 +14,7 @@ Codex 原生规则调用 `spawn_agent`、`send_message`、`followup_task`、`int
 flowchart LR
     U["用户 / 飞书"] <--> R["Codex Root Agent Thread\n持续对话、直接编码、动态委派"]
     R <--> C["Codex 原生 Child Agent Threads"]
-    R <--> X["MAC 外部 coding-agent 适配器\nClaude Code / Kimi / Pi"]
+    R <--> X["MAC 外部 coding-agent 适配器\nClaude Code / Codex / Kimi / Pi"]
     R <--> Q["Codex request_user_input"]
     Q <--> U
     E["Codex app-server 事件"] --> P["MAC 持久化与飞书卡片投影"]
@@ -46,7 +46,7 @@ MAC 不重新实现以上控制语义。升级 Codex 版本时先更新源码映
 | Codex app-server client | 透明传输 thread/turn/event/server-request，不解释业务阶段 |
 | ProjectService | 保存项目、Root thread identity、问题、通知、成本和展示投影 |
 | Feishu adapter | 把用户消息 steer 到活跃 turn，或启动新 turn；把原生问题和事件渲染为卡片 |
-| External agent adapter | 把 Claude Code、Kimi、Pi 等后端包装成 Root Agent 可调用的额外执行工具 |
+| External agent adapter | 把 Claude Code、Codex、Kimi、Pi 等后端包装成 Root Agent 可调用的额外执行工具 |
 | Runtime/hosting | 进程、服务地址、日志、计费与恢复 |
 
 不存在以下组件：
@@ -87,8 +87,23 @@ Project 只表达长期项目关系：`active / paused / cancelled`。一次 Roo
 - 只有偏好、授权或系统无法取得的外部事实才询问用户。
 - `request_user_input` 在原 turn 中等待飞书答案；回答后继续同一个 turn，不创建“恢复阶段”。
 - 用户在运行中发送新消息时使用 `turn/steer`；Root idle 时开始下一 turn。
+- 飞书收到消息后在用户原消息上添加回应；只有原生 turn 真正开始后才创建本轮进度卡。
 - 面向用户的输出全部使用卡片。进度可以充分，但不得展示内部 task path、thread id、
   协议字段和原始工具日志。
+
+## 外部 provider 选择
+
+- `run_external_agent` 的 `provider` 由 Root Agent 在调用时显式选择，runtime 严格执行该
+  provider，不静默 fallback。
+- 工具向 Root 提供启用状态、非敏感配置说明，以及最近执行的完成率、平均耗时和已报告
+  成本；只提供聚合指标，不暴露其他项目的任务内容。
+- 用户显式指定 provider 时优先遵从；否则 Root 根据任务和上述证据动态决定，不使用关键词
+  路由，也不按固定角色绑定 provider。
+- 每次调用必须提供简短的用户可见选择理由。飞书进度卡显示 provider、选择理由和外部 CLI
+  的真实活动状态。
+- Codex 原生 Child Agent 角色与外部 provider 是两个维度：角色描述任务责任，provider 描述
+  外部执行后端。普通委派优先使用 Codex 原生 Child Agent，只有独立 CLI 执行确有价值时才
+  使用外部 provider。
 
 ## MAC 扩展边界
 

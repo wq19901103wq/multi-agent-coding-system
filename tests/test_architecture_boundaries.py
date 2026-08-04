@@ -35,6 +35,8 @@ def test_root_has_no_mac_defined_workflow_prompt():
 def test_feishu_natural_language_is_delivered_unchanged():
     source = (SRC / "feishu" / "handlers.py").read_text(encoding="utf-8")
     assert "_deliver_to_root(ctx, project, text)" in source
+    assert "add_reaction(message_id, \"OnIt\")" in source
+    assert "消息已收到" not in source
     assert "route_demand" not in source
     assert "suggest_name" not in source
     assert "StateMachine" not in source

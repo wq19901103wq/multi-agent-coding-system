@@ -18,6 +18,7 @@ class RecordingBridge:
     def __init__(self):
         self.cards = []
         self.updates = []
+        self.reactions = []
 
     async def _send_interactive(self, recipient, card, receive_id_type="open_id"):
         self.cards.append((recipient, receive_id_type, card))
@@ -25,6 +26,10 @@ class RecordingBridge:
 
     async def update_card(self, message_id, card):
         self.updates.append((message_id, card))
+
+    async def add_reaction(self, message_id, emoji_type="OnIt"):
+        self.reactions.append((message_id, emoji_type))
+        return f"reaction-{len(self.reactions)}"
 
 
 class Orchestrator:
@@ -128,6 +133,7 @@ async def test_first_ordinary_message_creates_one_root_project(ctx):
     assert project.context["orchestration_mode"] == "root_agent"
     assert ctx.orchestrator.scheduled == [(project.id, "做一个个人网站")]
     assert len(ctx.bridge.cards) == 1
+    assert ctx.bridge.reactions == [("om-1", "OnIt")]
 
 
 @pytest.mark.asyncio
@@ -141,12 +147,12 @@ async def test_idle_project_receives_message_unchanged(ctx):
     )
     await handle_text_message(ctx, message("修复登录后白屏"))
     assert ctx.orchestrator.scheduled == [(project.id, "修复登录后白屏")]
-    assert len(ctx.bridge.cards) == 1
-    assert "消息已收到" in str(ctx.bridge.cards[0][2])
+    assert ctx.bridge.cards == []
+    assert ctx.bridge.reactions == [("om-1", "OnIt")]
 
 
 @pytest.mark.asyncio
-async def test_each_new_turn_creates_a_visible_progress_card(ctx):
+async def test_each_new_turn_acknowledges_original_message_without_receipt_card(ctx):
     await ctx.service.create_project(
         "site",
         "feature",
@@ -156,8 +162,9 @@ async def test_each_new_turn_creates_a_visible_progress_card(ctx):
     )
     await handle_text_message(ctx, message("第一轮只读问题"))
     await handle_text_message(ctx, message("第二轮只读问题"))
-    assert len(ctx.bridge.cards) == 2
+    assert ctx.bridge.cards == []
     assert ctx.bridge.updates == []
+    assert ctx.bridge.reactions == [("om-1", "OnIt"), ("om-1", "OnIt")]
 
 
 @pytest.mark.asyncio
@@ -173,12 +180,12 @@ async def test_running_project_uses_native_steer(ctx):
     await handle_text_message(ctx, message("补充：不要改数据库"))
     assert ctx.orchestrator.steered == [(project.id, "补充：不要改数据库")]
     assert ctx.orchestrator.scheduled == []
-    assert len(ctx.bridge.cards) == 1
-    assert "补充信息已交给" in str(ctx.bridge.cards[0][2])
+    assert ctx.bridge.cards == []
+    assert ctx.bridge.reactions == [("om-1", "OnIt")]
 
 
 @pytest.mark.asyncio
-async def test_same_turn_steer_updates_current_progress_card(ctx):
+async def test_same_turn_steer_uses_message_reaction_without_receipt_card(ctx):
     project = await ctx.service.create_project(
         "site",
         "feature",
@@ -189,8 +196,9 @@ async def test_same_turn_steer_updates_current_progress_card(ctx):
     await handle_text_message(ctx, message("先开始这一轮"))
     ctx.service.set_execution_status(project.id, "running")
     await handle_text_message(ctx, message("补充本轮信息"))
-    assert len(ctx.bridge.cards) == 1
-    assert ctx.bridge.updates and ctx.bridge.updates[0][0] == "message-1"
+    assert ctx.bridge.cards == []
+    assert ctx.bridge.updates == []
+    assert ctx.bridge.reactions == [("om-1", "OnIt"), ("om-1", "OnIt")]
 
 
 @pytest.mark.asyncio

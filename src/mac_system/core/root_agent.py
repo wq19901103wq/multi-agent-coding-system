@@ -34,7 +34,7 @@ from mac_system.core.notification_service import deliver_card
 from mac_system.core.project_service import ProjectService, generate_id
 from mac_system.core.root_sessions import RootSessionStore
 from mac_system.feishu.card import build_content_card, build_question_batch_card
-from mac_system.models import Approval, Project
+from mac_system.models import AgentSession, Approval, Project
 from mac_system.utils.formatting import split_markdown_sections
 from mac_system.utils.redaction import redact_text
 
@@ -157,6 +157,70 @@ def _compact_text(value: Any, *, limit: int = 4_000) -> str | None:
         return value
     half = (limit - 40) // 2
     return f"{value[:half]}\n... [output compacted] ...\n{value[-half:]}"
+
+
+def _provider_selection_guidance(
+    profiles: dict[str, dict[str, Any]],
+    metrics: dict[str, dict[str, float | int]],
+) -> str:
+    """Build compact evidence for Root's provider choice without routing it."""
+    lines = [
+        "Select a provider deliberately. Honor an explicit user choice. Otherwise "
+        "use the configured descriptions and recent process metrics below; do not "
+        "route by keywords or silently fall back.",
+    ]
+    for provider in sorted(profiles):
+        profile = profiles[provider]
+        description = str(profile.get("description") or "No configured description.")
+        configured = [
+            f"{key}={profile[key]}"
+            for key in ("mode", "provider", "model")
+            if profile.get(key)
+        ]
+        metric = metrics.get(provider, {})
+        sample_count = int(metric.get("sample_count") or 0)
+        if sample_count:
+            completed = int(metric.get("completed_count") or 0)
+            measured = (
+                f"recent CLI completion {completed}/{sample_count}, "
+                f"average duration {metric.get('average_duration_seconds')}s"
+            )
+            if "average_cost_usd" in metric:
+                measured += f", average reported cost ${metric['average_cost_usd']}"
+        else:
+            measured = "no recent execution samples"
+        suffix = f" ({', '.join(configured)})" if configured else ""
+        lines.append(f"- {provider}: {description}{suffix}; {measured}.")
+    return "\n".join(lines)
+
+
+def _external_progress_label(provider: str, kind: str, detail: str) -> str | None:
+    """Translate external CLI progress into concise user-facing activity."""
+    display = {
+        "claude_code": "Claude Code",
+        "kimi_code": "Kimi Code",
+        "codex": "Codex",
+        "pi": "Pi",
+    }.get(provider, provider)
+    if kind == "thinking":
+        return f"{display} 正在分析任务"
+    if kind != "tool":
+        return None
+    try:
+        tool = str((json.loads(detail) or {}).get("name") or "").lower()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        tool = ""
+    if tool in {"read", "grep", "find", "search", "ls", "glob"}:
+        action = "正在查看项目资料"
+    elif tool in {"edit", "write", "file_change"}:
+        action = "正在修改项目文件"
+    elif tool in {"bash", "command", "shell", "command_execution"}:
+        action = "正在执行检查或测试"
+    elif tool in {"browser", "host_automation"}:
+        action = "正在操作本机应用"
+    else:
+        action = "正在继续执行任务"
+    return f"{display} {action}"
 
 
 def _durable_native_event(event: AgentEvent) -> AgentEvent | None:
@@ -296,6 +360,8 @@ def _native_status_card(
 ) -> tuple[str, str, str] | None:
     """Translate official non-item turn status into the shared progress card."""
 
+    if event_kind == "turn/started":
+        return "Codex 已开始处理本轮消息。", "purple", "running"
     if event_kind != "error":
         return None
     if payload.get("willRetry") is True:
@@ -519,19 +585,43 @@ class RootAgentEngine:
         providers = sorted(self.runtime.available_providers())
         if not providers:
             return []
+        profiles = self.runtime.provider_profiles()
+        metrics = self.store.provider_metrics(providers)
+        provider_guidance = _provider_selection_guidance(profiles, metrics)
         return [
             DynamicTool(
                 name="run_external_agent",
                 description=(
                     "Run one task with an optional external coding-agent CLI. "
-                    "Codex native subagents remain available through Codex's own tools."
+                    "Codex native subagents remain available through Codex's own tools.\n"
+                    f"{provider_guidance}"
                 ),
                 input_schema={
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["provider", "task_name", "message", "access"],
+                    "required": [
+                        "provider",
+                        "selection_reason",
+                        "task_name",
+                        "message",
+                        "access",
+                    ],
                     "properties": {
-                        "provider": {"type": "string", "enum": providers},
+                        "provider": {
+                            "type": "string",
+                            "enum": providers,
+                            "description": (
+                                "Provider selected from the evidence in the tool description."
+                            ),
+                        },
+                        "selection_reason": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 300,
+                            "description": (
+                                "Short user-facing reason this provider adds value for this task."
+                            ),
+                        },
                         "task_name": {
                             "type": "string",
                             "minLength": 1,
@@ -568,6 +658,9 @@ class RootAgentEngine:
 
         async def execute(tool_call_id: str) -> dict[str, Any]:
             provider = str(arguments["provider"])
+            selection_reason = " ".join(
+                redact_text(str(arguments["selection_reason"])).split()
+            )[:300]
             task_name = str(arguments["task_name"])
             message = str(arguments["message"])
             access = str(arguments["access"])
@@ -589,8 +682,50 @@ class RootAgentEngine:
                 access=access,
                 objective=message,
                 tool_call_id=tool_call_id,
+                selection_reason=selection_reason,
             )
-            self.store.update_agent(agent, status="running")
+            display = {
+                "claude_code": "Claude Code",
+                "kimi_code": "Kimi Code",
+                "codex": "Codex",
+                "pi": "Pi",
+            }.get(provider, provider)
+            initial_activity = f"已选择 {display}，正在启动外部任务"
+            self.store.update_agent(
+                agent, status="running", latest_message=initial_activity
+            )
+            await self._project_external_agent_activity(
+                project.id,
+                agent.id,
+                provider,
+                selection_reason,
+                initial_activity,
+            )
+
+            last_activity = initial_activity
+
+            async def on_progress(kind: str, detail: str) -> None:
+                nonlocal last_activity
+                activity = _external_progress_label(provider, kind, detail)
+                if activity is None or activity == last_activity:
+                    return
+                last_activity = activity
+                with Session(self.bind) as progress_session:
+                    progress_agent = progress_session.get(AgentSession, agent.id)
+                    if progress_agent is not None:
+                        RootSessionStore(progress_session).update_agent(
+                            progress_agent,
+                            status="running",
+                            latest_message=activity,
+                        )
+                await self._project_external_agent_activity(
+                    project.id,
+                    agent.id,
+                    provider,
+                    selection_reason,
+                    activity,
+                )
+
             result = await self.runtime.execute(
                 agent_type="external",
                 preferred_provider=provider,
@@ -604,6 +739,7 @@ class RootAgentEngine:
                 readonly_dirs=[],
                 timeout_seconds=self.settings.agent_timeout_seconds,
                 task_id=agent.id,
+                progress_callback=on_progress,
             )
             answer = result.raw_result
             if answer is None and result.output_json is not None:
@@ -612,6 +748,7 @@ class RootAgentEngine:
             payload = {
                 "success": result.success,
                 "provider": provider,
+                "selection_reason": selection_reason,
                 "task_name": task_name,
                 "message": answer,
                 "cost": result.cost_info,
@@ -636,6 +773,61 @@ class RootAgentEngine:
         return await self.store.execute_tool_once(
             project.id, context, arguments, execute
         )
+
+    async def _project_external_agent_activity(
+        self,
+        project_id: str,
+        agent_id: str,
+        provider: str,
+        selection_reason: str,
+        activity: str,
+    ) -> None:
+        """Update the shared progress card from actual external CLI events."""
+        if self.feishu_bridge is None:
+            return
+        try:
+            with Session(self.bind) as projection_session:
+                service = ProjectService(projection_session)
+                project = service.require_project(project_id)
+                if not project.feishu_chat_id:
+                    return
+                card = build_content_card(
+                    f"[{self._project_display_name(project)}] 项目进展",
+                    (
+                        f"**当前进展**：{activity}\n\n"
+                        f"**选择原因**：{selection_reason}"
+                    ),
+                    color="purple",
+                )
+                projection_key = f"root-agent:{project.id}:activity"
+                projection = service.get_card_projection(projection_key)
+                await deliver_card(
+                    service,
+                    self.feishu_bridge,
+                    dedupe_key=(
+                        f"{projection_key}:external:{agent_id}:{activity}"
+                    ),
+                    recipient_id=project.feishu_chat_id,
+                    recipient_type="chat_id",
+                    intent_type="progress",
+                    card=card,
+                    project_id=project.id,
+                    update_message_id=(
+                        projection.provider_message_id
+                        if projection is not None
+                        and projection.lifecycle_status == "running"
+                        else None
+                    ),
+                    projection_key=projection_key,
+                    subject_type="root_agent",
+                    subject_id=project.id,
+                    lifecycle_status="running",
+                    resulting_state=project.execution_status,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to project external Agent activity", exc_info=True
+            )
 
     async def _on_event(self, project_id: str, event: AgentEvent) -> None:
         # Codex owns token streaming. Persist stable event boundaries only;
@@ -711,6 +903,7 @@ class RootAgentEngine:
                     update_message_id=(
                         projection.provider_message_id
                         if projection is not None
+                        and projection.lifecycle_status == "running"
                         else None
                     ),
                     projection_key=projection_key,

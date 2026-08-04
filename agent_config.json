@@ -3,22 +3,26 @@
   "runtimes": {
     "claude_code": {
       "enabled": true,
-      "mode": "headless_cli"
+      "mode": "headless_cli",
+      "description": "External Claude Code CLI for an independent implementation or review when using a separate provider adds value."
     },
     "kimi_code": {
       "enabled": true,
-      "mode": "headless_cli"
+      "mode": "headless_cli",
+      "description": "External Kimi Code CLI. Choose it from configured capability and recent measured execution results, not from task keywords."
     },
     "codex": {
       "enabled": true,
-      "mode": "app_server"
+      "mode": "headless_cli",
+      "description": "External ephemeral Codex CLI. Prefer native Codex subagents for ordinary delegation; use this only when isolated CLI execution adds value."
     },
     "pi": {
       "enabled": true,
       "mode": "headless_cli",
       "provider": "deepseek",
       "model": "deepseek-v4-flash",
-      "thinking": "high"
+      "thinking": "high",
+      "description": "External Pi CLI using its configured model. Treat it as an independent execution option and use recent measured results when choosing."
     },
     "zcode": {
       "enabled": false,

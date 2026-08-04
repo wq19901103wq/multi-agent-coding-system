@@ -166,6 +166,50 @@ class RootSessionStore:
             ).all()
         )
 
+    def provider_metrics(
+        self, providers: list[str], *, sample_limit: int = 20
+    ) -> dict[str, dict[str, float | int]]:
+        """Aggregate recent process outcomes without exposing task content."""
+        wanted = set(providers)
+        samples: dict[str, list[AgentSession]] = {provider: [] for provider in providers}
+        rows = self.session.exec(
+            select(AgentSession)
+            .where(AgentSession.status.in_(("completed", "failed")))
+            .order_by(AgentSession.created_at.desc())
+        ).all()
+        for row in rows:
+            if row.provider not in wanted or len(samples[row.provider]) >= sample_limit:
+                continue
+            samples[row.provider].append(row)
+
+        metrics: dict[str, dict[str, float | int]] = {}
+        for provider, provider_rows in samples.items():
+            if not provider_rows:
+                metrics[provider] = {"sample_count": 0}
+                continue
+            durations = [
+                max(0.0, (row.updated_at - row.created_at).total_seconds())
+                for row in provider_rows
+            ]
+            costs = []
+            for row in provider_rows:
+                cost = (row.result.get("cost") or {}).get("estimated_cost_usd")
+                if isinstance(cost, (int, float)):
+                    costs.append(float(cost))
+            metric: dict[str, float | int] = {
+                "sample_count": len(provider_rows),
+                "completed_count": sum(
+                    row.status == "completed" for row in provider_rows
+                ),
+                "average_duration_seconds": round(
+                    sum(durations) / len(durations), 1
+                ),
+            }
+            if costs:
+                metric["average_cost_usd"] = round(sum(costs) / len(costs), 4)
+            metrics[provider] = metric
+        return metrics
+
     def create_agent(
         self,
         project_id: str,
@@ -175,6 +219,7 @@ class RootSessionStore:
         access: str,
         objective: str,
         tool_call_id: str,
+        selection_reason: str | None = None,
     ) -> AgentSession:
         existing = self.get_agent(project_id, task_name)
         if existing is not None:
@@ -191,7 +236,10 @@ class RootSessionStore:
             access=access,
             objective=objective,
             status="pending",
-            result={"spawn_tool_call_id": tool_call_id},
+            result={
+                "spawn_tool_call_id": tool_call_id,
+                "selection_reason": selection_reason,
+            },
         )
         self.session.add(row)
         self.session.commit()

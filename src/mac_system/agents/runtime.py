@@ -306,6 +306,10 @@ class AgentRuntime(ABC):
         """Return provider identifiers the runtime can actually execute."""
         return {self.provider_for("")}
 
+    def provider_profiles(self) -> dict[str, dict[str, Any]]:
+        """Return model-visible, non-secret provider selection metadata."""
+        return {provider: {} for provider in self.available_providers()}
+
 
 class ClaudeCodeRuntime(AgentRuntime):
     """Drive Claude Code CLI via a stream-json subprocess session.
@@ -1779,12 +1783,17 @@ class RuntimeRouter(AgentRuntime):
         providers: dict[str, AgentRuntime],
         agent_providers: dict[str, str],
         default_provider: str = "claude_code",
+        provider_profiles: dict[str, dict[str, Any]] | None = None,
     ):
         if default_provider not in providers:
             raise ValueError(f"Default runtime provider is unavailable: {default_provider}")
         self.providers = providers
         self.agent_providers = agent_providers
         self.default_provider = default_provider
+        self._provider_profiles = {
+            provider: dict((provider_profiles or {}).get(provider, {}))
+            for provider in providers
+        }
         # Cancellation can land in the tiny gap after the primary provider
         # exits and before the fallback provider registers its subprocess.
         # Keep a router-level latch so that gap cannot resurrect cancelled work.
@@ -1797,6 +1806,12 @@ class RuntimeRouter(AgentRuntime):
 
     def available_providers(self) -> set[str]:
         return set(self.providers)
+
+    def provider_profiles(self) -> dict[str, dict[str, Any]]:
+        return {
+            provider: dict(profile)
+            for provider, profile in self._provider_profiles.items()
+        }
 
     @classmethod
     def _runtime_attempt(
@@ -1955,7 +1970,20 @@ def build_agent_runtime(settings: Any, agent_config: dict[str, Any]) -> AgentRun
                 agent,
             )
             assignments[agent] = "claude_code"
-    return RuntimeRouter(providers, assignments)
+    profile_fields = ("description", "mode", "model", "provider")
+    provider_profiles = {
+        provider: {
+            field: runtime_cfg.get(provider, {}).get(field)
+            for field in profile_fields
+            if runtime_cfg.get(provider, {}).get(field) is not None
+        }
+        for provider in providers
+    }
+    return RuntimeRouter(
+        providers,
+        assignments,
+        provider_profiles=provider_profiles,
+    )
 
 
 class FakeRuntime(AgentRuntime):

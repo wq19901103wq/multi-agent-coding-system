@@ -169,62 +169,21 @@ async def _deliver_to_root(
         await ctx.service.resume_project(project.id, triggered_by="feishu")
     if project.execution_status in {"running", "waiting_user"}:
         if await ctx.orchestrator.steer_root_agent(project.id, text):
-            await _project_root_receipt(
-                ctx,
-                project,
-                "补充信息已交给正在运行的 Codex。",
-                lifecycle="running",
-            )
             return
-    await _project_root_receipt(
-        ctx,
-        project,
-        "消息已收到，Codex 即将开始处理。",
-        lifecycle="received",
-    )
     ctx.orchestrator.schedule_root_agent(project.id, text)
 
 
-async def _project_root_receipt(
-    ctx: FeishuHandlerContext,
-    project: Project,
-    content: str,
-    *,
-    lifecycle: str,
+async def _acknowledge_message(
+    ctx: FeishuHandlerContext, message_id: str | None
 ) -> None:
-    """Acknowledge delivery immediately on the same durable progress card."""
-
-    if not project.feishu_chat_id:
+    """Acknowledge transport receipt on the original Feishu message."""
+    if not message_id:
         return
-    projection_key = f"root-agent:{project.id}:activity"
-    projection = ctx.service.get_card_projection(projection_key)
     try:
-        await deliver_card(
-            ctx.service,
-            ctx.bridge,
-            dedupe_key=generate_id("root-receipt"),
-            recipient_id=project.feishu_chat_id,
-            recipient_type="chat_id",
-            intent_type="progress",
-            card=build_content_card(
-                f"[{project.name or project.id}] 项目进展",
-                f"**当前进展**：{content}",
-                color="blue",
-            ),
-            project_id=project.id,
-            update_message_id=(
-                projection.provider_message_id
-                if lifecycle == "running" and projection is not None
-                else None
-            ),
-            projection_key=projection_key,
-            subject_type="root_agent",
-            subject_id=project.id,
-            lifecycle_status=lifecycle,
-            resulting_state=project.execution_status,
-        )
+        await ctx.bridge.add_reaction(message_id, "OnIt")
     except Exception:
-        logger.warning("Failed to project Root Agent message receipt", exc_info=True)
+        # A reaction is presentation-only. Delivery to Root must still proceed.
+        logger.warning("Failed to acknowledge Feishu message", exc_info=True)
 
 
 async def handle_text_message(
@@ -237,6 +196,7 @@ async def handle_text_message(
     text = msg.text.strip()
     if not text:
         return
+    await _acknowledge_message(ctx, msg.message_id)
 
     if text.startswith("/"):
         await _handle_command(ctx, msg, text)
