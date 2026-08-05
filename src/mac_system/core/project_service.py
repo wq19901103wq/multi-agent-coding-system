@@ -112,9 +112,6 @@ class ProjectService:
         initial_context: dict | None = None,
     ) -> Project:
         project_id = generate_id("proj")
-        if bound_directory is None and feishu_chat_id:
-            binding = self.get_chat_directory_binding(feishu_chat_id)
-            bound_directory = binding.directory if binding else None
         if bound_directory:
             workspace = self._prepare_bound_directory(bound_directory)
         else:
@@ -474,6 +471,38 @@ class ProjectService:
     ) -> Project | None:
         project = self.get_chat_user_selected_project(chat_id, open_id)
         return project if project and project.status in {"active", "paused"} else None
+
+    def get_user_project_for_directory(
+        self, open_id: str, directory: str
+    ) -> Project | None:
+        """Return the user's latest live project whose workspace is ``directory``.
+
+        A filesystem directory is a Project workspace, not a second chat-level
+        selection state.  Reopening a directory therefore resumes its existing
+        Project when possible instead of creating competing threads that write
+        to the same checkout.
+        """
+
+        path = self._prepare_bound_directory(directory)
+        return self.session.exec(
+            select(Project)
+            .join(ProjectUser, ProjectUser.project_id == Project.id)
+            .where(ProjectUser.open_id == open_id)
+            .where(Project.workspace_path == str(path))
+            .where(Project.status.in_(["active", "paused"]))
+            .order_by(Project.updated_at.desc())
+        ).first()
+
+    def user_can_access_project(self, open_id: str, project_id: str) -> bool:
+        return (
+            self.session.exec(
+                select(ProjectUser).where(
+                    ProjectUser.open_id == open_id,
+                    ProjectUser.project_id == project_id,
+                )
+            ).first()
+            is not None
+        )
 
     def list_projects_for_chat(self, chat_id: str) -> list[Project]:
         links = self.session.exec(
@@ -964,8 +993,28 @@ class ProjectService:
 
     # Explicit command/input continuations -----------------------------------
 
-    def get_pending_intent(self, open_id: str) -> PendingIntent | None:
-        row = self.session.get(PendingIntent, open_id)
+    @staticmethod
+    def _pending_intent_key(open_id: str, chat_id: str | None) -> str:
+        """Keep prompt continuations isolated without requiring a schema rewrite.
+
+        ``pending_intents.open_id`` predates chat-scoped project selection and is
+        the table primary key in existing installations.  Encoding the chat in
+        that key lets old databases support one pending prompt per chat/user
+        immediately; legacy rows remain readable with ``chat_id=None``.
+        """
+
+        return f"{open_id}\x1f{chat_id}" if chat_id else open_id
+
+    def get_pending_intent(
+        self, open_id: str, chat_id: str | None = None
+    ) -> PendingIntent | None:
+        row = self.session.get(
+            PendingIntent, self._pending_intent_key(open_id, chat_id)
+        )
+        if row is None and chat_id is not None:
+            legacy = self.session.get(PendingIntent, open_id)
+            if legacy is not None and legacy.chat_id in {None, chat_id}:
+                row = legacy
         if row and row.created_at < _now() - timedelta(hours=1):
             self.session.delete(row)
             self.session.commit()
@@ -980,8 +1029,9 @@ class ProjectService:
         chat_id: str | None = None,
         chat_type: str = "p2p",
     ) -> PendingIntent:
-        row = self.session.get(PendingIntent, open_id) or PendingIntent(
-            open_id=open_id, stage=stage
+        key = self._pending_intent_key(open_id, chat_id)
+        row = self.session.get(PendingIntent, key) or PendingIntent(
+            open_id=key, stage=stage
         )
         row.description = description
         row.stage = stage
@@ -992,8 +1042,16 @@ class ProjectService:
         self.session.commit()
         return row
 
-    def delete_pending_intent(self, open_id: str) -> None:
-        row = self.session.get(PendingIntent, open_id)
+    def delete_pending_intent(
+        self, open_id: str, chat_id: str | None = None
+    ) -> None:
+        row = self.session.get(
+            PendingIntent, self._pending_intent_key(open_id, chat_id)
+        )
+        if row is None and chat_id is not None:
+            legacy = self.session.get(PendingIntent, open_id)
+            if legacy is not None and legacy.chat_id in {None, chat_id}:
+                row = legacy
         if row:
             self.session.delete(row)
             self.session.commit()

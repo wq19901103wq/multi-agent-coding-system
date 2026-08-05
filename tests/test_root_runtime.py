@@ -47,7 +47,10 @@ class _FakeProcess:
                 {
                     "jsonrpc": "2.0",
                     "id": request_id,
-                    "result": {"thread": {"id": "thread-1"}},
+                    "result": {
+                        "thread": {"id": "thread-1"},
+                        "model": "gpt-5.6-codex",
+                    },
                 }
             )
         elif method == "turn/start":
@@ -232,7 +235,9 @@ async def test_codex_root_registers_native_tools_and_can_resume_and_steer(
     )
     try:
         await runtime.create_thread()
+        assert runtime.active_model == "gpt-5.6-codex"
         await runtime.resume_thread("thread-1")
+        assert runtime.active_model == "gpt-5.6-codex"
         await runtime.steer("turn-active", "new user correction")
         await runtime.interrupt("turn-active")
     finally:

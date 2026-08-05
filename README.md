@@ -34,15 +34,18 @@ curl http://127.0.0.1:18080/admin/projects
 
 ## 常用飞书命令
 
-- `/create <描述>`：创建项目；
-- `/bind [目录]`：绑定已有 Git 项目；
-- `/switch`：切换项目；
-- `/current`：查看当前项目和目录；
-- `/newthread`：保留项目目录并开始全新的 Codex 会话；
-- `/status`：查看状态；
-- `/cancel`：终止当前项目运行。
+- `/create` 或 `/c`：创建系统管理目录中的新项目；
+- `/open` 或 `/o`：打开已有 Git 项目（兼容 `/bind`、`/b`）；
+- `/proj` 或 `/ls`：查看项目；
+- `/use` 或 `/s`：切换项目；
+- `/info` 或 `/i`：查看当前项目、真实工作目录和状态；
+- `/new` 或 `/n`：保留项目和目录，开始新的 Codex 对话；
+- `/pause`、`/resume`、`/stop`：暂停、恢复或终止当前项目；
+- `/menu` 或 `/m`：用卡片完成常用操作；
+- `/help` 或 `/h`：查看全部快捷命令。
 
-正常项目工作直接使用自然语言，不要求用户选择任务类型或研发阶段。
+正常项目工作直接使用自然语言，不要求用户选择任务类型、研发阶段或 coding-agent。系统输出使用
+卡片；必须询问用户时优先提供选项，同时保留自由输入。
 
 ## 代码结构
 
@@ -58,5 +61,6 @@ src/mac_system/
 ```
 
 架构见 [docs/architecture.md](docs/architecture.md)，设计原则见
-[docs/mac-design-principles.md](docs/mac-design-principles.md)，测试报告必须使用
+[docs/mac-design-principles.md](docs/mac-design-principles.md)，飞书交互的可验收行为见
+[docs/interaction-spec.md](docs/interaction-spec.md)。测试报告必须使用
 [docs/testing-taxonomy.md](docs/testing-taxonomy.md) 中的 T1–T9 术语。

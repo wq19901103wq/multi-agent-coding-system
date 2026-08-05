@@ -105,6 +105,9 @@ class CodexAppServerThread:
         self.tools = {tool.name: tool for tool in tools}
         self.developer_instructions = developer_instructions
         self.model = model
+        # ``thread/start`` and ``thread/resume`` report the effective model
+        # selected by Codex even when the caller leaves ``model`` unset.
+        self.active_model: str | None = model
         self.event_handler = event_handler
         self.server_request_handler = server_request_handler
         self.request_timeout_seconds = request_timeout_seconds
@@ -229,6 +232,9 @@ class CodexAppServerThread:
             params["model"] = self.model
         response = await self._request("thread/start", params)
         self.thread_id = self._extract_thread_id(response)
+        reported_model = response.get("model")
+        if isinstance(reported_model, str) and reported_model.strip():
+            self.active_model = reported_model.strip()
         return self.thread_id
 
     async def resume_thread(self, thread_id: str) -> str:
@@ -247,6 +253,9 @@ class CodexAppServerThread:
             params["model"] = self.model
         response = await self._request("thread/resume", params)
         self.thread_id = self._extract_thread_id(response)
+        reported_model = response.get("model")
+        if isinstance(reported_model, str) and reported_model.strip():
+            self.active_model = reported_model.strip()
         return self.thread_id
 
     async def run_turn(self, text: str) -> TurnResult:

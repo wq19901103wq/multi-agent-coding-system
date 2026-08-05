@@ -9,6 +9,7 @@
     "kimi_code": {
       "enabled": true,
       "mode": "headless_cli",
+      "model": "kimi-code/k3-256k",
       "description": "External Kimi Code CLI. Choose it from configured capability and recent measured execution results, not from task keywords."
     },
     "codex": {

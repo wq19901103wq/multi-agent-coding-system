@@ -1,5 +1,8 @@
 # MAC 架构
 
+用户可观察的命令、卡片和状态语义以 [interaction-spec.md](interaction-spec.md) 为实施与验收基线；
+本文只说明支撑这些行为的技术边界。
+
 ## 结论
 
 MAC 的执行内核就是一个持久 Codex Root Agent Thread，不再另设 Coordinator Agent，
@@ -78,7 +81,7 @@ Project 只表达长期项目关系：`active / paused / cancelled`。一次 Roo
   不重复启动进程或回放历史。服务重启时才使用持久 thread id 恢复。
 - Codex 自己负责 rollout、历史截断、compaction 和 Child Agent `fork_turns`。
 - MAC 不把工具日志、Child Agent 全文结果或历史测试输出重新拼进下一轮 Prompt。
-- 默认始终恢复同一 thread。只有用户显式发送 `/newthread` 时，MAC 才调用原生
+- 默认始终恢复同一 thread。只有用户显式发送 `/new`（兼容 `/newthread`）时，MAC 才调用原生
   `thread/start` 并替换项目绑定的 thread id；项目和目录保留，旧历史不 fork、不注入新会话。
 - 项目目录是 Root Agent 的 cwd 和写入范围；workspace-write 下仍可按 Codex 原生权限读取
   相关参考目录。
@@ -97,8 +100,13 @@ Project 只表达长期项目关系：`active / paused / cancelled`。一次 Roo
   原卡片变为“已中止并恢复空闲”，后台状态同步回到 `idle`。
 - 面向用户的输出全部使用卡片。进度可以充分，但不得展示内部 task path、thread id、
   协议字段和原始工具日志。
-- `/bind` 只改变“下一次新建项目”使用的目录，并清除当前选择；它不会取消、暂停或迁移已有
-  项目。用户之后仍可用 `/switch` 回到旧项目，因此已有项目不应阻止绑定或解绑目录。
+- Project 是唯一导航边界，固定拥有工作目录和当前 Root Thread。`/open`（兼容 `/bind`）
+  立即打开已有目录对应的 Project 并设为当前项目；同一用户已有同目录 Project 时恢复它，
+  否则创建一个新的 Project。不存在独立的“下一次新建项目目录”状态。
+- `/new` 只替换当前 Project 的 Root Thread，项目和工作目录保持不变；普通消息只能进入当前
+  明确选中的 Project，不回退到用户最近更新的其他项目。
+- 进度卡保存 Agent 公开 commentary 形成的大步骤历史，以及当前大步骤中的真实工具、验证、
+  Child Agent 和外部 provider 小步骤历史。它是 app-server 事件投影，不是固定研发状态机。
 
 ## 外部 provider 选择
 

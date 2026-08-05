@@ -14,7 +14,7 @@ import json
 import logging
 import threading
 from concurrent.futures import Future as ConcurrentFuture
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -67,6 +67,26 @@ class _PendingUserRequest:
 
 
 @dataclass
+class _ProgressSmallStep:
+    key: str
+    label: str
+    status: str
+    detail: str | None = None
+    observed_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
+
+
+@dataclass
+class _ProgressBigStep:
+    title: str
+    status: str = "running"
+    executor: str = "Codex Root"
+    model: str | None = None
+    selection_reason: str | None = None
+    small_steps: list[_ProgressSmallStep] = field(default_factory=list)
+    collapsed_small_steps: int = 0
+
+
+@dataclass
 class _ProgressState:
     started_monotonic: float
     last_event_monotonic: float
@@ -76,6 +96,13 @@ class _ProgressState:
     narrative: str | None = None
     detail: str | None = None
     child_summary: str | None = None
+    executor: str = "Codex Root"
+    model: str | None = None
+    root_model: str | None = None
+    selection_reason: str | None = None
+    external_agent_id: str | None = None
+    big_steps: list[_ProgressBigStep] = field(default_factory=list)
+    collapsed_big_steps: int = 0
 
 
 _ROOT_THREADS: dict[str, _RootHandle] = {}
@@ -315,6 +342,93 @@ def _duration_label(seconds: float) -> str:
     return f"{remaining} 秒"
 
 
+def _progress_text(value: str, limit: int = 240) -> str:
+    return " ".join(redact_text(value).split())[:limit]
+
+
+def _start_progress_big_step(
+    state: _ProgressState,
+    title: str,
+    *,
+    executor: str | None = None,
+    model: str | None = None,
+    selection_reason: str | None = None,
+) -> None:
+    """Start a dynamic user-visible phase from observed Agent commentary."""
+
+    compact = _progress_text(title)
+    if not compact:
+        return
+    effective_executor = executor or state.executor
+    current = state.big_steps[-1] if state.big_steps else None
+    if (
+        current is not None
+        and current.title == compact
+        and current.executor == effective_executor
+    ):
+        current.model = model or current.model
+        current.selection_reason = selection_reason or current.selection_reason
+        state.executor = current.executor
+        state.model = current.model
+        state.selection_reason = current.selection_reason
+        return
+    if current is not None and current.status == "running":
+        current.status = "completed"
+    step = _ProgressBigStep(
+        title=compact,
+        executor=effective_executor,
+        model=model,
+        selection_reason=(
+            _progress_text(selection_reason, 320) if selection_reason else None
+        ),
+    )
+    state.big_steps.append(step)
+    if len(state.big_steps) > 8:
+        state.collapsed_big_steps += len(state.big_steps) - 8
+        state.big_steps = state.big_steps[-8:]
+    state.executor = step.executor
+    state.model = step.model
+    state.selection_reason = step.selection_reason
+
+
+def _record_progress_small_step(
+    state: _ProgressState,
+    *,
+    key: str,
+    label: str,
+    status: str,
+    detail: str | None = None,
+) -> None:
+    if not state.big_steps:
+        _start_progress_big_step(state, "理解并处理本轮任务")
+    current = state.big_steps[-1]
+    compact_label = _progress_text(label, 180)
+    compact_detail = _progress_text(detail, 220) if detail else None
+    for step in reversed(current.small_steps):
+        if step.key == key:
+            step.label = compact_label
+            step.status = status
+            step.detail = compact_detail or step.detail
+            step.observed_at = datetime.now().astimezone()
+            return
+    current.small_steps.append(
+        _ProgressSmallStep(
+            key=key,
+            label=compact_label,
+            status=status,
+            detail=compact_detail,
+        )
+    )
+    if len(current.small_steps) > 7:
+        current.collapsed_small_steps += len(current.small_steps) - 7
+        current.small_steps = current.small_steps[-7:]
+
+
+def _complete_progress_big_step(state: _ProgressState, status: str) -> None:
+    if state.big_steps:
+        state.big_steps[-1].status = status
+
+
 def _progress_card_body(
     state: _ProgressState,
     *,
@@ -325,21 +439,70 @@ def _progress_card_body(
     current = monotonic() if now_monotonic is None else now_monotonic
     elapsed = _duration_label(current - state.started_monotonic)
     since_event = max(0, int(current - state.last_event_monotonic))
+    model = state.model or "后端未报告"
     lines = [
-        f"**当前进展**：{state.label}",
+        f"**当前执行主体**：{state.executor}",
+        f"**模型**：{model}",
+    ]
+    if state.selection_reason:
+        lines.append(f"**选择原因**：{state.selection_reason}")
+    lines.extend([
+        f"**当前状态**：{state.label}",
         f"**已用时间**：{elapsed}",
         (
             "**最近事件**："
             f"{state.last_event_at.astimezone().strftime('%H:%M:%S')}"
             f"（{since_event} 秒前）"
         ),
-    ]
+    ])
     if state.child_summary:
         lines.append(f"**子 Agent**：{state.child_summary}")
-    if state.narrative:
-        lines.append(f"**进展说明**：{state.narrative}")
-    if state.detail:
-        lines.append(f"**补充信息**：{state.detail}")
+    if state.big_steps:
+        big_step_lines = []
+        if state.collapsed_big_steps:
+            big_step_lines.append(
+                f"… 更早 {state.collapsed_big_steps} 个大步骤已收起"
+            )
+        current_step = state.big_steps[-1]
+        for step in state.big_steps:
+            icon = {
+                "completed": "✅",
+                "failed": "⚠️",
+                "running": "▶️",
+            }.get(step.status, "•")
+            execution = []
+            if step.executor != "Codex Root":
+                execution.append(step.executor)
+            # Root model is already shown once in the card metadata. Repeat
+            # model/provider details only where execution actually crossed an
+            # external coding-agent boundary.
+            if step.executor != "Codex Root" and step.model:
+                execution.append(step.model)
+            suffix = f" · {' · '.join(execution)}" if execution else ""
+            big_step_lines.append(f"{icon} {step.title}{suffix}")
+            # The active external step already exposes this in the card
+            # metadata. Preserve it here only after that step becomes history.
+            if step.selection_reason and step is not current_step:
+                big_step_lines.append(f"  原因：{step.selection_reason}")
+        lines.append("**大步骤**：\n" + "\n".join(big_step_lines))
+        current = state.big_steps[-1]
+        if current.small_steps:
+            small_lines = []
+            if current.collapsed_small_steps:
+                small_lines.append(
+                    f"… 更早 {current.collapsed_small_steps} 个小步骤已收起"
+                )
+            for step in current.small_steps:
+                icon = {
+                    "completed": "✓",
+                    "failed": "!",
+                    "running": "…",
+                }.get(step.status, "·")
+                detail = f" — {step.detail}" if step.detail else ""
+                small_lines.append(
+                    f"{icon} {step.observed_at.strftime('%H:%M:%S')} {step.label}{detail}"
+                )
+            lines.append("**当前大步骤 · 小步骤**：\n" + "\n".join(small_lines))
     if since_event >= 30:
         lines.append(
             "**状态说明**：暂未收到新的 Codex 事件；本轮仍在运行，"
@@ -649,12 +812,20 @@ class RootAgentEngine:
                 self.store.set_turn(project_id, turn_id=None, status="running")
                 self.service.set_execution_status(project_id, "running")
                 current = monotonic()
-                self._progress[project_id] = _ProgressState(
+                progress_state = _ProgressState(
                     started_monotonic=current,
                     last_event_monotonic=current,
                     last_event_at=datetime.now().astimezone(),
                     label="正在准备 Codex 项目上下文",
                 )
+                _start_progress_big_step(progress_state, "理解并准备本轮任务")
+                _record_progress_small_step(
+                    progress_state,
+                    key="root-start",
+                    label="正在准备项目上下文",
+                    status="running",
+                )
+                self._progress[project_id] = progress_state
                 self._queue_progress_snapshot(
                     project_id,
                     event_identity=generate_id("root-start"),
@@ -664,6 +835,9 @@ class RootAgentEngine:
                     name=f"mac-progress-{project_id}",
                 )
                 root = await self._root_thread(project)
+                active_model = getattr(root, "active_model", None)
+                progress_state.root_model = active_model
+                progress_state.model = active_model
                 result = await root.run_turn(trigger)
                 await self._stop_progress_heartbeat(heartbeat)
                 heartbeat = None
@@ -1069,6 +1243,7 @@ class RootAgentEngine:
                 provider,
                 selection_reason,
                 initial_activity,
+                step_status="running",
             )
 
             last_activity = initial_activity
@@ -1098,6 +1273,7 @@ class RootAgentEngine:
                         if kind == "commentary"
                         else None
                     ),
+                    step_status=("completed" if kind == "tool" else "running"),
                 )
 
             result = await self.runtime.execute(
@@ -1180,6 +1356,7 @@ class RootAgentEngine:
                     else "未调用工具"
                 ),
                 narrative=(answer or failure_detail or "")[:1_200] or None,
+                step_status="completed" if result.success else "failed",
             )
             await self._flush_progress_snapshots(project.id)
             return {
@@ -1375,6 +1552,7 @@ class RootAgentEngine:
         activity: str,
         observed_detail: str | None = None,
         narrative: str | None = None,
+        step_status: str = "running",
     ) -> None:
         """Update the shared progress card from actual external CLI events."""
         detail = f"选择原因：{selection_reason}"
@@ -1389,6 +1567,38 @@ class RootAgentEngine:
             detail=detail,
             narrative=narrative,
         )
+        state = self._progress.get(project_id)
+        if state is not None:
+            display = {
+                "claude_code": "Claude Code",
+                "kimi_code": "Kimi Code",
+                "codex": "Codex CLI",
+                "pi": "Pi",
+            }.get(provider, provider)
+            profile = self.runtime.provider_profiles().get(provider, {})
+            model = str(profile.get("model") or "").strip() or None
+            if provider == "claude_code":
+                model = self.settings.claude_model or model
+            if state.external_agent_id != agent_id:
+                state.external_agent_id = agent_id
+                _start_progress_big_step(
+                    state,
+                    f"交给 {display} 独立处理",
+                    executor=display,
+                    model=model,
+                    selection_reason=selection_reason,
+                )
+            state.executor = display
+            state.model = model
+            state.selection_reason = selection_reason
+            small_step_label = narrative or activity
+            _record_progress_small_step(
+                state,
+                key=f"external:{agent_id}:{activity}:{small_step_label}",
+                label=small_step_label,
+                status=step_status,
+                detail=observed_detail,
+            )
         self._queue_progress_snapshot(
             project_id,
             event_identity=f"external:{agent_id}:{activity}",
@@ -1443,6 +1653,7 @@ class RootAgentEngine:
         child_summary = _native_child_summary(item) if isinstance(item, dict) else None
         detail = _native_activity_detail(item) if isinstance(item, dict) else ""
         narrative = None
+        item_type = str(item.get("type") or "") if isinstance(item, dict) else ""
         if isinstance(item, dict) and str(item.get("type") or "") == "agentMessage":
             phase = str(item.get("phase") or "")
             text = " ".join(redact_text(str(item.get("text") or "")).split())
@@ -1461,6 +1672,62 @@ class RootAgentEngine:
             child_summary=child_summary,
             observed_event=False,
         )
+        state = self._progress.get(project_id)
+        if state is not None:
+            if event.kind == "turn/started":
+                _record_progress_small_step(
+                    state,
+                    key="root-start",
+                    label="项目上下文已准备完成",
+                    status="completed",
+                )
+            native_executor = (
+                "Codex 子 Agent"
+                if item_type in {"collabAgentToolCall", "subAgentActivity"}
+                else "Codex Root"
+            )
+            observed_model = None
+            if isinstance(item, dict):
+                observed_model = str(item.get("model") or "").strip() or None
+            observed_model = observed_model or state.root_model
+            if narrative:
+                state.external_agent_id = None
+                _start_progress_big_step(
+                    state,
+                    narrative,
+                    executor="Codex Root",
+                    model=observed_model,
+                )
+            elif item_type and item_type != "agentMessage":
+                if item_type == "dynamicToolCall" and event.kind == "item/completed":
+                    state.external_agent_id = None
+                    _start_progress_big_step(
+                        state,
+                        "整理外部 coding-agent 返回结果",
+                        executor="Codex Root",
+                        model=observed_model,
+                    )
+                if state.external_agent_id is None:
+                    state.executor = native_executor
+                    state.model = observed_model
+                    state.selection_reason = None
+                status = "running" if event.kind == "item/started" else "completed"
+                if str(item.get("status") or "") in {"failed", "declined"}:
+                    status = "failed"
+                _record_progress_small_step(
+                    state,
+                    key=event_identity,
+                    label=label,
+                    status=status,
+                    detail=detail or None,
+                )
+            elif not item_type:
+                _record_progress_small_step(
+                    state,
+                    key=event_identity,
+                    label=label,
+                    status="running",
+                )
         self._queue_progress_snapshot(
             project_id,
             event_identity=f"{event_identity}:{event.kind}",
@@ -1483,6 +1750,10 @@ class RootAgentEngine:
                 label=label,
                 color=color,
                 observed_event=True,
+            )
+            _complete_progress_big_step(
+                state,
+                "completed" if result.status == "completed" else "failed",
             )
             body = _progress_card_body(state)
         else:
@@ -1722,6 +1993,12 @@ class RootAgentEngine:
                     _PENDING_USER_REQUESTS.pop(item_id, None)
 
     async def _publish_final(self, project: Project, result: TurnResult) -> None:
+        # Codex may emit public commentary before a tool call and retain that
+        # text as ``final_message`` when the turn is later interrupted. It is
+        # progress evidence, not a successful final answer. The terminal
+        # progress projection already reports interrupted/failed faithfully.
+        if result.status != "completed":
+            return
         content = result.final_message or ""
         if self.feishu_bridge is None or not project.feishu_chat_id:
             self.service.enqueue_notification(
@@ -1825,6 +2102,8 @@ class RootAgentEngine:
                 color="red",
             )
             state = self._progress.get(project.id)
+            if state is not None:
+                _complete_progress_big_step(state, "failed")
             projection = delivery_service.get_card_projection(projection_key)
             await deliver_card(
                 delivery_service,

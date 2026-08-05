@@ -12,9 +12,8 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
-
-from sqlmodel import select
 
 from mac_system.config import get_allowed_bind_roots
 from mac_system.core.notification_service import deliver_card
@@ -32,10 +31,58 @@ from mac_system.feishu.menu import (
     build_project_list_card,
 )
 from mac_system.feishu.models import ButtonAction, TextMessage
-from mac_system.models import Approval, Project, ProjectUser
+from mac_system.models import Approval, Project
 
 
 logger = logging.getLogger(__name__)
+
+
+_COMMAND_ALIASES = {
+    "/h": "/help",
+    "/m": "/menu",
+    "/c": "/create",
+    "/ls": "/projects",
+    "/proj": "/projects",
+    "/s": "/switch",
+    "/use": "/switch",
+    "/i": "/current",
+    "/info": "/current",
+    "/n": "/newthread",
+    "/new": "/newthread",
+    "/o": "/bind",
+    "/open": "/bind",
+    "/b": "/bind",
+    "/close": "/unbind",
+    "/u": "/unbind",
+    "/p": "/pause",
+    "/r": "/resume",
+    "/x": "/cancel",
+    "/stop": "/cancel",
+}
+_KNOWN_COMMANDS = {
+    "/help",
+    "/menu",
+    "/create",
+    "/projects",
+    "/list",
+    "/switch",
+    "/current",
+    "/newthread",
+    "/bind",
+    "/unbind",
+    "/pause",
+    "/resume",
+    "/cancel",
+}
+
+
+def _canonical_command(text: str) -> str:
+    command = text.partition(" ")[0].lower()
+    return _COMMAND_ALIASES.get(command, command)
+
+
+def _is_known_command(text: str) -> bool:
+    return _canonical_command(text) in _KNOWN_COMMANDS
 
 
 @dataclass
@@ -104,25 +151,48 @@ async def _send_interactive(
     return message_id or ""
 
 
+async def _resolve_menu_card(
+    ctx: FeishuHandlerContext,
+    action: ButtonAction,
+    title: str,
+    content: str,
+    *,
+    color: str = "green",
+) -> None:
+    """Persist and display the result on the card the user acted on."""
+
+    if not action.message_id:
+        return
+    receive_id, receive_id_type = _recipient(ctx, action.open_id)
+    try:
+        await deliver_card(
+            ctx.service,
+            ctx.bridge,
+            dedupe_key=generate_id("feishu-menu-resolution"),
+            recipient_id=receive_id,
+            recipient_type=receive_id_type,
+            intent_type="interaction",
+            card=build_content_card(title, content, color=color),
+            update_message_id=action.message_id,
+            projection_key=f"menu:{action.message_id}",
+            subject_type="menu_action",
+            subject_id=action.message_id,
+            lifecycle_status="resolved",
+            selected_action=action.option_key,
+            resolved_by=action.open_id,
+            resulting_state="resolved",
+        )
+    except Exception:
+        logger.warning("Failed to resolve Feishu menu card", exc_info=True)
+
+
 def _active_project(ctx: FeishuHandlerContext, open_id: str) -> Project | None:
     chat_id = _chat_id(ctx, open_id)
-    project = ctx.service.get_chat_user_active_project(chat_id, open_id)
-    if project is not None:
-        return project
-    if ctx.chat_type == "group":
-        return None
-    memberships = ctx.service.session.exec(
-        select(ProjectUser).where(ProjectUser.open_id == open_id)
-    ).all()
-    project_ids = [membership.project_id for membership in memberships]
-    if not project_ids:
-        return None
-    return ctx.service.session.exec(
-        select(Project)
-        .where(Project.id.in_(project_ids))
-        .where(Project.status == "active")
-        .order_by(Project.updated_at.desc())
-    ).first()
+    # The explicit chat/user selection is the only routing fact. Falling back
+    # to a user's most recently updated Project can cross chats and makes
+    # directory/project switches appear to succeed while messages still enter
+    # an unrelated thread.
+    return ctx.service.get_chat_user_active_project(chat_id, open_id)
 
 
 def _project_name(description: str) -> str:
@@ -152,7 +222,7 @@ async def _create_project(
         (
             f"**项目**：{project.name}\n\n"
             f"**工作目录**：`{project.workspace_path}`\n\n"
-            "Codex 已开始处理；进度、问题和本轮结果都会继续显示在当前会话。"
+            "Codex 已开始处理；进度、问题和本轮结果都会继续显示在当前项目。"
         ),
         color="green",
     )
@@ -198,23 +268,44 @@ async def handle_text_message(
         return
     await _acknowledge_message(ctx, msg.message_id)
 
+    chat_id = _chat_id(ctx, msg.open_id)
+    pending = ctx.service.get_pending_intent(msg.open_id, chat_id)
+    pending_in_chat = pending is not None
+
+    # A recognized project command supersedes a card prompt. Other leading
+    # slashes may be legitimate prompt answers, most notably Unix paths.
+    if text.startswith("/") and (not pending_in_chat or _is_known_command(text)):
+        await _handle_command(ctx, msg, text)
+        return
+
+    if pending_in_chat:
+        if pending.stage == "awaiting_description":
+            ctx.service.delete_pending_intent(msg.open_id, chat_id)
+            await _create_project(ctx, msg.open_id, text)
+            return
+        if pending.stage == "awaiting_bind_dir":
+            ctx.service.delete_pending_intent(msg.open_id, chat_id)
+            await _bind_directory(ctx, msg.open_id, text)
+            return
+
     if text.startswith("/"):
         await _handle_command(ctx, msg, text)
         return
 
-    pending = ctx.service.get_pending_intent(msg.open_id)
-    if pending is not None and pending.chat_id in {None, _chat_id(ctx, msg.open_id)}:
-        if pending.stage == "awaiting_description":
-            ctx.service.delete_pending_intent(msg.open_id)
-            await _create_project(ctx, msg.open_id, text)
-            return
-        if pending.stage == "awaiting_bind_dir":
-            ctx.service.delete_pending_intent(msg.open_id)
-            await _bind_directory(ctx, msg.open_id, text)
-            return
-
     project = _active_project(ctx, msg.open_id)
     if project is None:
+        legacy_binding = ctx.service.get_chat_directory_binding(
+            _chat_id(ctx, msg.open_id)
+        )
+        if legacy_binding is not None:
+            project = await _bind_directory(
+                ctx,
+                msg.open_id,
+                legacy_binding.directory,
+            )
+            if project is not None:
+                await _deliver_to_root(ctx, project, text)
+                return
         # A Feishu chat is the outer session.  Its first ordinary message gets
         # one persistent Codex project thread; there is no separate chat Agent.
         await _create_project(ctx, msg.open_id, text)
@@ -227,28 +318,18 @@ async def _handle_command(
     msg: TextMessage,
     text: str,
 ) -> None:
-    command, _, argument = text.partition(" ")
-    command = {
-        "/h": "/help",
-        "/m": "/menu",
-        "/c": "/create",
-        "/ls": "/projects",
-        "/proj": "/projects",
-        "/s": "/switch",
-        "/use": "/switch",
-        "/i": "/current",
-        "/info": "/current",
-        "/n": "/newthread",
-        "/new": "/newthread",
-        "/b": "/bind",
-        "/u": "/unbind",
-        "/p": "/pause",
-        "/r": "/resume",
-        "/x": "/cancel",
-        "/stop": "/cancel",
-    }.get(command.lower(), command.lower())
+    _, _, argument = text.partition(" ")
+    command = _canonical_command(text)
     argument = argument.strip()
     open_id = msg.open_id
+
+    # An explicit command supersedes a prior menu prompt in this chat. Without
+    # this, tapping “返回” and later typing ordinary text can unexpectedly
+    # create a Project or interpret the message as a filesystem path.
+    chat_id = _chat_id(ctx, open_id)
+    pending = ctx.service.get_pending_intent(open_id, chat_id)
+    if pending is not None:
+        ctx.service.delete_pending_intent(open_id, chat_id)
 
     if command in {"/help", "/menu"}:
         if command == "/menu":
@@ -267,10 +348,11 @@ async def _handle_command(
                     "- `/create` 或 `/c` 加需求：新建项目\n"
                     "- `/proj` 或 `/ls`：查看项目\n"
                     "- `/use` 或 `/s` 加项目 ID：切换项目\n"
-                    "- `/info` 或 `/i`：当前项目和目录\n"
-                    "- `/new` 或 `/n`：开始全新的 Codex 会话\n"
-                    "- `/bind` 或 `/b` 加目录：绑定目录\n"
-                    "- `/unbind` 或 `/u`：解绑目录\n"
+                    "- `/info` 或 `/i`：当前项目、目录和状态\n"
+                    "- `/new` 或 `/n`：在当前项目中开始新对话（目录不变）\n"
+                    "- `/open` 或 `/o` 加目录：打开已有 Git 项目\n"
+                    "- `/bind` 或 `/b`：兼容的打开目录命令\n"
+                    "- `/close`、`/unbind` 或 `/u`：关闭当前项目（不会删除文件）\n"
                     "- `/pause` 或 `/p`：暂停\n"
                     "- `/resume` 或 `/r`：恢复\n"
                     "- `/stop` 或 `/x`：取消\n"
@@ -328,8 +410,12 @@ async def _handle_command(
         await _send_card(
             ctx,
             open_id,
-            "已开始新的 Codex 会话",
-            "项目和工作目录保持不变；后续消息不会携带旧对话历史。",
+            "当前项目已开始新对话",
+            (
+                f"**项目**：{project.name or project.id}\n\n"
+                f"**工作目录**：`{project.workspace_path}`\n\n"
+                "项目和目录保持不变；后续消息不会携带旧对话历史。"
+            ),
             color="green",
         )
         return
@@ -351,6 +437,15 @@ async def _handle_command(
             if argument
             else _active_project(ctx, open_id)
         )
+        chat_id = _chat_id(ctx, open_id)
+        if project is not None and not (
+            ctx.service.user_can_access_project(open_id, project.id)
+            or any(
+                item.id == project.id
+                for item in ctx.service.list_projects_for_chat(chat_id)
+            )
+        ):
+            project = None
         if project is None:
             await _send_card(ctx, open_id, "未找到项目", "请先创建或切换项目。", color="orange")
             return
@@ -361,9 +456,19 @@ async def _handle_command(
             await ctx.service.resume_project(project.id, triggered_by=open_id)
             message = "项目已恢复。"
         else:
-            await ctx.orchestrator.cancel_project(project.id, reason="用户通过飞书取消")
-            message = "项目已取消；其 Codex 会话不会再接收新任务。"
-        await _send_card(ctx, open_id, "项目控制", message, color="green")
+            interrupted = await ctx.orchestrator.stop_root_turn(project.id)
+            message = (
+                "已请求停止当前一轮；项目、目录和 Codex 对话仍保留，可以继续发送新消息。"
+                if interrupted
+                else "当前没有正在执行的一轮；项目、目录和 Codex 对话仍保留。"
+            )
+        await _send_card(
+            ctx,
+            open_id,
+            "项目控制",
+            f"**项目**：{project.name or project.id}\n\n{message}",
+            color="green",
+        )
         return
 
     await _send_card(
@@ -376,24 +481,36 @@ async def _handle_command(
 
 
 async def _show_projects(ctx: FeishuHandlerContext, open_id: str) -> None:
-    projects = ctx.service.list_projects_for_chat(_chat_id(ctx, open_id))
+    chat_id = _chat_id(ctx, open_id)
+    projects = ctx.service.list_projects_for_chat(chat_id)
     if not projects:
-        await _send_card(ctx, open_id, "当前会话", "还没有项目。")
+        await _send_card(ctx, open_id, "项目", "还没有项目。")
         return
+    selected = ctx.service.get_chat_user_selected_project(chat_id, open_id)
     body = "\n".join(
-        f"- **{project.name or project.id}** · {project.execution_status} · `{project.id}`"
+        (
+            f"- {'▶ ' if selected and selected.id == project.id else ''}"
+            f"**{project.name or project.id}** · {project.execution_status}\n"
+            f"  `{project.workspace_path}`\n"
+            f"  `{project.id}`"
+        )
         for project in projects
     )
-    await _send_card(ctx, open_id, "当前会话项目", body)
+    await _send_card(ctx, open_id, "项目", body)
 
 
-async def _show_switch_card(ctx: FeishuHandlerContext, open_id: str) -> None:
-    projects = ctx.service.list_projects_for_chat(_chat_id(ctx, open_id))
+async def _show_switch_card(
+    ctx: FeishuHandlerContext, open_id: str, *, mode: str = "switch"
+) -> None:
+    chat_id = _chat_id(ctx, open_id)
+    projects = ctx.service.list_projects_for_chat(chat_id)
+    selected = ctx.service.get_chat_user_selected_project(chat_id, open_id)
     payload = [
         {
             "id": project.id,
             "name": project.name or project.id,
             "execution_status": project.execution_status,
+            "is_current": bool(selected and selected.id == project.id),
         }
         for project in projects
     ]
@@ -402,7 +519,7 @@ async def _show_switch_card(ctx: FeishuHandlerContext, open_id: str) -> None:
         open_id,
         build_project_list_card(
             payload,
-            mode="switch",
+            mode=mode,
             chat_id=ctx.chat_id,
             chat_type=ctx.chat_type,
         ),
@@ -410,13 +527,23 @@ async def _show_switch_card(ctx: FeishuHandlerContext, open_id: str) -> None:
 
 
 async def _switch_project(
-    ctx: FeishuHandlerContext, open_id: str, project_id: str
+    ctx: FeishuHandlerContext,
+    open_id: str,
+    project_id: str,
+    *,
+    announce: bool = True,
 ) -> None:
     project = ctx.service.get_project(project_id)
     if project is None or project.status == "cancelled":
         await _send_card(ctx, open_id, "切换失败", "项目不存在或已取消。", color="orange")
         return
     chat_id = _chat_id(ctx, open_id)
+    if not (
+        ctx.service.user_can_access_project(open_id, project.id)
+        or any(item.id == project.id for item in ctx.service.list_projects_for_chat(chat_id))
+    ):
+        await _send_card(ctx, open_id, "切换失败", "当前用户无权访问该项目。", color="orange")
+        return
     ctx.service.bind_project_to_chat(
         project.id,
         chat_id,
@@ -424,29 +551,34 @@ async def _switch_project(
         created_by=open_id,
     )
     ctx.service.set_chat_user_context(chat_id, open_id, project.id)
-    await _send_card(
-        ctx,
-        open_id,
-        "已切换项目",
-        f"后续消息将进入“{project.name or project.id}”的同一个 Codex 会话。",
-        color="green",
-    )
+    if announce:
+        await _send_card(
+            ctx,
+            open_id,
+            "已切换项目",
+            f"后续消息将进入“{project.name or project.id}”的同一个 Codex 会话。",
+            color="green",
+        )
 
 
 async def _show_current(ctx: FeishuHandlerContext, open_id: str) -> None:
     chat_id = _chat_id(ctx, open_id)
-    binding = ctx.service.get_chat_directory_binding(chat_id)
     project = ctx.service.get_chat_user_selected_project(chat_id, open_id)
+    if project is None:
+        await _send_card(
+            ctx,
+            open_id,
+            "当前项目",
+            "当前没有打开项目。直接发送需求可创建新项目，或使用 `/open` 打开已有目录。",
+            color="orange",
+        )
+        return
     lines = [
-        f"**绑定目录**：`{binding.directory}`" if binding else "**绑定目录**：系统项目目录",
-        (
-            f"**当前项目**：{project.name or project.id}\n\n"
-            f"**执行状态**：{project.execution_status}"
-            if project
-            else "**当前项目**：无"
-        ),
+        f"**当前项目**：{project.name or project.id}",
+        f"**工作目录**：`{project.workspace_path}`",
+        f"**执行状态**：{project.execution_status}",
     ]
-    await _send_card(ctx, open_id, "当前会话", "\n\n".join(lines))
+    await _send_card(ctx, open_id, "当前项目", "\n\n".join(lines))
 
 
 async def _show_directory_card(ctx: FeishuHandlerContext, open_id: str) -> None:
@@ -459,32 +591,76 @@ async def _show_directory_card(ctx: FeishuHandlerContext, open_id: str) -> None:
 
 
 async def _bind_directory(
-    ctx: FeishuHandlerContext, open_id: str, directory: str
-) -> None:
+    ctx: FeishuHandlerContext,
+    open_id: str,
+    directory: str,
+    *,
+    announce: bool = True,
+) -> Project | None:
     try:
-        binding = ctx.service.bind_directory_to_chat(
-            _chat_id(ctx, open_id), directory, bound_by=open_id
-        )
+        chat_id = _chat_id(ctx, open_id)
+        project = ctx.service.get_user_project_for_directory(open_id, directory)
+        resumed = project is not None
+        if project is None:
+            workspace_name = Path(directory).expanduser().resolve().name or "已有项目"
+            project = await ctx.service.create_project(
+                name=workspace_name,
+                task_type="existing_project",
+                description=f"继续迭代已有目录 {workspace_name}",
+                creator_open_id=open_id,
+                feishu_chat_id=chat_id,
+                feishu_chat_type=ctx.chat_type,
+                bound_directory=directory,
+                initial_context={"orchestration_mode": "root_agent"},
+            )
+        else:
+            ctx.service.bind_project_to_chat(
+                project.id,
+                chat_id,
+                chat_type=ctx.chat_type,
+                created_by=open_id,
+            )
+            ctx.service.set_chat_user_context(chat_id, open_id, project.id)
+        # Remove any legacy future-project binding. Project.workspace_path is
+        # now the sole source of truth for the current directory.
+        ctx.service.unbind_directory_from_chat(chat_id)
     except (ValueError, OSError) as exc:
-        await _send_card(ctx, open_id, "绑定失败", str(exc), color="red")
-        return
-    await _send_card(
-        ctx,
-        open_id,
-        "目录已绑定",
-        f"后续新项目会直接使用 `{binding.directory}`。",
-        color="green",
-    )
+        await _send_card(ctx, open_id, "打开失败", str(exc), color="red")
+        return None
+    if announce:
+        await _send_card(
+            ctx,
+            open_id,
+            "项目已打开",
+            (
+                f"**项目**：{project.name or project.id}\n\n"
+                f"**工作目录**：`{project.workspace_path}`\n\n"
+                f"{'已恢复这个目录原有的项目和对话。' if resumed else '已为这个目录创建项目。'}"
+                "后续消息会直接进入这里。"
+            ),
+            color="green",
+        )
+    return project
 
 
 async def _unbind_directory(ctx: FeishuHandlerContext, open_id: str) -> None:
-    removed = ctx.service.unbind_directory_from_chat(_chat_id(ctx, open_id))
+    chat_id = _chat_id(ctx, open_id)
+    project = ctx.service.get_chat_user_selected_project(chat_id, open_id)
+    legacy_removed = ctx.service.unbind_directory_from_chat(chat_id)
+    if project is not None:
+        ctx.service.set_chat_user_context(chat_id, open_id, None)
     await _send_card(
         ctx,
         open_id,
-        "目录绑定",
-        "已解绑。" if removed else "当前会话没有绑定目录。",
-        color="green",
+        "当前项目",
+        (
+            f"已关闭“{project.name or project.id}”；项目和文件都没有删除，可通过 `/use` 返回。"
+            if project is not None
+            else (
+                "已清理旧的目录绑定。" if legacy_removed else "当前没有打开项目。"
+            )
+        ),
+        color="green" if project is not None or legacy_removed else "orange",
     )
 
 
@@ -524,12 +700,18 @@ async def _handle_menu_action(
 ) -> None:
     option = action.option_key or "show_menu"
     if option == "show_menu":
+        chat_id = _chat_id(ctx, action.open_id)
+        pending = ctx.service.get_pending_intent(action.open_id, chat_id)
+        if pending is not None:
+            ctx.service.delete_pending_intent(action.open_id, chat_id)
+        await _resolve_menu_card(ctx, action, "已返回", "已取消上一项输入。")
         await _send_interactive(
             ctx,
             action.open_id,
             build_main_menu_card(ctx.chat_id, ctx.chat_type),
         )
     elif option == "create_prompt":
+        await _resolve_menu_card(ctx, action, "已选择", "创建一个新项目。")
         ctx.service.upsert_pending_intent(
             action.open_id,
             None,
@@ -542,14 +724,31 @@ async def _handle_menu_action(
             action.open_id,
             build_create_prompt_card(ctx.chat_id, ctx.chat_type),
         )
-    elif option in {
-        "list_projects_status",
-        "list_projects_switch",
-        "list_projects_bind",
-    }:
-        await _show_switch_card(ctx, action.open_id)
+    elif option == "open_directory":
+        await _resolve_menu_card(ctx, action, "已选择", "打开已有 Git 项目。")
+        await _show_directory_card(ctx, action.open_id)
+    elif option == "list_projects_status":
+        await _resolve_menu_card(ctx, action, "已选择", "查看项目状态。")
+        await _show_switch_card(ctx, action.open_id, mode="status")
+    elif option in {"list_projects_switch", "list_projects_bind"}:
+        await _resolve_menu_card(ctx, action, "已选择", "切换当前项目。")
+        await _show_switch_card(ctx, action.open_id, mode="switch")
     elif option.startswith("switch:") or option.startswith("bind:"):
-        await _switch_project(ctx, action.open_id, option.split(":", 1)[1])
+        project_id = option.split(":", 1)[1]
+        await _switch_project(ctx, action.open_id, project_id, announce=False)
+        project = ctx.service.get_chat_user_selected_project(
+            _chat_id(ctx, action.open_id), action.open_id
+        )
+        if project is not None and project.id == project_id:
+            await _resolve_menu_card(
+                ctx,
+                action,
+                "项目已切换",
+                (
+                    f"**当前项目**：{project.name or project.id}\n\n"
+                    f"**工作目录**：`{project.workspace_path}`"
+                ),
+            )
     elif option.startswith("status:"):
         project = ctx.service.get_project(option.split(":", 1)[1])
         if project is None:
@@ -564,10 +763,47 @@ async def _handle_menu_action(
                 action_needed=project.waiting_reason,
                 workspace=project.workspace_path,
             )
-            await _send_interactive(ctx, action.open_id, card)
+            if action.message_id:
+                receive_id, receive_id_type = _recipient(ctx, action.open_id)
+                await deliver_card(
+                    ctx.service,
+                    ctx.bridge,
+                    dedupe_key=generate_id("feishu-status-resolution"),
+                    recipient_id=receive_id,
+                    recipient_type=receive_id_type,
+                    intent_type="interaction",
+                    card=card,
+                    project_id=project.id,
+                    update_message_id=action.message_id,
+                    projection_key=f"menu:{action.message_id}",
+                    subject_type="project_status",
+                    subject_id=project.id,
+                    lifecycle_status="resolved",
+                    selected_action=action.option_key,
+                    resolved_by=action.open_id,
+                    resulting_state=project.execution_status,
+                )
+            else:
+                await _send_interactive(ctx, action.open_id, card)
     elif option.startswith("bind_dir_select:"):
-        await _bind_directory(ctx, action.open_id, option.split(":", 1)[1])
+        project = await _bind_directory(
+            ctx,
+            action.open_id,
+            option.split(":", 1)[1],
+            announce=False,
+        )
+        if project is not None:
+            await _resolve_menu_card(
+                ctx,
+                action,
+                "项目已打开",
+                (
+                    f"**当前项目**：{project.name or project.id}\n\n"
+                    f"**工作目录**：`{project.workspace_path}`"
+                ),
+            )
     elif option == "bind_dir_manual":
+        await _resolve_menu_card(ctx, action, "等待输入", "请回复要打开的绝对路径。")
         ctx.service.upsert_pending_intent(
             action.open_id,
             None,
@@ -579,10 +815,16 @@ async def _handle_menu_action(
             ctx,
             action.open_id,
             "输入目录",
-            "请直接回复要绑定的绝对路径。",
+            "请直接回复要打开的 Git 仓库绝对路径。",
         )
     elif option == "bind_dir_cancel":
-        await _send_card(ctx, action.open_id, "已取消", "没有更改目录绑定。")
+        chat_id = _chat_id(ctx, action.open_id)
+        pending = ctx.service.get_pending_intent(action.open_id, chat_id)
+        if pending is not None:
+            ctx.service.delete_pending_intent(action.open_id, chat_id)
+        await _resolve_menu_card(ctx, action, "已取消", "没有切换当前项目。")
+        if not action.message_id:
+            await _send_card(ctx, action.open_id, "已取消", "没有切换当前项目。")
 
 
 def _question_payload(

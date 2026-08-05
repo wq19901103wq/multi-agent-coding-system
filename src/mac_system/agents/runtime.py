@@ -1590,20 +1590,34 @@ class CodexRuntime(_JsonLineCliRuntime):
         final_text: str | None = None
         tool_calls: list[dict[str, Any]] = []
         cost_info: dict[str, Any] | None = None
+        last_transient_error: str | None = None
+        turn_completed = False
         for line in lines:
             event = ClaudeCodeRuntime._try_parse_json(line)
             if not event:
                 continue
             event_type = event.get("type")
-            if event_type in {"turn.failed", "error"}:
+            if event_type == "turn.failed":
                 return final_text, tool_calls, cost_info, str(
                     event.get("error") or event.get("message") or event
                 )
+            if event_type == "error":
+                # Codex may emit transport errors while reconnecting and then
+                # complete the same turn over HTTPS. Keep the diagnostic, but
+                # let the authoritative terminal event decide the outcome.
+                last_transient_error = str(
+                    event.get("error") or event.get("message") or event
+                )
+                continue
             if event_type == "item.completed":
                 item = event.get("item", {})
                 item_type = item.get("type")
                 if item_type == "agent_message":
                     final_text = item.get("text") or final_text
+                elif item_type == "error":
+                    last_transient_error = str(
+                        item.get("error") or item.get("message") or item
+                    )
                 elif item_type in {"command_execution", "file_change", "mcp_tool_call"}:
                     tool_calls.append({
                         "name": item_type,
@@ -1618,10 +1632,16 @@ class CodexRuntime(_JsonLineCliRuntime):
                         },
                     })
             elif event_type == "turn.completed":
+                turn_completed = True
                 usage = event.get("usage")
                 if isinstance(usage, dict):
                     cost_info = dict(usage)
-        return final_text, tool_calls, cost_info, None
+        return (
+            final_text,
+            tool_calls,
+            cost_info,
+            None if turn_completed else last_transient_error,
+        )
 
 
 class PiRuntime(_JsonLineCliRuntime):

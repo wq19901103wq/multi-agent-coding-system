@@ -38,6 +38,7 @@ class Orchestrator:
         self.scheduled = []
         self.steered = []
         self.cancelled = []
+        self.stopped = []
         self.new_threads = []
         self.steer_result = True
 
@@ -51,6 +52,10 @@ class Orchestrator:
     async def cancel_project(self, project_id, reason=""):
         self.cancelled.append((project_id, reason))
         await self.project_service.cancel_project(project_id, reason)
+
+    async def stop_root_turn(self, project_id):
+        self.stopped.append(project_id)
+        return True
 
     async def start_new_root_thread(self, project_id):
         self.new_threads.append(project_id)
@@ -129,6 +134,12 @@ def message(text):
         chat_id="oc-chat",
         chat_type="p2p",
     )
+
+
+def message_in_chat(text, chat_id):
+    item = message(text)
+    item.chat_id = chat_id
+    return item
 
 
 @pytest.mark.asyncio
@@ -222,10 +233,70 @@ async def test_message_while_native_question_waits_uses_same_turn_steer(ctx):
 @pytest.mark.asyncio
 async def test_explicit_create_without_description_waits_for_next_message(ctx):
     await handle_text_message(ctx, message("/create"))
-    assert ctx.service.get_pending_intent("ou-user").stage == "awaiting_description"
+    assert ctx.service.get_pending_intent("ou-user", "oc-chat").stage == "awaiting_description"
     await handle_text_message(ctx, message("做一个新工具"))
-    assert ctx.service.get_pending_intent("ou-user") is None
+    assert ctx.service.get_pending_intent("ou-user", "oc-chat") is None
     assert ctx.orchestrator.scheduled[0][1] == "做一个新工具"
+
+
+@pytest.mark.asyncio
+async def test_pending_project_prompts_are_isolated_by_chat_and_user(ctx):
+    ctx.service.upsert_pending_intent(
+        "ou-user", None, "awaiting_description", chat_id="oc-chat"
+    )
+    ctx.service.upsert_pending_intent(
+        "ou-user", None, "awaiting_description", chat_id="oc-other"
+    )
+
+    await handle_text_message(ctx, message_in_chat("另一个聊天的项目", "oc-other"))
+
+    assert ctx.service.get_pending_intent("ou-user", "oc-other") is None
+    assert ctx.service.get_pending_intent("ou-user", "oc-chat") is not None
+    other = ctx.service.get_chat_user_selected_project("oc-other", "ou-user")
+    assert other is not None
+    assert ctx.service.get_chat_user_selected_project("oc-chat", "ou-user") is None
+
+
+@pytest.mark.asyncio
+async def test_return_from_create_card_clears_pending_input_and_updates_card(ctx):
+    project = await ctx.service.create_project(
+        "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+    await handle_card_action(
+        ctx,
+        ButtonAction(
+            open_id="ou-user",
+            approval_id="",
+            action="menu",
+            state="",
+            decision_id=None,
+            option_key="create_prompt",
+            extras={},
+            chat_id="oc-chat",
+            message_id="om-menu",
+        ),
+    )
+    assert ctx.service.get_pending_intent("ou-user", "oc-chat") is not None
+
+    await handle_card_action(
+        ctx,
+        ButtonAction(
+            open_id="ou-user",
+            approval_id="",
+            action="menu",
+            state="",
+            decision_id=None,
+            option_key="show_menu",
+            extras={},
+            chat_id="oc-chat",
+            message_id="om-create",
+        ),
+    )
+
+    assert ctx.service.get_pending_intent("ou-user", "oc-chat") is None
+    assert ctx.bridge.updates[-1][0] == "om-create"
+    await handle_text_message(ctx, message("继续修改当前项目"))
+    assert ctx.orchestrator.scheduled[-1] == (project.id, "继续修改当前项目")
 
 
 @pytest.mark.asyncio
@@ -259,7 +330,8 @@ async def test_newthread_is_explicit_project_control(ctx):
 
     assert ctx.orchestrator.new_threads == [project.id]
     card = ctx.bridge.cards[-1][2]
-    assert card["header"]["title"]["content"] == "已开始新的 Codex 会话"
+    assert card["header"]["title"]["content"] == "当前项目已开始新对话"
+    assert project.workspace_path in card["body"]["elements"][0]["content"]
     assert "后续消息不会携带旧对话历史" in card["body"]["elements"][0]["content"]
 
 
@@ -270,7 +342,7 @@ async def test_help_presents_short_mobile_commands(ctx):
     markdown = ctx.bridge.cards[-1][2]["body"]["elements"][0]["content"]
     for command in (
         "/create", "/c", "/proj", "/ls", "/use", "/s", "/info", "/i",
-        "/new", "/n", "/bind", "/b", "/unbind", "/u", "/pause", "/p",
+        "/new", "/n", "/open", "/o", "/bind", "/b", "/unbind", "/u", "/pause", "/p",
         "/resume", "/r", "/stop", "/x", "/menu", "/m", "/help", "/h",
     ):
         assert f"`{command}" in markdown
@@ -290,18 +362,19 @@ async def test_readable_new_alias_resets_current_project_thread(ctx):
 
 
 @pytest.mark.asyncio
-async def test_short_cancel_alias_controls_selected_project(ctx):
+async def test_short_stop_alias_interrupts_turn_without_cancelling_project(ctx):
     project = await ctx.service.create_project(
         "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
     )
 
     await handle_text_message(ctx, message("/x"))
 
-    assert ctx.orchestrator.cancelled[0][0] == project.id
+    assert ctx.orchestrator.stopped == [project.id]
+    assert ctx.service.require_project(project.id).status == "active"
 
 
 @pytest.mark.asyncio
-async def test_bind_directory_preserves_existing_project_and_targets_next_project(
+async def test_open_directory_immediately_selects_project_and_routes_next_message(
     ctx, tmp_path, monkeypatch
 ):
     existing = await ctx.service.create_project(
@@ -320,21 +393,135 @@ async def test_bind_directory_preserves_existing_project_and_targets_next_projec
 
     await handle_text_message(ctx, message(f"/bind {repository}"))
 
-    binding = ctx.service.get_chat_directory_binding("oc-chat")
-    assert binding is not None
-    assert binding.directory == str(repository)
+    assert ctx.service.get_chat_directory_binding("oc-chat") is None
     assert ctx.service.require_project(existing.id).status == "active"
-    assert ctx.service.get_chat_user_selected_project("oc-chat", "ou-user") is None
-
-    await handle_text_message(ctx, message("/create 修复已有仓库的 README"))
     selected = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
     assert selected is not None
     assert selected.id != existing.id
     assert selected.workspace_path == str(repository)
+    assert ctx.orchestrator.scheduled == []
+
+    await handle_text_message(ctx, message("修复已有仓库的 README"))
     assert ctx.orchestrator.scheduled[-1] == (
         selected.id,
         "修复已有仓库的 README",
     )
+
+
+@pytest.mark.asyncio
+async def test_open_directory_then_newthread_targets_opened_project(
+    ctx, tmp_path, monkeypatch
+):
+    old = await ctx.service.create_project(
+        "old", "feature", "old", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+    repository = (tmp_path / "opened-repository").resolve()
+    repository.mkdir()
+    monkeypatch.setattr(
+        "mac_system.core.project_service.path_within_allowed_bind_roots",
+        lambda _path: True,
+    )
+
+    await handle_text_message(ctx, message(f"/open {repository}"))
+    opened = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert opened is not None and opened.id != old.id
+
+    await handle_text_message(ctx, message("/new"))
+    assert ctx.orchestrator.new_threads == [opened.id]
+
+
+@pytest.mark.asyncio
+async def test_manual_absolute_path_is_answer_not_unknown_command(
+    ctx, tmp_path, monkeypatch
+):
+    repository = (tmp_path / "manual-repository").resolve()
+    repository.mkdir()
+    monkeypatch.setattr(
+        "mac_system.core.project_service.path_within_allowed_bind_roots",
+        lambda _path: True,
+    )
+    ctx.service.upsert_pending_intent(
+        "ou-user",
+        None,
+        "awaiting_bind_dir",
+        chat_id="oc-chat",
+        chat_type="p2p",
+    )
+
+    await handle_text_message(ctx, message(str(repository)))
+
+    selected = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert selected is not None
+    assert selected.workspace_path == str(repository)
+    assert ctx.service.get_pending_intent("ou-user", "oc-chat") is None
+    card = ctx.bridge.cards[-1][2]
+    assert card["header"]["title"]["content"] == "项目已打开"
+
+
+@pytest.mark.asyncio
+async def test_known_command_supersedes_pending_manual_path(ctx):
+    ctx.service.upsert_pending_intent(
+        "ou-user",
+        None,
+        "awaiting_bind_dir",
+        chat_id="oc-chat",
+        chat_type="p2p",
+    )
+
+    await handle_text_message(ctx, message("/info"))
+
+    assert ctx.service.get_pending_intent("ou-user", "oc-chat") is None
+    card = ctx.bridge.cards[-1][2]
+    assert card["header"]["title"]["content"] == "当前项目"
+
+
+@pytest.mark.asyncio
+async def test_missing_explicit_selection_never_falls_back_to_recent_project(ctx):
+    old = await ctx.service.create_project(
+        "old", "feature", "old", creator_open_id="ou-user", feishu_chat_id="oc-other"
+    )
+
+    await handle_text_message(ctx, message("创建当前聊天自己的项目"))
+
+    selected = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert selected is not None and selected.id != old.id
+    assert ctx.orchestrator.scheduled == [(selected.id, "创建当前聊天自己的项目")]
+
+
+@pytest.mark.asyncio
+async def test_current_card_uses_selected_project_workspace(ctx):
+    project = await ctx.service.create_project(
+        "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+
+    await handle_text_message(ctx, message("/info"))
+
+    card = ctx.bridge.cards[-1][2]
+    assert card["header"]["title"]["content"] == "当前项目"
+    markdown = card["body"]["elements"][0]["content"]
+    assert project.workspace_path in markdown
+    assert "绑定目录" not in markdown
+
+
+@pytest.mark.asyncio
+async def test_legacy_future_directory_binding_is_opened_on_next_message(
+    ctx, tmp_path, monkeypatch
+):
+    repository = (tmp_path / "legacy-bound-repository").resolve()
+    repository.mkdir()
+    monkeypatch.setattr(
+        "mac_system.core.project_service.path_within_allowed_bind_roots",
+        lambda _path: True,
+    )
+    ctx.service.bind_directory_to_chat("oc-chat", str(repository), bound_by="ou-user")
+
+    await handle_text_message(ctx, message("检查这个已有项目"))
+
+    selected = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert selected is not None
+    assert selected.workspace_path == str(repository)
+    assert ctx.service.get_chat_directory_binding("oc-chat") is None
+    assert ctx.orchestrator.scheduled == [(selected.id, "检查这个已有项目")]
 
 
 @pytest.mark.asyncio
@@ -425,10 +612,10 @@ async def test_unknown_card_action_is_rejected_without_side_effect(ctx):
 
 
 @pytest.mark.asyncio
-async def test_cancel_command_cancels_selected_project(ctx):
+async def test_cancel_command_interrupts_selected_project_but_keeps_it_active(ctx):
     project = await ctx.service.create_project(
         "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
     )
     await handle_text_message(ctx, message("/cancel"))
-    assert ctx.orchestrator.cancelled[0][0] == project.id
-    assert ctx.service.require_project(project.id).status == "cancelled"
+    assert ctx.orchestrator.stopped == [project.id]
+    assert ctx.service.require_project(project.id).status == "active"

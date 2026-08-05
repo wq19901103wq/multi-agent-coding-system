@@ -50,8 +50,8 @@ ls -lt server_*.log | head
 ## 调试顺序
 
 1. 日志确认 WebSocket connected；
-2. `/whoami` 确认事件接收；
-3. `/current` 确认会话项目与目录；
+2. `/help` 确认事件接收和当前可用命令；
+3. `/info` 确认当前项目与真实工作目录；
 4. 查看 RootAgentSession 的 thread id 和 execution status；
 5. 检查 NotificationOutbox/CardProjection 是否与飞书卡片一致；
 6. app-server 协议异常再查看 Root Agent event，不用旧状态机字段推断。

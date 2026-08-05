@@ -159,6 +159,37 @@ def test_codex_jsonl_parser_extracts_final_message_and_usage():
     assert error is None
 
 
+def test_codex_jsonl_parser_treats_reconnect_error_as_transient_after_completion():
+    runtime = CodexRuntime(Path("codex"))
+    final, tools, cost, error = runtime.parse_events([
+        json.dumps({"type": "error", "message": "Reconnecting... 2/5"}),
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "error", "message": "Falling back to HTTPS"},
+        }),
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "done"},
+        }),
+        json.dumps({"type": "turn.completed", "usage": {"output_tokens": 1}}),
+    ])
+    assert final == "done"
+    assert tools == []
+    assert cost == {"output_tokens": 1}
+    assert error is None
+
+
+def test_codex_jsonl_parser_reports_error_without_successful_terminal_event():
+    runtime = CodexRuntime(Path("codex"))
+    final, tools, cost, error = runtime.parse_events([
+        json.dumps({"type": "error", "message": "request timed out"}),
+    ])
+    assert final is None
+    assert tools == []
+    assert cost is None
+    assert error == "request timed out"
+
+
 @pytest.mark.asyncio
 async def test_runtime_router_honors_explicit_provider(tmp_path):
     class CountingRuntime(FakeRuntime):

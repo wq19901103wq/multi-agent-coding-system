@@ -25,9 +25,11 @@ from mac_system.core.root_agent import (
     _native_activity_card,
     _native_child_summary,
     _native_status_card,
+    _record_progress_small_step,
     _progress_card_body,
     _provider_selection_guidance,
     _root_profile_key,
+    _start_progress_big_step,
     _turn_completion_card,
     resolve_root_user_input,
 )
@@ -415,13 +417,32 @@ def test_progress_card_reports_elapsed_and_stale_wait_without_fake_activity():
         narrative="已定位到 SSE 完成事件没有被前端识别，正在补回归测试。",
         child_summary="运行中 2，已完成 1",
     )
+    _start_progress_big_step(state, "定位消息完成状态")
+    _record_progress_small_step(
+        state,
+        key="inspect-sse",
+        label="检查 SSE 完成事件",
+        status="completed",
+        detail="已确认前端没有识别完成事件",
+    )
+    _start_progress_big_step(state, "补充回归测试")
+    _record_progress_small_step(
+        state,
+        key="run-tests",
+        label="正在运行相关测试",
+        status="running",
+    )
 
     fresh = _progress_card_body(state, now_monotonic=125.0)
     assert "已用时间**：25 秒" in fresh
     assert "最近事件" in fresh
     assert "10 秒前" in fresh
     assert "子 Agent**：运行中 2，已完成 1" in fresh
-    assert "进展说明**：已定位到 SSE 完成事件没有被前端识别" in fresh
+    assert "大步骤**" in fresh
+    assert "✅ 定位消息完成状态" in fresh
+    assert "▶️ 补充回归测试" in fresh
+    assert "当前大步骤 · 小步骤**" in fresh
+    assert "正在运行相关测试" in fresh
     assert "等待模型或工具返回" not in fresh
 
     stale = _progress_card_body(state, now_monotonic=150.0)
@@ -430,25 +451,47 @@ def test_progress_card_reports_elapsed_and_stale_wait_without_fake_activity():
     assert "暂未收到新的 Codex 事件" in stale
 
 
-def test_progress_narrative_survives_later_tool_activity(root_context):
-    _session, engine = root_context
-    engine._update_progress(
-        "proj-root",
-        label="Codex 已汇报阶段进展，正在继续处理",
-        narrative="已定位共同根因，正在补测试。",
-        detail="",
+def test_progress_card_marks_collapsed_history_instead_of_silently_dropping_it():
+    state = _ProgressState(
+        started_monotonic=100.0,
+        last_event_monotonic=100.0,
+        last_event_at=datetime(2026, 8, 5, 1, 2, 3, tzinfo=timezone.utc),
+        label="正在处理",
     )
-    engine._update_progress(
-        "proj-root",
+    for index in range(10):
+        _start_progress_big_step(state, f"大步骤 {index}")
+    for index in range(9):
+        _record_progress_small_step(
+            state,
+            key=f"small-{index}",
+            label=f"小步骤 {index}",
+            status="completed",
+        )
+
+    body = _progress_card_body(state, now_monotonic=101.0)
+
+    assert "更早 2 个大步骤已收起" in body
+    assert "更早 2 个小步骤已收起" in body
+    assert "大步骤 0" not in body
+    assert "小步骤 0" not in body
+
+
+def test_progress_big_step_survives_later_tool_activity(root_context):
+    _session, engine = root_context
+    engine._update_progress("proj-root", label="正在检查或验证项目")
+    state = engine._progress["proj-root"]
+    _start_progress_big_step(state, "已定位共同根因，正在补测试。")
+    _record_progress_small_step(
+        state,
+        key="exec-1",
         label="正在检查或验证项目",
+        status="running",
         detail="工具：终端命令；目录：site",
     )
 
-    state = engine._progress["proj-root"]
-    assert state.narrative == "已定位共同根因，正在补测试。"
     body = _progress_card_body(state)
-    assert "进展说明**：已定位共同根因，正在补测试。" in body
-    assert "补充信息**：工具：终端命令；目录：site" in body
+    assert "▶️ 已定位共同根因，正在补测试。" in body
+    assert "工具：终端命令；目录：site" in body
 
 
 @pytest.mark.asyncio
@@ -492,6 +535,8 @@ async def test_native_commentary_remains_visible_during_following_tool(root_cont
     assert state.label == "正在检查或验证项目"
     assert state.narrative == "已定位共同根因，正在补齐连续两轮测试。"
     assert state.detail == "工具：终端命令；目录：site"
+    assert state.big_steps[-1].title == "已定位共同根因，正在补齐连续两轮测试。"
+    assert state.big_steps[-1].small_steps[-1].detail == "工具：终端命令；目录：site"
 
 
 @pytest.mark.asyncio
@@ -559,6 +604,29 @@ def test_native_turn_terminal_status_closes_shared_progress_projection():
         "red",
         "failed",
     )
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_does_not_publish_partial_commentary_as_final(
+    root_context,
+):
+    session, engine = root_context
+    project = session.get(Project, "proj-root")
+
+    await engine._publish_final(
+        project,
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="turn-interrupted",
+            status="interrupted",
+            final_message="我准备执行下一步。",
+            events=(),
+        ),
+    )
+
+    from mac_system.models import NotificationOutbox
+
+    assert session.exec(select(NotificationOutbox)).all() == []
 
 
 @pytest.mark.asyncio
@@ -959,6 +1027,14 @@ async def test_external_provider_keeps_public_text_with_tool_status(root_context
     assert "sk-test-secret" not in state.narrative
     assert "选择原因：需要宿主自动化完成部署" in state.detail
     assert "工具：bash" in state.detail
+    body = _progress_card_body(state)
+    assert "当前执行主体**：Pi" in body
+    assert "模型**：后端未报告" in body
+    assert "选择原因**：需要宿主自动化完成部署" in body
+    assert "交给 Pi 独立处理" in body
+    assert "服务已重启，正在核对健康检查" in body
+    assert len(state.big_steps) == 1
+    assert body.count("需要宿主自动化完成部署") == 1
 
 
 @pytest.mark.asyncio

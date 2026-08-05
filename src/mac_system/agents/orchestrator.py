@@ -113,3 +113,16 @@ class AgentOrchestrator:
             await self._engine().interrupt(project.id)
         except Exception:
             pass
+
+    async def stop_root_turn(self, project_id: str) -> bool:
+        """Interrupt current work while preserving the Project and Root thread."""
+
+        running_task_ids = [
+            task.id for task in self.project_service._running_tasks(project_id)
+        ]
+        for task_id in running_task_ids:
+            try:
+                self.runtime.cancel(task_id)
+            except Exception:
+                pass
+        return await self._engine().interrupt(project_id)
