@@ -922,6 +922,13 @@ class ProjectService:
     def mark_event_processed(self, event_id: str, event_type: str) -> None:
         if event_id:
             self.session.merge(ProcessedEvent(event_id=event_id, event_type=event_type))
+            # Event ownership must be durable before the handler crosses an
+            # async boundary (turn/steer, card delivery, or a native tool
+            # response). Leaving this INSERT pending lets SQLAlchemy autoflush
+            # it on the next read and hold SQLite's single writer lock for the
+            # whole network/model await, blocking Root event projection and
+            # external AgentSession creation.
+            self.session.commit()
 
     def log_feishu_event(
         self,

@@ -194,3 +194,10 @@ def test_restart_recovery_supersedes_only_stale_projection_updates(service):
     assert stale.status == "terminal_failed"
     assert stale.last_error == "restart recovery"
     assert unrelated.status == "pending"
+
+
+def test_processed_event_claim_commits_before_async_handler_boundary(service):
+    service.mark_event_processed("evt-1", "message")
+
+    assert not service.session.in_transaction()
+    assert service.is_event_processed("evt-1") is True

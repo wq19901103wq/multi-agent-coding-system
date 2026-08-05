@@ -16,6 +16,7 @@ from mac_system.agents.runtime import AgentRuntimeResult, FakeRuntime
 from mac_system.config import Settings
 from mac_system.core.project_service import ProjectService
 from mac_system.core.root_agent import (
+    _external_progress_detail,
     RootAgentEngine,
     _ProgressState,
     _codex_role_overrides,
@@ -213,9 +214,9 @@ async def test_explicit_new_thread_replaces_history_without_changing_project(
             self.event_handler = kwargs.get("event_handler")
             self.server_request_handler = kwargs.get("server_request_handler")
 
-        async def create_thread(self):
+        async def create_thread(self, *, session_start_source=None):
             self.thread_id = f"thread-{len(created) + 1}"
-            created.append(self.thread_id)
+            created.append((self.thread_id, session_start_source))
             return self.thread_id
 
         async def resume_thread(self, thread_id):
@@ -242,21 +243,30 @@ async def test_explicit_new_thread_replaces_history_without_changing_project(
 
     old_thread, new_thread = await engine.start_new_thread("proj-root")
 
-    assert (old_thread, new_thread) == ("thread-1", "thread-2")
-    assert created == ["thread-1", "thread-2"]
+    assert (old_thread, new_thread) == ("thread-1", None)
+    assert created == [("thread-1", None)]
     assert closed == ["thread-1"]
     root = session.exec(select(RootAgentSession)).one()
-    assert root.native_thread_id == "thread-2"
+    assert root.native_thread_id is None
     assert session.get(Project, "proj-root").workspace_path == workspace_before
     event = session.exec(
         select(EventLog).where(
-            EventLog.message == "Native Codex thread replaced by explicit user command"
+            EventLog.message == "Native Codex thread reset by explicit user command"
         )
     ).one()
     assert event.meta == {
         "old_thread_id": "thread-1",
-        "new_thread_id": "thread-2",
+        "new_thread_id": None,
+        "replacement_pending": True,
     }
+
+    await engine.run("proj-root", "新会话第一轮")
+
+    assert created == [("thread-1", None), ("thread-2", "clear")]
+    assert session.exec(select(RootAgentSession)).one().native_thread_id == "thread-2"
+    assert "root_thread_reset_pending" not in (
+        session.get(Project, "proj-root").context or {}
+    )
 
 
 @pytest.mark.asyncio
@@ -345,8 +355,35 @@ def test_native_activity_cards_cover_official_item_lifecycle_without_fake_comple
     ) is None
     assert _native_activity_card(
         "item/completed",
-        {"type": "reasoning", "text": "internal"},
-    ) is None
+        {
+            "type": "reasoning",
+            "summary": ["先定位协议边界，再补回归测试。"],
+            "content": ["不应展示的内部推理"],
+        },
+    ) == ("Codex 已完成一轮分析，正在继续处理", "blue", "running")
+
+
+def test_native_activity_detail_shows_tool_identity_without_arguments_or_output():
+    from mac_system.core.root_agent import _native_activity_detail
+
+    assert _native_activity_detail(
+        {
+            "type": "mcpToolCall",
+            "server": "browser",
+            "tool": "click",
+            "arguments": {"secret": "do-not-show"},
+        }
+    ) == "工具：browser/click"
+    detail = _native_activity_detail(
+        {
+            "type": "commandExecution",
+            "cwd": "/workspace/site",
+            "command": "curl -H 'Authorization: secret' example.com",
+            "aggregatedOutput": "secret output",
+        }
+    )
+    assert detail == "工具：终端命令；目录：site"
+    assert "secret" not in detail
 
 
 def test_native_retry_error_updates_progress_without_ending_turn():
@@ -375,6 +412,7 @@ def test_progress_card_reports_elapsed_and_stale_wait_without_fake_activity():
         last_event_monotonic=115.0,
         last_event_at=datetime(2026, 8, 5, 1, 2, 3, tzinfo=timezone.utc),
         label="正在检查或验证项目",
+        narrative="已定位到 SSE 完成事件没有被前端识别，正在补回归测试。",
         child_summary="运行中 2，已完成 1",
     )
 
@@ -383,12 +421,111 @@ def test_progress_card_reports_elapsed_and_stale_wait_without_fake_activity():
     assert "最近事件" in fresh
     assert "10 秒前" in fresh
     assert "子 Agent**：运行中 2，已完成 1" in fresh
+    assert "进展说明**：已定位到 SSE 完成事件没有被前端识别" in fresh
     assert "等待模型或工具返回" not in fresh
 
     stale = _progress_card_body(state, now_monotonic=150.0)
     assert "已用时间**：50 秒" in stale
     assert "35 秒前" in stale
     assert "暂未收到新的 Codex 事件" in stale
+
+
+def test_progress_narrative_survives_later_tool_activity(root_context):
+    _session, engine = root_context
+    engine._update_progress(
+        "proj-root",
+        label="Codex 已汇报阶段进展，正在继续处理",
+        narrative="已定位共同根因，正在补测试。",
+        detail="",
+    )
+    engine._update_progress(
+        "proj-root",
+        label="正在检查或验证项目",
+        detail="工具：终端命令；目录：site",
+    )
+
+    state = engine._progress["proj-root"]
+    assert state.narrative == "已定位共同根因，正在补测试。"
+    body = _progress_card_body(state)
+    assert "进展说明**：已定位共同根因，正在补测试。" in body
+    assert "补充信息**：工具：终端命令；目录：site" in body
+
+
+@pytest.mark.asyncio
+async def test_native_commentary_remains_visible_during_following_tool(root_context):
+    _session, engine = root_context
+    await engine._project_native_activity(
+        "proj-root",
+        AgentEvent(
+            "item/completed",
+            "thread-1",
+            "turn-1",
+            {
+                "item": {
+                    "type": "agentMessage",
+                    "id": "commentary-1",
+                    "phase": "commentary",
+                    "text": "已定位共同根因，正在补齐连续两轮测试。",
+                }
+            },
+        ),
+    )
+    await engine._project_native_activity(
+        "proj-root",
+        AgentEvent(
+            "item/started",
+            "thread-1",
+            "turn-1",
+            {
+                "item": {
+                    "type": "commandExecution",
+                    "id": "exec-1",
+                    "status": "inProgress",
+                    "cwd": "/workspace/site",
+                }
+            },
+        ),
+    )
+    await engine._flush_progress_snapshots("proj-root")
+
+    state = engine._progress["proj-root"]
+    assert state.label == "正在检查或验证项目"
+    assert state.narrative == "已定位共同根因，正在补齐连续两轮测试。"
+    assert state.detail == "工具：终端命令；目录：site"
+
+
+@pytest.mark.asyncio
+async def test_progress_delivery_is_non_blocking_coalesced_and_flushable(
+    root_context, monkeypatch
+):
+    _session, engine = root_context
+    engine._progress_min_delivery_interval = 0
+    gate = asyncio.Event()
+    delivered = []
+
+    async def slow_delivery(project_id, *, event_identity):
+        delivered.append((project_id, event_identity))
+        await gate.wait()
+
+    monkeypatch.setattr(engine, "_publish_progress_snapshot", slow_delivery)
+
+    engine._queue_progress_snapshot("proj-root", event_identity="first")
+    await asyncio.sleep(0)
+    engine._queue_progress_snapshot("proj-root", event_identity="second")
+    engine._queue_progress_snapshot("proj-root", event_identity="latest")
+
+    assert delivered == [("proj-root", "first")]
+    assert engine._pending_progress_delivery == {"proj-root": "latest"}
+
+    gate.set()
+    await engine._flush_progress_snapshots("proj-root")
+
+    assert delivered == [
+        ("proj-root", "first"),
+        ("proj-root", "latest"),
+    ]
+    assert engine._pending_progress_delivery == {}
+    assert engine._progress_delivery_tasks == {}
 
 
 def test_native_child_summary_uses_official_states_without_thread_ids():
@@ -780,6 +917,14 @@ def test_external_progress_is_user_facing_and_does_not_expose_tool_input():
     label = _external_progress_label("codex", "tool", detail)
     assert label == "Codex 正在查看项目资料"
     assert "/secret/path" not in label
+    assert _external_progress_detail("tool", detail) == "工具：Read"
+
+    assert _external_progress_detail(
+        "thinking", "不应展示的内部推理；token=sk-test-secret"
+    ) is None
+    assert _external_progress_label(
+        "pi", "commentary", "正在核对协议"
+    ) == "Pi 已汇报阶段进展，正在继续处理"
 
 
 def test_external_tool_summary_excludes_inputs_and_outputs():
@@ -792,6 +937,28 @@ def test_external_tool_summary_excludes_inputs_and_outputs():
     )
     assert summary == {"count": 3, "names": ["Read", "Bash"]}
     assert "secret" not in str(summary)
+
+
+@pytest.mark.asyncio
+async def test_external_provider_keeps_public_text_with_tool_status(root_context):
+    _session, engine = root_context
+    await engine._project_external_agent_activity(
+        "proj-root",
+        "agent-1",
+        "pi",
+        "需要宿主自动化完成部署",
+        "Pi 正在执行检查或测试",
+        observed_detail="工具：bash",
+        narrative="服务已重启，正在核对健康检查；token=sk-test-secret",
+    )
+    await engine._flush_progress_snapshots("proj-root")
+
+    state = engine._progress["proj-root"]
+    assert state.label == "Pi 正在执行检查或测试"
+    assert state.narrative.startswith("服务已重启，正在核对健康检查")
+    assert "sk-test-secret" not in state.narrative
+    assert "选择原因：需要宿主自动化完成部署" in state.detail
+    assert "工具：bash" in state.detail
 
 
 @pytest.mark.asyncio

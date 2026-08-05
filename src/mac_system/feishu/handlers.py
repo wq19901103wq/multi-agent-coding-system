@@ -228,6 +228,25 @@ async def _handle_command(
     text: str,
 ) -> None:
     command, _, argument = text.partition(" ")
+    command = {
+        "/h": "/help",
+        "/m": "/menu",
+        "/c": "/create",
+        "/ls": "/projects",
+        "/proj": "/projects",
+        "/s": "/switch",
+        "/use": "/switch",
+        "/i": "/current",
+        "/info": "/current",
+        "/n": "/newthread",
+        "/new": "/newthread",
+        "/b": "/bind",
+        "/u": "/unbind",
+        "/p": "/pause",
+        "/r": "/resume",
+        "/x": "/cancel",
+        "/stop": "/cancel",
+    }.get(command.lower(), command.lower())
     argument = argument.strip()
     open_id = msg.open_id
 
@@ -245,13 +264,18 @@ async def _handle_command(
                 "MAC 使用帮助",
                 (
                     "直接发送需求、问题或修改意见即可。\n\n"
-                    "- `/create <需求>`：新建一个独立项目\n"
-                    "- `/projects`：查看当前会话项目\n"
-                    "- `/switch [项目ID]`：切换项目\n"
-                    "- `/current`：查看当前项目和目录\n"
-                    "- `/newthread`：保留项目目录，开始全新的 Codex 会话\n"
-                    "- `/bind [目录]`、`/unbind`：管理工作目录\n"
-                    "- `/pause`、`/resume`、`/cancel`：控制当前项目"
+                    "- `/create` 或 `/c` 加需求：新建项目\n"
+                    "- `/proj` 或 `/ls`：查看项目\n"
+                    "- `/use` 或 `/s` 加项目 ID：切换项目\n"
+                    "- `/info` 或 `/i`：当前项目和目录\n"
+                    "- `/new` 或 `/n`：开始全新的 Codex 会话\n"
+                    "- `/bind` 或 `/b` 加目录：绑定目录\n"
+                    "- `/unbind` 或 `/u`：解绑目录\n"
+                    "- `/pause` 或 `/p`：暂停\n"
+                    "- `/resume` 或 `/r`：恢复\n"
+                    "- `/stop` 或 `/x`：取消\n"
+                    "- `/menu` 或 `/m`：打开操作菜单\n"
+                    "- `/help` 或 `/h`：显示本帮助"
                 ),
             )
         return
@@ -346,7 +370,7 @@ async def _handle_command(
         ctx,
         open_id,
         "未知命令",
-        "发送 `/help` 查看可用快捷命令；普通需求无需命令，直接发送即可。",
+        "发送 `/h` 查看快捷命令；普通需求无需命令，直接发送即可。",
         color="orange",
     )
 

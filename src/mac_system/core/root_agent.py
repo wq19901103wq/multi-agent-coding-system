@@ -73,6 +73,7 @@ class _ProgressState:
     last_event_at: datetime
     label: str
     color: str = "purple"
+    narrative: str | None = None
     detail: str | None = None
     child_summary: str | None = None
 
@@ -262,6 +263,8 @@ def _external_progress_label(provider: str, kind: str, detail: str) -> str | Non
     }.get(provider, provider)
     if kind == "thinking":
         return f"{display} 正在分析任务"
+    if kind == "commentary":
+        return f"{display} 已汇报阶段进展，正在继续处理"
     if kind != "tool":
         return None
     try:
@@ -279,6 +282,19 @@ def _external_progress_label(provider: str, kind: str, detail: str) -> str | Non
     else:
         action = "正在继续执行任务"
     return f"{display} {action}"
+
+
+def _external_progress_detail(kind: str, detail: str) -> str | None:
+    """Keep provider activity useful while excluding tool arguments and output."""
+
+    if kind != "tool":
+        return None
+    try:
+        payload = json.loads(detail) or {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    name = str(payload.get("name") or payload.get("tool") or "").strip()
+    return f"工具：{name[:120]}" if name else "工具：编码工具"
 
 
 def _external_tool_summary(tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
@@ -320,6 +336,8 @@ def _progress_card_body(
     ]
     if state.child_summary:
         lines.append(f"**子 Agent**：{state.child_summary}")
+    if state.narrative:
+        lines.append(f"**进展说明**：{state.narrative}")
     if state.detail:
         lines.append(f"**补充信息**：{state.detail}")
     if since_event >= 30:
@@ -375,8 +393,6 @@ def _durable_native_event(event: AgentEvent) -> AgentEvent | None:
     item = payload.get("item")
     if event.kind in {"item/started", "item/completed"} and isinstance(item, dict):
         item_type = str(item.get("type") or "")
-        if item_type == "reasoning":
-            return None
         compact_item = {
             key: item[key]
             for key in (
@@ -389,6 +405,12 @@ def _durable_native_event(event: AgentEvent) -> AgentEvent | None:
                 "exitCode",
                 "kind",
                 "tool",
+                "server",
+                "namespace",
+                "pluginId",
+                "durationMs",
+                "path",
+                "phase",
                 "senderThreadId",
                 "receiverThreadIds",
                 "model",
@@ -451,6 +473,18 @@ def _native_activity_card(
             return None
         return text[:1_200], "blue", "running"
 
+    if item_type == "reasoning":
+        if started:
+            return "Codex 正在分析任务", "purple", "running"
+        return "Codex 已完成一轮分析，正在继续处理", "blue", "running"
+
+    if item_type == "plan":
+        if started:
+            return "正在整理执行步骤", "purple", "running"
+        text = str(item.get("text") or "").strip()
+        label = f"执行计划：{text[:600]}" if text else "执行计划已更新"
+        return label, "blue", "running"
+
     labels = {
         "commandExecution": (
             "正在检查或验证项目",
@@ -487,6 +521,21 @@ def _native_activity_card(
             "子 Agent 已返回，Codex 继续处理",
             "子 Agent 未完成任务，Codex 正在分析",
         ),
+        "contextCompaction": (
+            "正在整理较长会话的上下文",
+            "上下文已整理，Codex 继续处理",
+            "上下文整理未完成，Codex 正在分析",
+        ),
+        "imageView": (
+            "正在查看项目图片",
+            "图片已查看，Codex 继续处理",
+            "图片查看未完成，Codex 正在分析",
+        ),
+        "imageGeneration": (
+            "正在生成图片",
+            "图片已生成，Codex 继续处理",
+            "图片生成未完成，Codex 正在分析",
+        ),
     }
     wording = labels.get(item_type)
     if wording is None:
@@ -496,6 +545,43 @@ def _native_activity_card(
     if failed:
         return wording[2], "orange", "running"
     return wording[1], "green", "running"
+
+
+def _native_activity_detail(item: dict[str, Any]) -> str:
+    """Describe the active native tool without leaking arguments or output."""
+
+    item_type = str(item.get("type") or "")
+    if item_type == "commandExecution":
+        cwd = str(item.get("cwd") or "").strip()
+        return f"工具：终端命令；目录：{Path(cwd).name}" if cwd else "工具：终端命令"
+    if item_type == "fileChange":
+        paths = [
+            str(change.get("path") or "").strip()
+            for change in (item.get("changes") or [])
+            if isinstance(change, dict) and str(change.get("path") or "").strip()
+        ]
+        if paths:
+            shown = "、".join(paths[:3])
+            suffix = f" 等 {len(paths)} 个文件" if len(paths) > 3 else ""
+            return f"文件：{shown}{suffix}"
+        return "工具：文件修改"
+    if item_type == "mcpToolCall":
+        server = str(item.get("server") or "").strip()
+        tool = str(item.get("tool") or "").strip()
+        name = "/".join(part for part in (server, tool) if part)
+        return f"工具：{name}" if name else "工具：已连接能力"
+    if item_type == "dynamicToolCall":
+        namespace = str(item.get("namespace") or "").strip()
+        tool = str(item.get("tool") or "").strip()
+        name = "/".join(part for part in (namespace, tool) if part)
+        return f"工具：{name}" if name else "工具：外部编码能力"
+    if item_type in {"collabAgentToolCall", "subAgentActivity"}:
+        tool = str(item.get("tool") or item.get("kind") or "").strip()
+        return f"子 Agent 操作：{tool}" if tool else "子 Agent 正在执行任务"
+    if item_type == "imageView":
+        path = str(item.get("path") or "").strip()
+        return f"图片：{Path(path).name}" if path else "工具：图片查看"
+    return ""
 
 
 def _native_status_card(
@@ -544,6 +630,10 @@ class RootAgentEngine:
         self.store = RootSessionStore(session)
         self.project: Project | None = None
         self._progress: dict[str, _ProgressState] = {}
+        self._progress_delivery_tasks: dict[str, asyncio.Task[None]] = {}
+        self._pending_progress_delivery: dict[str, str] = {}
+        self._progress_last_delivery: dict[str, float] = {}
+        self._progress_min_delivery_interval = 1.5 if feishu_bridge is not None else 0.0
         self._agent_config = load_agent_config(settings.agent_config_path)
 
     async def run(self, project_id: str, trigger: str) -> TurnResult:
@@ -565,7 +655,7 @@ class RootAgentEngine:
                     last_event_at=datetime.now().astimezone(),
                     label="正在准备 Codex 项目上下文",
                 )
-                await self._publish_progress_snapshot(
+                self._queue_progress_snapshot(
                     project_id,
                     event_identity=generate_id("root-start"),
                 )
@@ -577,6 +667,7 @@ class RootAgentEngine:
                 result = await root.run_turn(trigger)
                 await self._stop_progress_heartbeat(heartbeat)
                 heartbeat = None
+                await self._flush_progress_snapshots(project_id)
                 self.store.set_turn(project_id, turn_id=None, status="idle")
                 refreshed = self.service.require_project(project_id)
                 if refreshed.execution_status != "waiting_user":
@@ -602,6 +693,10 @@ class RootAgentEngine:
             except BaseException as exc:
                 await self._stop_progress_heartbeat(heartbeat)
                 heartbeat = None
+                if isinstance(exc, asyncio.CancelledError):
+                    await self._cancel_progress_snapshots(project_id)
+                else:
+                    await self._flush_progress_snapshots(project_id)
                 if root is not None:
                     try:
                         await self._release_root(project_id, root)
@@ -671,12 +766,16 @@ class RootAgentEngine:
             return False
         return True
 
-    async def start_new_thread(self, project_id: str) -> tuple[str | None, str]:
-        """Start a fresh native Codex thread for an idle project.
+    async def start_new_thread(
+        self, project_id: str
+    ) -> tuple[str | None, str | None]:
+        """Detach an idle project from its current native Codex thread.
 
-        This deliberately uses Codex ``thread/start`` rather than ``thread/fork``:
-        the project and workspace stay the same, while old conversation history
-        is not copied into the new thread.
+        The replacement ``thread/start`` is deliberately deferred until the next
+        user turn. Codex does not persist an empty rollout, while Feishu message
+        handling and background turns may run on different event loops. Creating
+        and then closing an empty app-server thread here would therefore leave a
+        thread id that the next transport cannot resume.
         """
 
         lock = await get_default_lock_manager().acquire(project_id)
@@ -713,20 +812,24 @@ class RootAgentEngine:
                     )
 
             self.store.clear_native_thread(project_id)
-            root = await self._root_thread(project)
-            assert root.thread_id is not None
-            new_thread_id = root.thread_id
+            project.context = {
+                **(project.context or {}),
+                "root_thread_reset_pending": True,
+            }
+            project.updated_at = _now()
+            self.session.add(project)
             await self.service.log_event(
                 project_id,
                 "INFO",
-                "Native Codex thread replaced by explicit user command",
+                "Native Codex thread reset by explicit user command",
                 {
                     "old_thread_id": old_thread_id,
-                    "new_thread_id": new_thread_id,
+                    "new_thread_id": None,
+                    "replacement_pending": True,
                 },
             )
             self.session.commit()
-            return old_thread_id, new_thread_id
+            return old_thread_id, None
 
     async def _root_thread(self, project: Project) -> CodexAppServerThread:
         current_loop = asyncio.get_running_loop()
@@ -808,10 +911,20 @@ class RootAgentEngine:
             if durable.native_thread_id and durable.status != "failed" and profile_current:
                 await root.resume_thread(durable.native_thread_id)
             else:
-                native_id = await root.create_thread()
+                reset_pending = bool(
+                    (project.context or {}).get("root_thread_reset_pending")
+                )
+                if reset_pending:
+                    native_id = await root.create_thread(
+                        session_start_source="clear"
+                    )
+                else:
+                    native_id = await root.create_thread()
                 self.store.set_native_thread(project.id, native_id)
+                next_context = dict(project.context or {})
+                next_context.pop("root_thread_reset_pending", None)
                 project.context = {
-                    **(project.context or {}),
+                    **next_context,
                     "orchestration_mode": "root_agent",
                     "root_agent_profile": root_profile,
                 }
@@ -963,23 +1076,28 @@ class RootAgentEngine:
             async def on_progress(kind: str, detail: str) -> None:
                 nonlocal last_activity
                 activity = _external_progress_label(provider, kind, detail)
-                if activity is None or activity == last_activity:
+                if activity is None:
+                    return
+                if activity == last_activity and kind != "commentary":
                     return
                 last_activity = activity
-                with Session(self.bind) as progress_session:
-                    progress_agent = progress_session.get(AgentSession, agent.id)
-                    if progress_agent is not None:
-                        RootSessionStore(progress_session).update_agent(
-                            progress_agent,
-                            status="running",
-                            latest_message=activity,
-                        )
+                # The progress card is the live projection. Persisting every
+                # transient activity string in a second transaction creates
+                # avoidable SQLite writer contention with the outbox while the
+                # provider is running. The durable AgentSession is written at
+                # start and once at completion.
                 await self._project_external_agent_activity(
                     project.id,
                     agent.id,
                     provider,
                     selection_reason,
                     activity,
+                    observed_detail=_external_progress_detail(kind, detail),
+                    narrative=(
+                        " ".join(redact_text(detail).split())[:1_200]
+                        if kind == "commentary"
+                        else None
+                    ),
                 )
 
             result = await self.runtime.execute(
@@ -1022,11 +1140,25 @@ class RootAgentEngine:
                 "cost": result.cost_info,
                 "tool_calls": result.tool_calls,
             }
-            self.store.update_agent(
-                agent,
-                status="completed" if result.success else "failed",
-                latest_message=answer or failure_detail,
-                result=stored_payload,
+            # Finish any in-flight card transaction before committing the
+            # authoritative provider result. This keeps presentation writes
+            # from turning a successful provider execution into a failed Root
+            # tool call on SQLite's single-writer boundary.
+            await self._flush_progress_snapshots(project.id)
+            with Session(self.bind) as result_session:
+                persisted_agent = result_session.get(AgentSession, agent.id)
+                if persisted_agent is None:
+                    raise RuntimeError(f"external agent session disappeared: {agent.id}")
+                RootSessionStore(result_session).update_agent(
+                    persisted_agent,
+                    status="completed" if result.success else "failed",
+                    latest_message=answer or failure_detail,
+                    result=stored_payload,
+                )
+            completion_activity = (
+                f"{display} 已完成外部任务，结果已返回 Codex"
+                if result.success
+                else f"{display} 未完成外部任务，错误已返回 Codex"
             )
             estimated_cost = (result.cost_info or {}).get("estimated_cost_usd")
             if isinstance(estimated_cost, (int, float)):
@@ -1036,6 +1168,20 @@ class RootAgentEngine:
                 project.updated_at = _now()
                 self.session.add(project)
                 self.session.commit()
+            await self._project_external_agent_activity(
+                project.id,
+                agent.id,
+                provider,
+                selection_reason,
+                completion_activity,
+                observed_detail=(
+                    f"工具调用：{len(result.tool_calls)} 次"
+                    if result.tool_calls
+                    else "未调用工具"
+                ),
+                narrative=(answer or failure_detail or "")[:1_200] or None,
+            )
+            await self._flush_progress_snapshots(project.id)
             return {
                 "success": result.success,
                 "provider": provider,
@@ -1070,7 +1216,7 @@ class RootAgentEngine:
 
         while True:
             await asyncio.sleep(15)
-            await self._publish_progress_snapshot(
+            self._queue_progress_snapshot(
                 project_id,
                 event_identity=generate_id("root-heartbeat"),
             )
@@ -1082,6 +1228,7 @@ class RootAgentEngine:
         label: str | None = None,
         color: str | None = None,
         detail: str | None = None,
+        narrative: str | None = None,
         child_summary: str | None = None,
         observed_event: bool = True,
     ) -> None:
@@ -1101,6 +1248,8 @@ class RootAgentEngine:
             state.color = color
         if detail is not None:
             state.detail = detail
+        if narrative is not None:
+            state.narrative = narrative
         if child_summary is not None:
             state.child_summary = child_summary
         if observed_event:
@@ -1152,6 +1301,71 @@ class RootAgentEngine:
         except Exception:
             logger.warning("Failed to project Root Agent progress", exc_info=True)
 
+    def _queue_progress_snapshot(
+        self,
+        project_id: str,
+        *,
+        event_identity: str,
+    ) -> None:
+        """Coalesce UI updates without blocking Codex's native event stream."""
+
+        self._pending_progress_delivery[project_id] = event_identity
+        task = self._progress_delivery_tasks.get(project_id)
+        if task is not None and not task.done():
+            return
+
+        async def deliver_latest() -> None:
+            try:
+                while True:
+                    wait_for = (
+                        self._progress_last_delivery.get(project_id, 0.0)
+                        + self._progress_min_delivery_interval
+                        - monotonic()
+                    )
+                    if wait_for > 0:
+                        await asyncio.sleep(wait_for)
+                    identity = self._pending_progress_delivery.pop(project_id, None)
+                    if identity is None:
+                        return
+                    await self._publish_progress_snapshot(
+                        project_id,
+                        event_identity=identity,
+                    )
+                    self._progress_last_delivery[project_id] = monotonic()
+            finally:
+                self._progress_delivery_tasks.pop(project_id, None)
+
+        self._progress_delivery_tasks[project_id] = asyncio.create_task(
+            deliver_latest(),
+            name=f"mac-progress-delivery-{project_id}",
+        )
+
+    async def _flush_progress_snapshots(self, project_id: str) -> None:
+        """Wait until the latest queued UI state is durably projected."""
+
+        while True:
+            task = self._progress_delivery_tasks.get(project_id)
+            if task is None:
+                if project_id not in self._pending_progress_delivery:
+                    return
+                self._queue_progress_snapshot(
+                    project_id,
+                    event_identity=self._pending_progress_delivery[project_id],
+                )
+                task = self._progress_delivery_tasks.get(project_id)
+            if task is not None:
+                await task
+
+    async def _cancel_progress_snapshots(self, project_id: str) -> None:
+        """Drop stale non-terminal UI work when the owning turn is cancelled."""
+
+        self._pending_progress_delivery.pop(project_id, None)
+        task = self._progress_delivery_tasks.pop(project_id, None)
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
     async def _project_external_agent_activity(
         self,
         project_id: str,
@@ -1159,15 +1373,23 @@ class RootAgentEngine:
         provider: str,
         selection_reason: str,
         activity: str,
+        observed_detail: str | None = None,
+        narrative: str | None = None,
     ) -> None:
         """Update the shared progress card from actual external CLI events."""
+        detail = f"选择原因：{selection_reason}"
+        if observed_detail:
+            detail = f"{detail}\n\n{observed_detail}"
+        if narrative is not None:
+            narrative = " ".join(redact_text(narrative).split())[:1_200]
         self._update_progress(
             project_id,
             label=activity,
             color="purple",
-            detail=f"选择 {provider}：{selection_reason}",
+            detail=detail,
+            narrative=narrative,
         )
-        await self._publish_progress_snapshot(
+        self._queue_progress_snapshot(
             project_id,
             event_identity=f"external:{agent_id}:{activity}",
         )
@@ -1219,14 +1441,27 @@ class RootAgentEngine:
             return
         label, color, _lifecycle = activity
         child_summary = _native_child_summary(item) if isinstance(item, dict) else None
+        detail = _native_activity_detail(item) if isinstance(item, dict) else ""
+        narrative = None
+        if isinstance(item, dict) and str(item.get("type") or "") == "agentMessage":
+            phase = str(item.get("phase") or "")
+            text = " ".join(redact_text(str(item.get("text") or "")).split())
+            if event.kind == "item/completed" and text and phase == "commentary":
+                # Commentary is Codex's public, user-facing progress text. Keep
+                # the latest one visible while later tool events update the
+                # current activity; do not expose private reasoning content.
+                narrative = text[:1_200]
+                label = "Codex 已汇报阶段进展，正在继续处理"
         self._update_progress(
             project_id,
             label=label,
             color=color,
+            detail=detail,
+            narrative=narrative,
             child_summary=child_summary,
             observed_event=False,
         )
-        await self._publish_progress_snapshot(
+        self._queue_progress_snapshot(
             project_id,
             event_identity=f"{event_identity}:{event.kind}",
         )

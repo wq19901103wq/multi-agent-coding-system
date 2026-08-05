@@ -8,6 +8,7 @@ from mac_system.agents.root_runtime import (
 from mac_system.core.root_sessions import (
     SHUTDOWN_INTERRUPTED_ERROR,
     RootSessionStore,
+    recover_interrupted_external_agents,
     recover_interrupted_native_turns,
 )
 from mac_system.models import (
@@ -158,3 +159,25 @@ def test_restart_reconciles_turn_cancelled_during_graceful_shutdown(session):
         "Previous native Codex turn was interrupted by service restart"
     )
     assert recover_interrupted_native_turns(session) == []
+
+
+def test_service_restart_closes_unowned_external_agent_rows(session):
+    store = RootSessionStore(session)
+    running = store.create_agent(
+        "proj-1",
+        task_name="browser-check",
+        provider="pi",
+        access="host_automation",
+        objective="run browser verification",
+        tool_call_id="ctool-running",
+    )
+    store.update_agent(running, status="running", latest_message="Pi 正在执行测试")
+
+    assert recover_interrupted_external_agents(session) == [running.id]
+
+    session.expire_all()
+    recovered = session.get(AgentSession, running.id)
+    assert recovered.status == "failed"
+    assert recovered.result["interrupted"] is True
+    assert "service restart" in recovered.latest_message
+    assert recover_interrupted_external_agents(session) == []

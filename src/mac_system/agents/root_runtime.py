@@ -208,7 +208,7 @@ class CodexAppServerThread:
                 future.set_exception(error)
         self._pending.clear()
 
-    async def create_thread(self) -> str:
+    async def create_thread(self, *, session_start_source: str | None = None) -> str:
         await self.start()
         params: JsonObject = {
             "cwd": str(self.cwd),
@@ -217,6 +217,8 @@ class CodexAppServerThread:
             "dynamicTools": [tool.codex_spec() for tool in self.tools.values()],
             "ephemeral": self.ephemeral,
         }
+        if session_start_source is not None:
+            params["sessionStartSource"] = session_start_source
         if self.developer_instructions is not None:
             params["developerInstructions"] = self.developer_instructions
         if self.environments is not None:

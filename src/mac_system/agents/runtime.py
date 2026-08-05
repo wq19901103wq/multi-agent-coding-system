@@ -738,7 +738,14 @@ class ClaudeCodeRuntime(AgentRuntime):
                             txt = redact_text(full_text)[:500]
                             if txt.strip() and full_text not in seen_progress_texts:
                                 seen_progress_texts.add(full_text)
-                                await progress_callback("thinking", txt.strip())
+                                await progress_callback(
+                                    "commentary"
+                                    if block.get("type") == "text"
+                                    else "thinking",
+                                    txt.strip()
+                                    if block.get("type") == "text"
+                                    else "",
+                                )
                         if block.get("type") == "tool_use":
                             tool_key = block.get("id") or json.dumps(
                                 [block.get("name"), block.get("input")],
@@ -1287,6 +1294,8 @@ class _JsonLineCliRuntime(AgentRuntime):
             stdout_lines: list[str] = []
             stderr_task = asyncio.create_task(proc.stderr.read())
             observed_tool_calls: list[dict[str, Any]] = []
+            observed_tool_keys: set[str] = set()
+            observed_progress_texts: set[str] = set()
             tool_budget_exceeded = False
 
             async def _collect_stdout() -> None:
@@ -1301,16 +1310,29 @@ class _JsonLineCliRuntime(AgentRuntime):
                     if not clean.strip():
                         continue
                     stdout_lines.append(clean)
-                    if progress_callback:
-                        _, line_tools, _, _ = self.parse_events([clean])
-                        for call in line_tools:
-                            observed_tool_calls.append(call)
+                    if progress_callback or max_tool_calls is not None:
+                        line_text, line_tools, _, _ = self.parse_events([clean])
+                        if (
+                            progress_callback
+                            and line_text
+                            and line_text not in observed_progress_texts
+                        ):
+                            observed_progress_texts.add(line_text)
                             await progress_callback(
-                                "tool", json.dumps(call, ensure_ascii=False)
+                                "commentary", redact_text(line_text)[:500]
                             )
-                    elif max_tool_calls is not None:
-                        _, line_tools, _, _ = self.parse_events([clean])
-                        observed_tool_calls.extend(line_tools)
+                        for call in line_tools:
+                            call_key = json.dumps(
+                                call, ensure_ascii=False, sort_keys=True, default=str
+                            )
+                            if call_key in observed_tool_keys:
+                                continue
+                            observed_tool_keys.add(call_key)
+                            observed_tool_calls.append(call)
+                            if progress_callback:
+                                await progress_callback(
+                                    "tool", json.dumps(call, ensure_ascii=False)
+                                )
                     if (
                         max_tool_calls is not None
                         and len(observed_tool_calls) > max_tool_calls

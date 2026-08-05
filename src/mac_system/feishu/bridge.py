@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -18,6 +19,8 @@ from mac_system.feishu.models import ButtonAction, FeishuEvent, TextMessage
 
 _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 _MENTION_AT_TAG_RE = re.compile(r'<at[^>]*>.*?</at>')
+_TENANT_TOKEN_CACHE: dict[tuple[str, str], tuple[str, float]] = {}
+_TENANT_TOKEN_CACHE_LOCK = threading.Lock()
 
 
 def _strip_mention_placeholders(text: str) -> str:
@@ -72,7 +75,15 @@ class FeishuBridge:
         await self._client.aclose()
 
     async def _get_tenant_token(self) -> str:
-        if self._token and time.time() < self._token_expire_at - 60:
+        now = time.time()
+        if self._token and now < self._token_expire_at:
+            return self._token
+
+        cache_key = (self.base_url, self.app_id)
+        with _TENANT_TOKEN_CACHE_LOCK:
+            cached = _TENANT_TOKEN_CACHE.get(cache_key)
+        if cached is not None and now < cached[1]:
+            self._token, self._token_expire_at = cached
             return self._token
 
         url = f"{self.base_url}/open-apis/auth/v3/tenant_access_token/internal"
@@ -86,8 +97,16 @@ class FeishuBridge:
             raise FeishuBridgeError(f"Failed to get tenant token: {data}")
 
         self._token = data["tenant_access_token"]
-        # expire is in seconds; keep a 60s buffer
-        self._token_expire_at = time.time() + data.get("expire", 7200) - 60
+        # expire is in seconds; keep a 60s buffer before sharing the token.
+        self._token_expire_at = time.time() + max(
+            int(data.get("expire", 7200)) - 60,
+            0,
+        )
+        with _TENANT_TOKEN_CACHE_LOCK:
+            _TENANT_TOKEN_CACHE[cache_key] = (
+                self._token,
+                self._token_expire_at,
+            )
         return self._token
 
     async def _request(

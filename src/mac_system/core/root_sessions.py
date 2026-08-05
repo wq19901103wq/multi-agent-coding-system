@@ -356,3 +356,32 @@ def recover_interrupted_native_turns(session: Session) -> list[str]:
 
     session.commit()
     return sorted(project_ids)
+
+
+def recover_interrupted_external_agents(session: Session) -> list[str]:
+    """Close provider rows whose owning MAC process no longer exists.
+
+    External coding-agent processes are children of the MAC service and cannot
+    survive a service restart as resumable work. Leaving their durable rows in
+    ``pending`` or ``running`` makes the mobile UI advertise work that has no
+    owner, so startup records the interruption explicitly.
+    """
+
+    rows = list(
+        session.exec(
+            select(AgentSession).where(
+                AgentSession.status.in_(("pending", "running"))
+            )
+        ).all()
+    )
+    if not rows:
+        return []
+    message = "External provider execution was interrupted by MAC service restart"
+    for row in rows:
+        row.status = "failed"
+        row.latest_message = message
+        row.result = {**(row.result or {}), "error": message, "interrupted": True}
+        row.updated_at = _now()
+        session.add(row)
+    session.commit()
+    return [row.id for row in rows]

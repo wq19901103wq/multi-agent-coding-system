@@ -323,8 +323,11 @@ class FeishuWebSocketClient:
         # once a prior turn launches an Agent, later status questions,
         # corrections, and unrelated questions must keep the chat responsive.
         normalized_text = _strip_mention_placeholders(msg.text or "")
-        is_priority_cancel = normalized_text == "/cancel" or normalized_text.startswith(
-            "/cancel "
+        is_priority_cancel = (
+            normalized_text in {"/cancel", "/stop", "/x"}
+            or normalized_text.startswith("/cancel ")
+            or normalized_text.startswith("/stop ")
+            or normalized_text.startswith("/x ")
         )
         lock = None if is_priority_cancel else self._user_lock(msg.open_id)
         lock_acquired = bool(lock and lock.acquire(blocking=False))

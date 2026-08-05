@@ -178,16 +178,27 @@ async def lifespan(app: FastAPI):
 
     register_root_service_loop(asyncio.get_running_loop())
     init_db()
-    from mac_system.core.root_sessions import recover_interrupted_native_turns
+    from mac_system.core.root_sessions import (
+        recover_interrupted_external_agents,
+        recover_interrupted_native_turns,
+    )
 
     with session_scope() as recovery_session:
         recovered_projects = recover_interrupted_native_turns(recovery_session)
+        recovered_external_agents = recover_interrupted_external_agents(
+            recovery_session
+        )
     if recovered_projects:
         logger.warning(
             "Recovered %s native Codex turn(s) interrupted by service restart",
             len(recovered_projects),
         )
         await _reconcile_interrupted_root_cards(recovered_projects)
+    if recovered_external_agents:
+        logger.warning(
+            "Recovered %s external provider execution(s) interrupted by service restart",
+            len(recovered_external_agents),
+        )
     settings = get_settings()
     ws_client: FeishuWebSocketClient | None = None
     if (

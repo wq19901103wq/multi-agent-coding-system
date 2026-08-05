@@ -255,12 +255,49 @@ async def test_newthread_is_explicit_project_control(ctx):
         feishu_chat_id="oc-chat",
     )
 
-    await handle_text_message(ctx, message("/newthread"))
+    await handle_text_message(ctx, message("/n"))
 
     assert ctx.orchestrator.new_threads == [project.id]
     card = ctx.bridge.cards[-1][2]
     assert card["header"]["title"]["content"] == "已开始新的 Codex 会话"
     assert "后续消息不会携带旧对话历史" in card["body"]["elements"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_help_presents_short_mobile_commands(ctx):
+    await handle_text_message(ctx, message("/h"))
+
+    markdown = ctx.bridge.cards[-1][2]["body"]["elements"][0]["content"]
+    for command in (
+        "/create", "/c", "/proj", "/ls", "/use", "/s", "/info", "/i",
+        "/new", "/n", "/bind", "/b", "/unbind", "/u", "/pause", "/p",
+        "/resume", "/r", "/stop", "/x", "/menu", "/m", "/help", "/h",
+    ):
+        assert f"`{command}" in markdown
+    assert "/newthread" not in markdown
+    assert "/current" not in markdown
+
+
+@pytest.mark.asyncio
+async def test_readable_new_alias_resets_current_project_thread(ctx):
+    project = await ctx.service.create_project(
+        "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+
+    await handle_text_message(ctx, message("/new"))
+
+    assert ctx.orchestrator.new_threads == [project.id]
+
+
+@pytest.mark.asyncio
+async def test_short_cancel_alias_controls_selected_project(ctx):
+    project = await ctx.service.create_project(
+        "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+
+    await handle_text_message(ctx, message("/x"))
+
+    assert ctx.orchestrator.cancelled[0][0] == project.id
 
 
 @pytest.mark.asyncio
