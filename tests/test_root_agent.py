@@ -275,7 +275,8 @@ async def test_explicit_new_thread_replaces_history_without_changing_project(
 async def test_explicit_new_thread_rejects_active_turn(root_context):
     session, engine = root_context
     engine.store.set_turn("proj-root", turn_id="turn-active", status="running")
-    engine.service.set_execution_status("proj-root", "running")
+
+    assert session.get(Project, "proj-root").execution_status == "running"
 
     with pytest.raises(RuntimeError, match="当前项目仍在处理消息"):
         await engine.start_new_thread("proj-root")
@@ -774,8 +775,9 @@ async def test_native_request_user_input_waits_for_durable_feishu_answer(root_co
     assert root.status == "running"
     response = await asyncio.wait_for(request_task, timeout=1)
     assert response == {"answers": {"style": {"answers": ["未来科技"]}}}
-    approval = session.get(Approval, interaction.approval_id)
-    assert approval.payload["root_request_item_id"] == "request-1"
+    assert interaction.request_item_id == "request-1"
+    assert interaction.approval_id is None
+    assert session.exec(select(Approval)).first() is None
 
 
 @pytest.mark.asyncio

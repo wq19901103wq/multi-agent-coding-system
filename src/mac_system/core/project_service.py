@@ -263,29 +263,30 @@ class ProjectService:
 
     def get_project_status(self, project_id: str) -> dict[str, Any]:
         project = self.require_project(project_id)
-        approval = self.session.exec(
-            select(Approval)
-            .where(Approval.project_id == project.id, Approval.status == "pending")
-            .order_by(Approval.created_at.desc())
+        interaction = self.session.exec(
+            select(QuestionInteraction)
+            .where(
+                QuestionInteraction.project_id == project.id,
+                QuestionInteraction.status == "pending",
+            )
+            .order_by(QuestionInteraction.created_at.desc())
         ).first()
         return {
             "project_id": project.id,
             "name": project.name,
             "status": project.status,
-            "current_state": project.current_state,
             "display": project.execution_status,
             "execution_status": project.execution_status,
             "waiting_reason": project.waiting_reason,
             "workspace_path": project.workspace_path,
             "bound_directory": project.bound_directory,
-            "pending_approval": (
+            "pending_question": (
                 {
-                    "approval_id": approval.id,
-                    "type": approval.approval_type,
-                    "question": approval.question,
-                    "payload": approval.payload,
+                    "interaction_id": interaction.id,
+                    "requested_to": interaction.requested_to,
+                    "stage": interaction.stage,
                 }
-                if approval
+                if interaction
                 else None
             ),
         }
@@ -334,8 +335,6 @@ class ProjectService:
     ) -> Project:
         project = self.require_project(project_id)
         project.status = "cancelled"
-        project.execution_status = "idle"
-        project.waiting_reason = None
         project.updated_at = _now()
         for approval in self.session.exec(
             select(Approval).where(
@@ -344,6 +343,16 @@ class ProjectService:
         ).all():
             approval.status = "expired"
             self.session.add(approval)
+        for interaction in self.session.exec(
+            select(QuestionInteraction).where(
+                QuestionInteraction.project_id == project.id,
+                QuestionInteraction.status == "pending",
+            )
+        ).all():
+            interaction.status = "expired"
+            interaction.answered_at = _now()
+            interaction.resolution_source = "project_cancelled"
+            self.session.add(interaction)
         for context in self.session.exec(
             select(ChatUserContext).where(ChatUserContext.active_project_id == project.id)
         ).all():
@@ -604,6 +613,7 @@ class ProjectService:
         questions: list[dict[str, Any]],
         *,
         approval_id: str | None = None,
+        request_item_id: str | None = None,
         requested_to: str = "user",
         escalated_to_user: bool = True,
         commit: bool = True,
@@ -618,6 +628,7 @@ class ProjectService:
             stage=stage,
             batch_key=batch_key,
             approval_id=approval_id,
+            request_item_id=request_item_id,
             requested_to=requested_to,
             escalated_to_user=escalated_to_user,
         )
@@ -650,6 +661,17 @@ class ProjectService:
             )
         if commit:
             self.session.commit()
+        return interaction
+
+    def set_question_selections(
+        self, interaction_id: str, selected_options: dict[str, str]
+    ) -> QuestionInteraction:
+        interaction = self.get_question_interaction(interaction_id)
+        if interaction is None:
+            raise ValueError(f"Question interaction not found: {interaction_id}")
+        interaction.selected_options = dict(selected_options)
+        self.session.add(interaction)
+        self.session.commit()
         return interaction
 
     def get_question_interaction(

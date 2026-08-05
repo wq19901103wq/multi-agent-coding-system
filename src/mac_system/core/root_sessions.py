@@ -54,12 +54,8 @@ class RootSessionStore:
     def set_native_thread(self, project_id: str, native_thread_id: str) -> RootAgentSession:
         row = self.ensure(project_id)
         row.native_thread_id = native_thread_id
-        row.status = "idle"
-        row.last_error = None
-        row.updated_at = _now()
         self.session.add(row)
-        self.session.commit()
-        return row
+        return self.set_turn(project_id, turn_id=None, status="idle")
 
     def clear_native_thread(self, project_id: str) -> RootAgentSession:
         """Detach the project from its current Codex thread.
@@ -70,23 +66,39 @@ class RootSessionStore:
 
         row = self.ensure(project_id)
         row.native_thread_id = None
-        row.active_turn_id = None
-        row.status = "idle"
-        row.last_error = None
-        row.updated_at = _now()
         self.session.add(row)
-        self.session.commit()
-        return row
+        return self.set_turn(project_id, turn_id=None, status="idle")
 
     def set_turn(
-        self, project_id: str, *, turn_id: str | None, status: str, error: str | None = None
+        self,
+        project_id: str,
+        *,
+        turn_id: str | None,
+        status: str,
+        error: str | None = None,
+        reason: str | None = None,
     ) -> RootAgentSession:
+        """Persist the native turn and its user-facing Project projection atomically.
+
+        ``RootAgentSession`` is the execution source of truth.  The Project fields
+        are a denormalized UI/API projection and must never be updated separately
+        for a native Codex turn.
+        """
+
         row = self.ensure(project_id)
         row.active_turn_id = turn_id
         row.status = status
         row.last_error = error
         row.updated_at = _now()
+        project = self.session.get(Project, project_id)
+        if project is None:
+            raise ValueError(f"Project not found: {project_id}")
+        project.execution_status = status
+        project.waiting_reason = reason
+        project.waiting_since = _now() if status.startswith("waiting") else None
+        project.updated_at = _now()
         self.session.add(row)
+        self.session.add(project)
         self.session.commit()
         return row
 

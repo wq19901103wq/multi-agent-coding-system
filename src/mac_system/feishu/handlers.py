@@ -294,18 +294,6 @@ async def handle_text_message(
 
     project = _active_project(ctx, msg.open_id)
     if project is None:
-        legacy_binding = ctx.service.get_chat_directory_binding(
-            _chat_id(ctx, msg.open_id)
-        )
-        if legacy_binding is not None:
-            project = await _bind_directory(
-                ctx,
-                msg.open_id,
-                legacy_binding.directory,
-            )
-            if project is not None:
-                await _deliver_to_root(ctx, project, text)
-                return
         # A Feishu chat is the outer session.  Its first ordinary message gets
         # one persistent Codex project thread; there is no separate chat Agent.
         await _create_project(ctx, msg.open_id, text)
@@ -757,7 +745,6 @@ async def _handle_menu_action(
             card = build_status_card(
                 f"[{project.name or project.id}] 项目状态",
                 project.id,
-                project.current_state,
                 project.execution_status,
                 [],
                 action_needed=project.waiting_reason,
@@ -836,8 +823,21 @@ def _question_payload(
 async def _handle_question_action(
     ctx: FeishuHandlerContext, action: ButtonAction
 ) -> dict[str, Any] | None:
-    approval = ctx.service.session.get(Approval, action.approval_id)
-    if approval is None or approval.status != "pending":
+    interaction_id = str((action.extras or {}).get("interaction_id") or "")
+    if not interaction_id:
+        interaction_id = action.approval_id
+    interaction = ctx.service.get_question_interaction(interaction_id)
+    approval = None
+    if interaction is None:
+        # Compatibility for cards created before QuestionInteraction became
+        # the lifecycle source of truth.
+        approval = ctx.service.session.get(Approval, action.approval_id)
+        if approval is not None:
+            interaction_id = str(
+                (approval.payload or {}).get("question_interaction_id") or ""
+            )
+            interaction = ctx.service.get_question_interaction(interaction_id)
+    if interaction is None or interaction.status != "pending":
         await _send_card(
             ctx,
             action.open_id,
@@ -845,12 +845,6 @@ async def _handle_question_action(
             "这张卡片已经提交或失效。",
             color="orange",
         )
-        return None
-    interaction_id = str((action.extras or {}).get("interaction_id") or "")
-    if not interaction_id:
-        interaction_id = str((approval.payload or {}).get("question_interaction_id") or "")
-    interaction = ctx.service.get_question_interaction(interaction_id)
-    if interaction is None or interaction.status != "pending":
         return None
     project = ctx.service.get_project(interaction.project_id)
     if project is None:
@@ -861,22 +855,22 @@ async def _handle_question_action(
     # from the updated Feishu card.
     question_payload = _question_payload(questions)
     pending = [question for question in questions if question.status == "pending"]
-    selected = dict((approval.payload or {}).get("selected_options") or {})
+    selected = dict(interaction.selected_options or {})
     target_id = str((action.extras or {}).get("question_id") or "")
 
     if action.action == "select_question_option":
         if target_id and action.option_key:
             selected[target_id] = action.option_key
-            approval.payload = {**(approval.payload or {}), "selected_options": selected}
-            ctx.service.session.add(approval)
-            ctx.service.session.commit()
+            interaction = ctx.service.set_question_selections(
+                interaction.id, selected
+            )
         return build_question_batch_card(
-            approval.id,
+            interaction.id,
             interaction.id,
             question_payload,
             "Codex",
             "conversation",
-            state=approval.state,
+            state=action.state or "ROOT_AGENT_WAITING_USER",
             project_name=project.name or project.id,
             chat_id=project.feishu_chat_id,
             chat_type=project.feishu_chat_type,
@@ -920,9 +914,7 @@ async def _handle_question_action(
         submitted[question.question_id] = value
 
     if not ctx.service.interaction_is_resolvable(interaction.id):
-        approval.payload = {**(approval.payload or {}), "selected_options": selected}
-        ctx.service.session.add(approval)
-        ctx.service.session.commit()
+        ctx.service.set_question_selections(interaction.id, selected)
         await _send_card(
             ctx,
             action.open_id,
@@ -933,9 +925,12 @@ async def _handle_question_action(
         return None
 
     await ctx.service.resolve_question_interaction(interaction.id, commit=False)
-    await ctx.service.respond_approval(
-        approval.id, "answer", action.open_id, commit=False
-    )
+    if approval is None and interaction.approval_id:
+        approval = ctx.service.session.get(Approval, interaction.approval_id)
+    if approval is not None and approval.status == "pending":
+        await ctx.service.respond_approval(
+            approval.id, "answer", action.open_id, commit=False
+        )
     ctx.service.session.commit()
 
     receipt_answers: dict[str, str] = {}
@@ -944,12 +939,12 @@ async def _handle_question_action(
         if answer is not None and not answer.skipped and answer.answer:
             receipt_answers[question.question_id] = str(answer.answer)
     receipt = build_question_batch_card(
-        approval.id,
+        interaction.id,
         interaction.id,
         question_payload,
         "Codex",
         "conversation",
-        state=approval.state,
+        state=action.state or "ROOT_AGENT_WAITING_USER",
         project_name=project.name or project.id,
         chat_id=project.feishu_chat_id,
         chat_type=project.feishu_chat_type,

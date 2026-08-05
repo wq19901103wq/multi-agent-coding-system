@@ -30,6 +30,8 @@ class Project(SQLModel, table=True):
 
     id: str = SQLField(primary_key=True)
     name: Optional[str] = None
+    # Legacy columns retained for in-place compatibility with existing SQLite
+    # databases. They no longer drive routing, workflow, API output, or cards.
     task_type: str = SQLField(default="feature")
     description: Optional[str] = None
     status: str = SQLField(default="active", index=True)
@@ -147,6 +149,11 @@ class QuestionInteraction(SQLModel, table=True):
     stage: Optional[str] = "conversation"
     batch_key: str
     status: str = SQLField(default="pending", index=True)
+    request_item_id: Optional[str] = SQLField(default=None, index=True)
+    card_message_id: Optional[str] = None
+    selected_options: dict = SQLField(default_factory=dict, sa_column=Column(JSON))
+    # Compatibility link for question cards created before QuestionInteraction
+    # became the lifecycle source of truth.
     approval_id: Optional[str] = SQLField(default=None, foreign_key="approvals.id")
     requested_to: str = "user"
     escalated_to_user: bool = True
@@ -358,14 +365,11 @@ class ProjectCreate(BaseModel):
 class ProjectOut(BaseModel):
     id: str
     name: Optional[str]
-    task_type: str
     description: Optional[str]
     status: str
     execution_status: str
     waiting_reason: Optional[str]
     waiting_since: Optional[datetime]
-    current_state: str
-    previous_state: Optional[str]
     workspace_path: str
     bound_directory: Optional[str]
     total_cost_usd: Optional[float]

@@ -810,7 +810,6 @@ class RootAgentEngine:
             heartbeat: asyncio.Task[None] | None = None
             try:
                 self.store.set_turn(project_id, turn_id=None, status="running")
-                self.service.set_execution_status(project_id, "running")
                 current = monotonic()
                 progress_state = _ProgressState(
                     started_monotonic=current,
@@ -843,9 +842,6 @@ class RootAgentEngine:
                 heartbeat = None
                 await self._flush_progress_snapshots(project_id)
                 self.store.set_turn(project_id, turn_id=None, status="idle")
-                refreshed = self.service.require_project(project_id)
-                if refreshed.execution_status != "waiting_user":
-                    self.service.set_execution_status(project_id, "idle")
                 try:
                     await self._publish_turn_status(project, result)
                 except Exception:
@@ -957,11 +953,7 @@ class RootAgentEngine:
             self.session.expire_all()
             project = self.service.require_project(project_id)
             durable = self.store.ensure(project_id)
-            if (
-                project.execution_status != "idle"
-                or durable.status != "idle"
-                or durable.active_turn_id is not None
-            ):
+            if durable.status != "idle" or durable.active_turn_id is not None:
                 raise RuntimeError("当前项目仍在处理消息，请等本轮结束后再新建会话。")
 
             old_thread_id = durable.native_thread_id
@@ -1102,7 +1094,6 @@ class RootAgentEngine:
                     "orchestration_mode": "root_agent",
                     "root_agent_profile": root_profile,
                 }
-                project.current_state = "ACTIVE"
                 project.updated_at = _now()
                 self.session.add(project)
                 self.session.commit()
@@ -1822,16 +1813,6 @@ class RootAgentEngine:
                 }
             )
 
-        approval = await self.service.create_approval(
-            project.id,
-            None,
-            "ROOT_AGENT_WAITING_USER",
-            "input",
-            questions[0]["question"],
-            [],
-            payload={"root_request_item_id": item_id},
-            enforce_current_state=False,
-        )
         interaction = await self.service.create_question_interaction(
             project.id,
             None,
@@ -1841,16 +1822,10 @@ class RootAgentEngine:
             "conversation",
             f"root:{item_id}",
             questions,
-            approval_id=approval.id,
+            request_item_id=item_id,
             requested_to="user",
             escalated_to_user=True,
         )
-        approval.payload = {
-            **(approval.payload or {}),
-            "question_interaction_id": interaction.id,
-            "root_request_item_id": item_id,
-        }
-        self.session.add(approval)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         pending = _PendingUserRequest(
@@ -1858,23 +1833,17 @@ class RootAgentEngine:
         )
         with _PENDING_USER_REQUESTS_GUARD:
             _PENDING_USER_REQUESTS[item_id] = pending
-        self.service.set_execution_status(
-            project.id,
-            "waiting_user",
-            reason=questions[0]["question"],
-            commit=False,
-        )
-        self.session.commit()
         durable = self.store.ensure(project.id)
         self.store.set_turn(
             project.id,
             turn_id=durable.active_turn_id,
             status="waiting_user",
+            reason=questions[0]["question"],
         )
 
         if self.feishu_bridge is not None and project.feishu_chat_id:
             card = build_question_batch_card(
-                approval.id,
+                interaction.id,
                 interaction.id,
                 questions,
                 "root_agent",
@@ -1906,11 +1875,8 @@ class RootAgentEngine:
                     exc_info=True,
                 )
             else:
-                approval.payload = {
-                    **(approval.payload or {}),
-                    "question_batch_message_id": message_id,
-                }
-                self.session.add(approval)
+                interaction.card_message_id = message_id
+                self.session.add(interaction)
                 self.session.commit()
 
         try:
@@ -1940,15 +1906,13 @@ class RootAgentEngine:
                         commit=False,
                         resolution_source="auto_resolution",
                     )
-                    await self.service.respond_approval(
-                        approval.id,
-                        "auto_resolution",
-                        "codex_auto_resolution",
-                        commit=False,
-                    )
-                    self.service.set_execution_status(
-                        project.id, "running", commit=False
-                    )
+                    if interaction.approval_id:
+                        await self.service.respond_approval(
+                            interaction.approval_id,
+                            "auto_resolution",
+                            "codex_auto_resolution",
+                            commit=False,
+                        )
                     self.session.commit()
                     durable = self.store.ensure(project.id)
                     self.store.set_turn(
@@ -1970,13 +1934,7 @@ class RootAgentEngine:
                                 color="orange",
                             ),
                             project_id=project.id,
-                            update_message_id=str(
-                                (approval.payload or {}).get(
-                                    "question_batch_message_id"
-                                )
-                                or ""
-                            )
-                            or None,
+                            update_message_id=interaction.card_message_id,
                             projection_key=f"question:{interaction.id}",
                             subject_type="question_interaction",
                             subject_id=interaction.id,
@@ -2058,10 +2016,6 @@ class RootAgentEngine:
                     turn_id=None,
                     status="idle",
                     error=str(exc),
-                )
-                ProjectService(recovery_session).set_execution_status(
-                    project_id,
-                    "idle",
                     reason=f"Root Agent failed: {exc}",
                 )
         except Exception:
@@ -2179,12 +2133,16 @@ def resolve_root_user_input(
     """Return durable Feishu answers to the blocked native Codex request."""
 
     interaction = service.get_question_interaction(interaction_id)
-    if interaction is None or not interaction.approval_id:
+    if interaction is None:
         return False
-    approval = service.session.get(Approval, interaction.approval_id)
-    if approval is None:
-        return False
-    item_id = str((approval.payload or {}).get("root_request_item_id") or "")
+    item_id = str(interaction.request_item_id or "")
+    if not item_id and interaction.approval_id:
+        approval = service.session.get(Approval, interaction.approval_id)
+        item_id = (
+            str((approval.payload or {}).get("root_request_item_id") or "")
+            if approval
+            else ""
+        )
     if not item_id:
         return False
     with _PENDING_USER_REQUESTS_GUARD:
@@ -2206,7 +2164,6 @@ def resolve_root_user_input(
             pending.future.set_result(response)
 
     pending.loop.call_soon_threadsafe(deliver)
-    service.set_execution_status(interaction.project_id, "running")
     store = RootSessionStore(service.session)
     durable = store.ensure(interaction.project_id)
     store.set_turn(

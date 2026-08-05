@@ -69,13 +69,42 @@ async def test_chat_project_is_selected_for_creator(service):
 @pytest.mark.asyncio
 async def test_pause_resume_cancel_are_lifecycle_only(service):
     project = await service.create_project("demo", "feature", "build")
+    project.execution_status = "running"
+    project.waiting_reason = "provider turn is still active"
+    service.session.add(project)
+    service.session.commit()
     await service.pause_project(project.id)
     assert service.require_project(project.id).status == "paused"
     await service.resume_project(project.id)
     assert service.require_project(project.id).status == "active"
     await service.cancel_project(project.id)
     assert service.require_project(project.id).status == "cancelled"
+    assert service.require_project(project.id).execution_status == "running"
+    assert service.require_project(project.id).waiting_reason == "provider turn is still active"
     assert service.require_project(project.id).current_state == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_cancel_expires_pending_question_interactions(service):
+    project = await service.create_project("demo", "feature", "build")
+    interaction = await service.create_question_interaction(
+        project.id,
+        None,
+        1,
+        "ACTIVE",
+        "root_agent",
+        "conversation",
+        "cancel-pending",
+        [{"id": "choice", "question": "Continue?", "options": []}],
+        request_item_id="request-1",
+    )
+
+    await service.cancel_project(project.id)
+
+    refreshed = service.get_question_interaction(interaction.id)
+    assert refreshed is not None
+    assert refreshed.status == "expired"
+    assert refreshed.resolution_source == "project_cancelled"
 
 
 @pytest.mark.asyncio
@@ -164,7 +193,8 @@ def test_project_status_has_no_workflow_projection(service):
     service.session.add(project)
     service.session.commit()
     status = service.get_project_status("p")
-    assert status["current_state"] == "ACTIVE"
+    assert "current_state" not in status
+    assert "pending_approval" not in status
     assert "workflow_steps" not in status
 
 

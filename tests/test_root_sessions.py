@@ -107,10 +107,12 @@ def test_native_session_event_cursor_and_agent_registry_are_durable(session):
 def test_service_restart_recovers_interrupted_native_turn(session):
     store = RootSessionStore(session)
     store.set_native_thread("proj-1", "thread-1")
-    store.set_turn("proj-1", turn_id="turn-1", status="waiting_user")
+    store.set_turn(
+        "proj-1", turn_id="turn-1", status="waiting_user", reason="请选择"
+    )
     project = session.get(Project, "proj-1")
-    project.execution_status = "waiting_user"
-    project.waiting_reason = "请选择"
+    assert project.execution_status == "waiting_user"
+    assert project.waiting_reason == "请选择"
     approval = Approval(
         id="approval-1",
         project_id="proj-1",

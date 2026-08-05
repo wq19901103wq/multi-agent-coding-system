@@ -52,7 +52,6 @@ def build_content_card(
 def build_status_card(
     title: str,
     project_id: str,
-    current_state: str,
     display: str,
     recent_events: list[dict[str, Any]],
     action_needed: str | None = None,
@@ -60,7 +59,7 @@ def build_status_card(
 ) -> dict[str, Any]:
     """Render the durable project posture without a synthetic workflow."""
 
-    del project_id, current_state
+    del project_id
     elements: list[dict[str, Any]] = [
         {"tag": "div", "text": _lark_md(f"**当前状态**：{display}")}
     ]

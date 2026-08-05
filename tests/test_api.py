@@ -70,7 +70,8 @@ def test_create_always_uses_native_root(api):
     )
     assert response.status_code == 200, response.text
     project = service.require_project(response.json()["id"])
-    assert project.current_state == "ACTIVE"
+    assert "current_state" not in response.json()
+    assert "task_type" not in response.json()
     assert project.context["orchestration_mode"] == "root_agent"
 
 
@@ -83,7 +84,7 @@ def test_project_status_is_execution_posture(api):
     project_id = response.json()["id"]
     status = client.get(f"/projects/{project_id}/status")
     assert status.status_code == 200
-    assert status.json()["current_state"] == "ACTIVE"
+    assert "current_state" not in status.json()
     assert status.json()["execution_status"] == "idle"
 
 

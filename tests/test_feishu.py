@@ -504,7 +504,7 @@ async def test_current_card_uses_selected_project_workspace(ctx):
 
 
 @pytest.mark.asyncio
-async def test_legacy_future_directory_binding_is_opened_on_next_message(
+async def test_legacy_directory_binding_is_ignored_on_next_message(
     ctx, tmp_path, monkeypatch
 ):
     repository = (tmp_path / "legacy-bound-repository").resolve()
@@ -519,8 +519,8 @@ async def test_legacy_future_directory_binding_is_opened_on_next_message(
 
     selected = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
     assert selected is not None
-    assert selected.workspace_path == str(repository)
-    assert ctx.service.get_chat_directory_binding("oc-chat") is None
+    assert selected.workspace_path != str(repository)
+    assert ctx.service.get_chat_directory_binding("oc-chat") is not None
     assert ctx.orchestrator.scheduled == [(selected.id, "检查这个已有项目")]
 
 
@@ -528,9 +528,6 @@ async def test_legacy_future_directory_binding_is_opened_on_next_message(
 async def test_request_user_input_card_updates_then_resolves(ctx, monkeypatch):
     project = await ctx.service.create_project(
         "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
-    )
-    approval = await ctx.service.create_approval(
-        project.id, None, "ROOT_AGENT_WAITING_USER", "input", "风格？", []
     )
     interaction = await ctx.service.create_question_interaction(
         project.id,
@@ -549,11 +546,8 @@ async def test_request_user_input_card_updates_then_resolves(ctx, monkeypatch):
                 {"key": "炫酷", "label": "炫酷"},
             ],
         }],
-        approval_id=approval.id,
+        request_item_id="request-style",
     )
-    approval.payload = {**approval.payload, "question_interaction_id": interaction.id}
-    ctx.service.session.add(approval)
-    ctx.service.session.commit()
     monkeypatch.setattr(
         "mac_system.core.root_agent.resolve_root_user_input", lambda *_: False
     )
@@ -561,9 +555,9 @@ async def test_request_user_input_card_updates_then_resolves(ctx, monkeypatch):
         ctx,
         ButtonAction(
             open_id="ou-user",
-            approval_id=approval.id,
+            approval_id=interaction.id,
             action="select_question_option",
-            state=approval.state,
+            state="ROOT_AGENT_WAITING_USER",
             decision_id=None,
             option_key="炫酷",
             extras={"interaction_id": interaction.id, "question_id": "style"},
@@ -577,9 +571,9 @@ async def test_request_user_input_card_updates_then_resolves(ctx, monkeypatch):
         ctx,
         ButtonAction(
             open_id="ou-user",
-            approval_id=approval.id,
+            approval_id=interaction.id,
             action="submit_selected_options",
-            state=approval.state,
+            state="ROOT_AGENT_WAITING_USER",
             decision_id=None,
             option_key=None,
             extras={"interaction_id": interaction.id},
@@ -587,8 +581,11 @@ async def test_request_user_input_card_updates_then_resolves(ctx, monkeypatch):
             message_id="om-card",
         ),
     )
-    assert ctx.service.session.get(Approval, approval.id).status == "responded"
     assert ctx.service.session.get(QuestionInteraction, interaction.id).status == "answered"
+    assert ctx.service.session.get(QuestionInteraction, interaction.id).selected_options == {
+        "style": "炫酷"
+    }
+    assert ctx.service.session.exec(select(Approval)).first() is None
     assert ctx.orchestrator.scheduled[-1][0] == project.id
     assert ctx.bridge.updates[-1][0] == "om-card"
 
