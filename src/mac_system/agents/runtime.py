@@ -1382,8 +1382,11 @@ class _JsonLineCliRuntime(AgentRuntime):
                 stdout_lines
             )
             logs = stdout_text + ("\n--- stderr ---\n" + stderr_text if stderr_text else "")
-            if provider_error or proc.returncode != 0:
-                error = provider_error or f"process exited with status {proc.returncode}"
+            if provider_error or proc.returncode != 0 or not (final_text or "").strip():
+                error = provider_error or (
+                    f"process exited with status {proc.returncode}"
+                    if proc.returncode != 0 else "provider returned no final answer"
+                )
                 return AgentRuntimeResult(
                     False,
                     None,
@@ -1512,13 +1515,33 @@ class KimiCodeRuntime(_JsonLineCliRuntime):
             if isinstance(content, dict):
                 content = [content]
             if event.get("role") == "assistant":
+                # Current Kimi stream-json uses OpenAI-style top-level calls.
+                # A tool-use message is not a final answer.
+                final_text = None
                 texts = [
                     str(block.get("text", ""))
                     for block in content
                     if isinstance(block, dict) and block.get("type") == "text"
                 ]
-                if texts:
+                if texts and not event.get("tool_calls") and not any(
+                    isinstance(block, dict) and block.get("type") in {"tool_use", "tool_call"}
+                    for block in content
+                ):
                     final_text = "\n".join(texts)
+            for call in event.get("tool_calls") or []:
+                function = call.get("function") or {}
+                raw_input = function.get("arguments") or {}
+                if isinstance(raw_input, str):
+                    try:
+                        raw_input = json.loads(raw_input)
+                    except ValueError:
+                        raw_input = {}
+                tool_calls.append({
+                    "name": function.get("name"),
+                    "input": ClaudeCodeRuntime._summarize_tool_input({
+                        "name": function.get("name"), "input": raw_input,
+                    }) if isinstance(raw_input, dict) else {},
+                })
             for block in content:
                 if not isinstance(block, dict):
                     continue
@@ -1570,6 +1593,17 @@ class CodexRuntime(_JsonLineCliRuntime):
             str(self.executable), "exec",
             "--ephemeral",
             "--ignore-user-config",
+            # Match the native Root transport on this installation.  The
+            # authenticated proxy supports Responses over HTTPS but not the
+            # built-in provider's WebSocket path; selecting the official
+            # config surface up front avoids spending the whole provider
+            # deadline on WebSocket retries.
+            "-c", "model_provider=mac_openai_https",
+            "-c", 'model_providers.mac_openai_https.name="OpenAI HTTPS"',
+            "-c", 'model_providers.mac_openai_https.wire_api="responses"',
+            "-c", "model_providers.mac_openai_https.requires_openai_auth=true",
+            "-c", "model_providers.mac_openai_https.supports_websockets=false",
+            "-c", "model_providers.mac_openai_https.stream_max_retries=10",
             # Codex 0.144 ships an unsigned code-mode host on macOS. Disabling
             # that host selects the stable shell tool and avoids a model-level
             # environment_failure loop while preserving real tool execution.
@@ -1590,20 +1624,34 @@ class CodexRuntime(_JsonLineCliRuntime):
         final_text: str | None = None
         tool_calls: list[dict[str, Any]] = []
         cost_info: dict[str, Any] | None = None
+        last_transient_error: str | None = None
+        turn_completed = False
         for line in lines:
             event = ClaudeCodeRuntime._try_parse_json(line)
             if not event:
                 continue
             event_type = event.get("type")
-            if event_type in {"turn.failed", "error"}:
+            if event_type == "turn.failed":
                 return final_text, tool_calls, cost_info, str(
                     event.get("error") or event.get("message") or event
                 )
+            if event_type == "error":
+                # Codex may emit transport errors while reconnecting and then
+                # complete the same turn over HTTPS. Keep the diagnostic, but
+                # let the authoritative terminal event decide the outcome.
+                last_transient_error = str(
+                    event.get("error") or event.get("message") or event
+                )
+                continue
             if event_type == "item.completed":
                 item = event.get("item", {})
                 item_type = item.get("type")
                 if item_type == "agent_message":
                     final_text = item.get("text") or final_text
+                elif item_type == "error":
+                    last_transient_error = str(
+                        item.get("error") or item.get("message") or item
+                    )
                 elif item_type in {"command_execution", "file_change", "mcp_tool_call"}:
                     tool_calls.append({
                         "name": item_type,
@@ -1618,10 +1666,16 @@ class CodexRuntime(_JsonLineCliRuntime):
                         },
                     })
             elif event_type == "turn.completed":
+                turn_completed = True
                 usage = event.get("usage")
                 if isinstance(usage, dict):
                     cost_info = dict(usage)
-        return final_text, tool_calls, cost_info, None
+        return (
+            final_text,
+            tool_calls,
+            cost_info,
+            None if turn_completed else last_transient_error,
+        )
 
 
 class PiRuntime(_JsonLineCliRuntime):
@@ -1816,15 +1870,18 @@ class RuntimeRouter(AgentRuntime):
             provider: dict((provider_profiles or {}).get(provider, {}))
             for provider in providers
         }
-        # Cancellation can land in the tiny gap after the primary provider
-        # exits and before the fallback provider registers its subprocess.
-        # Keep a router-level latch so that gap cannot resurrect cancelled work.
+        # Keep cancellation at the router boundary so an execution cannot be
+        # resurrected between subprocess lifecycle transitions.
         self._active_task_ids: set[str] = set()
         self._cancelled_task_ids: set[str] = set()
 
     def provider_for(self, agent_type: str) -> str:
         selected = self.agent_providers.get(agent_type, self.default_provider)
-        return selected if selected in self.providers else self.default_provider
+        if selected not in self.providers:
+            raise RuntimeError(
+                f"Configured runtime provider is unavailable for {agent_type}: {selected}"
+            )
+        return selected
 
     def available_providers(self) -> set[str]:
         return set(self.providers)
@@ -1935,9 +1992,8 @@ class RuntimeRouter(AgentRuntime):
         if task_id in self._active_task_ids:
             self._cancelled_task_ids.add(task_id)
         # Feishu handlers and background project workers can own different
-        # RuntimeRouter instances.  Keep the cancellation latch process-wide
-        # so one instance cannot kill the primary provider while another
-        # mistakes that exit for a provider failure and starts a fallback.
+        # RuntimeRouter instances. Keep the cancellation latch process-wide so
+        # another instance cannot mistake the exit for an uncancelled failure.
         with _ACTIVE_PROCESS_LOCK:
             _CANCELLED_TASK_IDS.add(task_id)
         for runtime in self.providers.values():
@@ -1984,14 +2040,11 @@ def build_agent_runtime(settings: Any, agent_config: dict[str, Any]) -> AgentRun
         agent: cfg.get("runtime", "claude_code")
         for agent, cfg in agent_config.get("agents", {}).items()
     }
-    for agent, selected in list(assignments.items()):
+    for agent, selected in assignments.items():
         if selected not in providers:
-            logger.warning(
-                "runtime provider %s unavailable for %s; falling back to claude_code",
-                selected,
-                agent,
+            raise ValueError(
+                f"Configured runtime provider is unavailable for {agent}: {selected}"
             )
-            assignments[agent] = "claude_code"
     profile_fields = ("description", "mode", "model", "provider")
     provider_profiles = {
         provider: {

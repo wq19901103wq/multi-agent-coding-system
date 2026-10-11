@@ -4,17 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlmodel import select
+from sqlmodel import Session, select
 
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.config import get_settings
+from mac_system.config import get_agent_config
 from mac_system.core.notification_service import deliver_card, retry_notification
+from mac_system.core.project_files import (
+    resolve_project_file,
+    verify_project_file_signature,
+)
 from mac_system.core.project_service import ProjectNotFoundError, ProjectService
 from mac_system.database import init_db, session_scope
 from mac_system.feishu import NullFeishuBridge
@@ -26,11 +33,13 @@ from mac_system.feishu.handlers import (
 )
 from mac_system.feishu.models import ButtonAction, TextMessage
 from mac_system.feishu.ws_client import FeishuWebSocketClient
+from mac_system.feishu.accounts import create_feishu_bridge, get_feishu_bot_accounts
 from mac_system.models import (
     FeishuEventLog,
     Project,
     ProjectCreate,
     ProjectOut,
+    ProjectOwnerReview,
     ProjectUser,
     RootAgentSession,
 )
@@ -46,23 +55,42 @@ from mac_system.api.dependencies import (
 
 logger = logging.getLogger(__name__)
 
+_PROJECT_TEXT_MEDIA_TYPES = {
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".log": "text/plain",
+    ".rst": "text/plain",
+    ".toml": "text/plain",
+    ".yaml": "text/yaml",
+    ".yml": "text/yaml",
+}
+_UTF8_APPLICATION_MEDIA_TYPES = {
+    "application/json",
+    "application/ld+json",
+    "application/xml",
+    "application/yaml",
+    "application/javascript",
+}
 
-async def _reconcile_interrupted_root_cards(project_ids: list[str]) -> None:
+
+async def _reconcile_interrupted_root_cards(
+    project_ids: list[str],
+    *,
+    auto_resume_project_ids: set[str] | None = None,
+) -> None:
     """Make durable Feishu projections match restart-recovered root turns."""
 
     if not project_ids:
         return
+    auto_resume_project_ids = auto_resume_project_ids or set()
     settings = get_settings()
-    if not settings.feishu_app_id or not settings.feishu_app_secret:
+    accounts = get_feishu_bot_accounts(settings)
+    if not accounts:
         return
-    from mac_system.feishu.bridge import FeishuBridge
-
-    bridge = FeishuBridge(
-        app_id=settings.feishu_app_id,
-        app_secret=settings.feishu_app_secret,
-        encrypt_key=settings.feishu_encrypt_key,
-        verification_token=settings.feishu_verification_token,
-    )
+    bridges = {
+        account_id: create_feishu_bridge(settings, account_id)
+        for account_id in accounts
+    }
     try:
         with session_scope() as session:
             service = ProjectService(session)
@@ -70,12 +98,26 @@ async def _reconcile_interrupted_root_cards(project_ids: list[str]) -> None:
                 project = service.get_project(project_id)
                 if project is None or not project.feishu_chat_id:
                     continue
+                bridge = bridges.get(project.bot_account_id)
+                if bridge is None:
+                    continue
                 projections = service.get_project_card_projections(project_id)
-                progress_key = f"root-agent:{project_id}:activity"
+                legacy_progress_key = f"root-agent:{project_id}:activity"
+                progress_prefix = f"{legacy_progress_key}:"
+
+                def is_live_progress(projection) -> bool:
+                    return bool(
+                        projection.lifecycle_status == "running"
+                        and (
+                            projection.projection_key == legacy_progress_key
+                            or projection.projection_key.startswith(progress_prefix)
+                        )
+                    )
+
                 recoverable = {
                     projection.projection_key
                     for projection in projections
-                    if projection.projection_key == progress_key
+                    if is_live_progress(projection)
                     or (
                         projection.card_kind == "question"
                         and projection.lifecycle_status == "pending"
@@ -94,41 +136,58 @@ async def _reconcile_interrupted_root_cards(project_ids: list[str]) -> None:
                         or not projection.provider_message_id
                     ):
                         continue
-                    is_progress = projection.projection_key == progress_key
-                    title = (
-                        f"[{display_name}] 项目进展"
-                        if is_progress
-                        else f"[{display_name}] 问题已失效"
-                    )
+                    is_progress = is_live_progress(projection)
+                    title = f"[{display_name}] 项目进展"
                     content = (
-                        "**当前进展**：服务重启中止了上一轮；项目已恢复为空闲，"
-                        "可以直接继续发送消息。"
+                        (
+                            "**当前进展**：服务重启中止了旧 turn；已保留原项目会话，"
+                            "并排队自动安全续接。"
+                            if project_id in auto_resume_project_ids
+                            else "**当前进展**：服务重启中止了上一轮；项目已恢复为空闲，"
+                            "可以直接继续发送消息。"
+                        )
                         if is_progress
-                        else "服务重启中止了提出该问题的 Codex turn；旧答案不会再提交，"
-                        "请直接继续发送消息。"
+                        else ""
                     )
                     lifecycle = "interrupted" if is_progress else "expired"
                     try:
-                        await deliver_card(
-                            service,
-                            bridge,
-                            dedupe_key=(
-                                f"restart-recovery:{projection.projection_key}:"
-                                f"{projection.projection_version}"
-                            ),
-                            recipient_id=project.feishu_chat_id,
-                            recipient_type="chat_id",
-                            intent_type="progress" if is_progress else "question",
-                            card=build_content_card(title, content, color="orange"),
-                            project_id=project_id,
-                            update_message_id=projection.provider_message_id,
-                            projection_key=projection.projection_key,
-                            subject_type=projection.subject_type,
-                            subject_id=projection.subject_id,
-                            lifecycle_status=lifecycle,
-                            resolved_by="system_restart" if not is_progress else None,
-                            resulting_state="idle",
-                        )
+                        if is_progress:
+                            await deliver_card(
+                                service,
+                                bridge,
+                                dedupe_key=(
+                                    f"restart-recovery:{projection.projection_key}:"
+                                    f"{projection.projection_version}"
+                                ),
+                                recipient_id=project.feishu_chat_id,
+                                recipient_type="chat_id",
+                                intent_type="progress",
+                                card=build_content_card(title, content, color="orange"),
+                                project_id=project_id,
+                                update_message_id=projection.provider_message_id,
+                                projection_key=projection.projection_key,
+                                subject_type=projection.subject_type,
+                                subject_id=projection.subject_id,
+                                lifecycle_status=lifecycle,
+                                resulting_state="idle",
+                            )
+                        else:
+                            # The restart happened later than the original
+                            # question. Recall the obsolete form instead of
+                            # back-writing that later fact into an old card.
+                            await bridge.delete_message(projection.provider_message_id)
+                            service.upsert_card_projection(
+                                projection_key=projection.projection_key,
+                                project_id=project_id,
+                                conversation_id=projection.conversation_id,
+                                subject_type=projection.subject_type,
+                                subject_id=projection.subject_id,
+                                card_kind=projection.card_kind,
+                                provider_message_id=projection.provider_message_id,
+                                lifecycle_status="recalled",
+                                resolved_by="system_restart",
+                                resulting_state="idle",
+                            )
                     except Exception:
                         logger.warning(
                             "Failed to reconcile recovered card %s",
@@ -136,92 +195,451 @@ async def _reconcile_interrupted_root_cards(project_ids: list[str]) -> None:
                             exc_info=True,
                         )
     finally:
-        await bridge.close()
+        for bridge in bridges.values():
+            if bridge is not None:
+                await bridge.close()
 
 
-async def _drain_notification_outbox() -> None:
+async def _reconcile_owner_assessment_cards() -> int:
+    """Recall stale Owner companion forms without rewriting chat history."""
+
     settings = get_settings()
-    if not settings.feishu_app_id or not settings.feishu_app_secret:
-        return
-    from mac_system.feishu.bridge import FeishuBridge
+    accounts = get_feishu_bot_accounts(settings)
+    if not accounts:
+        return 0
+    bridges = {
+        account_id: create_feishu_bridge(settings, account_id)
+        for account_id in accounts
+    }
+    updated = 0
+    try:
+        with session_scope() as session:
+            service = ProjectService(session)
+            for decision in service.reconcile_project_owner_assessments():
+                project = service.get_project(decision.project_id)
+                if (
+                    project is None
+                    or not project.feishu_chat_id
+                    or not decision.card_message_id
+                ):
+                    continue
+                bridge = bridges.get(project.bot_account_id)
+                if bridge is None:
+                    continue
+                try:
+                    await bridge.delete_message(decision.card_message_id)
+                    service.upsert_card_projection(
+                        project_id=project.id,
+                        projection_key=f"decision:{decision.id}",
+                        subject_type="project_decision",
+                        subject_id=decision.id,
+                        card_kind="decision",
+                        provider_message_id=decision.card_message_id,
+                        lifecycle_status=decision.status,
+                        resolved_by="startup_reconciliation",
+                        resulting_state=project.execution_status,
+                    )
+                    updated += 1
+                except Exception:
+                    logger.warning(
+                        "Failed to reconcile Owner assessment card %s",
+                        decision.id,
+                        exc_info=True,
+                    )
+    finally:
+        for bridge in bridges.values():
+            if bridge is not None:
+                await bridge.close()
+    return updated
 
-    bridge = FeishuBridge(
-        app_id=settings.feishu_app_id,
-        app_secret=settings.feishu_app_secret,
-        encrypt_key=settings.feishu_encrypt_key,
-        verification_token=settings.feishu_verification_token,
-    )
+
+async def _reconcile_closed_interaction_projections() -> int:
+    """Repair old question projections left pending after their form was recalled."""
+
+    settings = get_settings()
+    accounts = get_feishu_bot_accounts(settings)
+    if not accounts:
+        return 0
+    bridges = {
+        account_id: create_feishu_bridge(settings, account_id)
+        for account_id in accounts
+    }
+    repaired = 0
+    try:
+        with session_scope() as session:
+            service = ProjectService(session)
+            for project in service.list_projects():
+                bridge = bridges.get(project.bot_account_id)
+                if bridge is None:
+                    continue
+                for projection in service.get_project_card_projections(project.id):
+                    if not (
+                        projection.subject_type == "question_interaction"
+                        and projection.lifecycle_status == "pending"
+                    ):
+                        continue
+                    interaction = service.get_question_interaction(
+                        projection.subject_id
+                    )
+                    if interaction is None or interaction.status == "pending":
+                        continue
+                    recalled = False
+                    if projection.provider_message_id:
+                        try:
+                            await bridge.delete_message(projection.provider_message_id)
+                            recalled = True
+                        except Exception:
+                            logger.warning(
+                                "Could not recall closed question projection %s; "
+                                "the historical card is left unchanged",
+                                projection.projection_key,
+                            )
+                    service.upsert_card_projection(
+                        projection_key=projection.projection_key,
+                        project_id=projection.project_id,
+                        conversation_id=projection.conversation_id,
+                        subject_type=projection.subject_type,
+                        subject_id=projection.subject_id,
+                        card_kind=projection.card_kind,
+                        provider_message_id=projection.provider_message_id,
+                        lifecycle_status=(
+                            "recalled" if recalled else "closed_unrecalled"
+                        ),
+                        resolved_by=interaction.resolution_source or "reconciliation",
+                        resulting_state="idle",
+                    )
+                    repaired += 1
+    finally:
+        for bridge in bridges.values():
+            if bridge is not None:
+                await bridge.close()
+    return repaired
+
+
+async def _drain_notification_outbox(
+    bind: Any,
+    runtime: Any,
+    settings: Any,
+    ws_clients: dict[str, FeishuWebSocketClient] | None = None,
+) -> None:
+    accounts = get_feishu_bot_accounts(settings)
+    if not accounts:
+        return
+    bridges = {
+        account_id: create_feishu_bridge(settings, account_id)
+        for account_id in accounts
+    }
     try:
         while True:
             await asyncio.sleep(5)
             with session_scope() as session:
                 service = ProjectService(session)
+                recovered_claims = service.recover_inflight_notifications(
+                    older_than_seconds=60,
+                )
+                if any(recovered_claims.values()):
+                    logger.warning(
+                        "Recovered expired notification claims: %s",
+                        recovered_claims,
+                    )
                 for notification in service.list_retryable_notifications():
+                    bridge = bridges.get(notification.bot_account_id)
+                    if bridge is None:
+                        service.finish_notification(
+                            notification.id,
+                            error=(
+                                "Feishu bot account is not configured: "
+                                f"{notification.bot_account_id}"
+                            ),
+                            retryable=False,
+                        )
+                        continue
                     try:
-                        await retry_notification(service, bridge, notification)
+                        message_id = await retry_notification(service, bridge, notification)
+                        from mac_system.core.notification_service import (
+                            reconcile_retried_root_report,
+                        )
+
+                        reconcile_retried_root_report(
+                            service,
+                            notification,
+                            message_id=message_id,
+                        )
                     except Exception:
                         logger.warning(
                             "Notification retry failed id=%s",
                             notification.id,
                             exc_info=True,
                         )
+                # A sent report must never be resent to retry a failed Owner
+                # dispatch. Pending reviews are durable independent jobs;
+                # the account process deduplicates repeated acknowledgements.
+                pending_reviews = list(session.exec(
+                    select(ProjectOwnerReview)
+                    .where(ProjectOwnerReview.status == "pending")
+                    .order_by(ProjectOwnerReview.created_at)
+                    .limit(100)
+                ).all())
+                for review in pending_reviews:
+                    try:
+                        project = service.require_project(review.project_id)
+                        if settings.feishu_transport == "websocket":
+                            client = (ws_clients or {}).get(project.bot_account_id)
+                            if client is None:
+                                raise RuntimeError(
+                                    "Project account process is unavailable for Owner review"
+                                )
+                            await client.submit_owner_review(project.id, review.id)
+                        else:
+                            from mac_system.core.root_agent import schedule_project_owner_review
+
+                            schedule_project_owner_review(bind, runtime, settings, review.id)
+                    except Exception:
+                        logger.warning(
+                            "Owner review dispatch failed; kept pending id=%s",
+                            review.id,
+                            exc_info=True,
+                        )
     finally:
-        await bridge.close()
+        for bridge in bridges.values():
+            if bridge is not None:
+                await bridge.close()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from mac_system.core.root_agent import (
         close_root_threads,
+        build_restart_recovery_trigger,
+        latest_project_human_context,
         register_root_service_loop,
+        schedule_project_owner_review,
+        schedule_root_turn,
     )
+    from mac_system.agents.runtime import build_agent_runtime
 
     register_root_service_loop(asyncio.get_running_loop())
     init_db()
     from mac_system.core.root_sessions import (
+        RootSessionStore,
+        prune_redundant_native_event_snapshots,
         recover_interrupted_external_agents,
         recover_interrupted_native_turns,
     )
 
     with session_scope() as recovery_session:
+        recovery_bind = recovery_session.get_bind()
         recovered_projects = recover_interrupted_native_turns(recovery_session)
+        recovery_jobs = {
+            project_id: job
+            for project_id in recovered_projects
+            if (job := RootSessionStore(recovery_session).get_restart_recovery(project_id))
+            is not None
+        }
         recovered_external_agents = recover_interrupted_external_agents(
             recovery_session
+        )
+        recovery_service = ProjectService(recovery_session)
+        owner_review_jobs = [
+            (
+                review.id,
+                review.project_id,
+                (
+                    project.bot_account_id
+                    if (project := recovery_service.get_project(review.project_id))
+                    else None
+                ),
+            )
+            for review in recovery_service.list_recoverable_project_owner_reviews()
+        ]
+        recovered_notifications = recovery_service.recover_inflight_notifications()
+        pruned_progress_notifications = (
+            recovery_service.prune_sent_progress_notifications()
+        )
+        pruned_native_events = prune_redundant_native_event_snapshots(
+            recovery_session
+        )
+    if pruned_progress_notifications:
+        logger.info(
+            "Pruned %s redundant sent progress notification snapshot(s)",
+            pruned_progress_notifications,
+        )
+    if any(recovered_notifications.values()):
+        logger.warning(
+            "Recovered orphaned notification claims: %s",
+            recovered_notifications,
+        )
+    if any(pruned_native_events.values()):
+        logger.info(
+            "Pruned redundant native event snapshots: %s",
+            pruned_native_events,
         )
     if recovered_projects:
         logger.warning(
             "Recovered %s native Codex turn(s) interrupted by service restart",
             len(recovered_projects),
         )
-        await _reconcile_interrupted_root_cards(recovered_projects)
+        await _reconcile_interrupted_root_cards(
+            recovered_projects,
+            auto_resume_project_ids=set(recovery_jobs),
+        )
+    reconciled_owner_assessments = await _reconcile_owner_assessment_cards()
+    if reconciled_owner_assessments:
+        logger.info(
+            "Reconciled %s stale Project Owner assessment card(s)",
+            reconciled_owner_assessments,
+        )
+    repaired_interaction_projections = (
+        await _reconcile_closed_interaction_projections()
+    )
+    if repaired_interaction_projections:
+        logger.info(
+            "Reconciled %s closed question projection(s)",
+            repaired_interaction_projections,
+        )
     if recovered_external_agents:
         logger.warning(
             "Recovered %s external provider execution(s) interrupted by service restart",
             len(recovered_external_agents),
         )
     settings = get_settings()
-    ws_client: FeishuWebSocketClient | None = None
+    logger.info("Using Codex executable: %s", settings.codex_bin)
+    recovery_dispatches: dict[str, dict[str, Any]] = {}
+    for project_id, (
+        _thread_id,
+        user_request,
+        _request_origin,
+        parent_decision_id,
+    ) in recovery_jobs.items():
+        with Session(recovery_bind) as context_session:
+            service = ProjectService(context_session)
+            project = service.require_project(project_id)
+            human_context = latest_project_human_context(
+                service,
+                project_id,
+                parent_decision_id=parent_decision_id,
+            )
+        recovery_dispatches[project_id] = {
+            "project_id": project_id,
+            "bot_account_id": project.bot_account_id,
+            "trigger": build_restart_recovery_trigger(
+                user_request,
+                human_context,
+            ),
+            "visible_request": user_request,
+            "parent_decision_id": parent_decision_id,
+        }
+    ws_clients: dict[str, FeishuWebSocketClient] = {}
+    delegated_recovery_projects: set[str] = set()
+    delegated_owner_reviews: set[str] = set()
     if (
         settings.feishu_transport == "websocket"
-        and settings.feishu_app_id
-        and settings.feishu_app_secret
     ):
-        ws_client = FeishuWebSocketClient()
-        ws_client.start()
-    app.state.ws_client = ws_client
-    notification_task = asyncio.create_task(
-        _drain_notification_outbox(), name="notification-outbox"
+        for account in get_feishu_bot_accounts(settings).values():
+            account_recovery_turns = tuple(
+                job
+                for job in recovery_dispatches.values()
+                if job["bot_account_id"] == account.id
+            )
+            delegated_recovery_projects.update(
+                str(job["project_id"]) for job in account_recovery_turns
+            )
+            account_owner_reviews = tuple(
+                review_id
+                for review_id, _project_id, bot_account_id in owner_review_jobs
+                if bot_account_id == account.id
+            )
+            delegated_owner_reviews.update(account_owner_reviews)
+            client = FeishuWebSocketClient(
+                account,
+                startup_root_turns=account_recovery_turns,
+                startup_owner_reviews=account_owner_reviews,
+            )
+            client.start()
+            ws_clients[account.id] = client
+    default_account_id = settings.feishu_default_bot_account_id
+    ws_client = ws_clients.get(default_account_id) or next(
+        iter(ws_clients.values()), None
     )
+    app.state.ws_clients = ws_clients
+    # Compatibility for local test injection and older callers.
+    app.state.ws_client = ws_client
+    # The runtime registry is cheap to construct and is also needed by the
+    # durable Owner wake-up loop after startup recovery has finished.
+    runtime = build_agent_runtime(settings, get_agent_config())
+    notification_task = asyncio.create_task(
+        _drain_notification_outbox(recovery_bind, runtime, settings, ws_clients),
+        name="notification-outbox",
+    )
+    if recovery_dispatches:
+        for project_id, job in recovery_dispatches.items():
+            if project_id in delegated_recovery_projects:
+                continue
+            if settings.feishu_transport == "websocket":
+                logger.error(
+                    "Could not dispatch Root recovery %s: account process unavailable",
+                    project_id,
+                )
+                continue
+            schedule_root_turn(
+                recovery_bind,
+                runtime,
+                settings,
+                project_id,
+                str(job["trigger"]),
+                visible_request=str(job["visible_request"]),
+                request_origin="system_recovery",
+                parent_decision_id=(
+                    str(job["parent_decision_id"])
+                    if job.get("parent_decision_id")
+                    else None
+                ),
+            )
+        logger.warning(
+            "Dispatched %s interrupted native Codex turn(s) for safe continuation",
+            len(recovery_dispatches),
+        )
+    if owner_review_jobs:
+        for review_id, _project_id, _bot_account_id in owner_review_jobs:
+            if review_id in delegated_owner_reviews:
+                continue
+            if settings.feishu_transport == "websocket":
+                logger.error(
+                    "Could not dispatch Project Owner review %s: account process unavailable",
+                    review_id,
+                )
+                continue
+            schedule_project_owner_review(
+                recovery_bind,
+                runtime,
+                settings,
+                review_id,
+            )
+        logger.warning(
+            "Scheduled %s interrupted Project Owner review(s) for continuation",
+            len(owner_review_jobs),
+        )
     try:
         yield
     finally:
         notification_task.cancel()
-        await asyncio.gather(notification_task, return_exceptions=True)
+        await asyncio.gather(
+            notification_task, return_exceptions=True
+        )
         await close_root_threads()
         register_root_service_loop(None)
+        # Each account can need up to 50s to stop its native execution. Stop
+        # independent workers concurrently within launchd's shutdown grace.
+        stop_results = await asyncio.gather(
+            *(asyncio.to_thread(client.stop) for client in ws_clients.values()),
+            return_exceptions=True,
+        )
+        for account_id, result in zip(ws_clients, stop_results):
+            if isinstance(result, BaseException):
+                logger.error("Account worker shutdown failed account=%s: %s", account_id, result)
+        app.state.ws_clients = {}
         if ws_client is not None:
-            ws_client.stop()
-        app.state.ws_client = None
+            app.state.ws_client = None
 
 
 app = FastAPI(title="MAC System API", lifespan=lifespan)
@@ -230,8 +648,45 @@ app.include_router(admin_routes.router)
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, Any]:
+    from mac_system.feishu import ws_status
+
+    return {"status": "ok", "feishu_ws": ws_status.list_statuses()}
+
+
+@app.get("/files/{project_id}/{file_path:path}", include_in_schema=False)
+def get_project_file(
+    project_id: str,
+    file_path: str,
+    sig: str = Query(default=""),
+    service: ProjectService = Depends(get_project_service),
+) -> FileResponse:
+    """Serve one signed file link previously shown in a project card."""
+
+    project = service.get_project(project_id)
+    resolved = resolve_project_file(project, file_path) if project is not None else None
+    if project is None or resolved is None:
+        raise HTTPException(status_code=404, detail="FILE_NOT_FOUND")
+    path, relative_path = resolved
+    if not verify_project_file_signature(
+        project.id, relative_path, sig, service.settings
+    ):
+        raise HTTPException(status_code=403, detail="INVALID_FILE_LINK")
+    media_type = _PROJECT_TEXT_MEDIA_TYPES.get(path.suffix.lower())
+    media_type = media_type or mimetypes.guess_type(path.name)[0]
+    media_type = media_type or "application/octet-stream"
+    if media_type in _UTF8_APPLICATION_MEDIA_TYPES:
+        media_type = f"{media_type}; charset=utf-8"
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type=media_type,
+        content_disposition_type="inline",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.post("/projects", response_model=ProjectOut)
@@ -246,6 +701,7 @@ async def create_project(
             task_type=req.task_type.value,
             description=req.description,
             approval_mode=req.approval_mode,
+            bot_account_id=req.bot_account_id,
             creator_open_id=req.creator_open_id,
             feishu_chat_id=req.feishu_chat_id,
             feishu_chat_type=req.feishu_chat_type,
@@ -320,7 +776,28 @@ async def submit_user_message(
         raise HTTPException(status_code=404, detail="PROJECT_NOT_FOUND") from exc
     if project.status == "cancelled":
         raise HTTPException(status_code=409, detail="PROJECT_CANCELLED")
-    background_tasks.add_task(_run_project_message, project.id, req.content)
+    clients = getattr(app.state, "ws_clients", {})
+    client = clients.get(project.bot_account_id)
+    settings = service.settings
+    account_owned = (
+        settings.feishu_transport == "websocket"
+        and project.bot_account_id in get_feishu_bot_accounts(settings)
+    )
+    if client is not None:
+        try:
+            await client.submit_project_message(project.id, req.content)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504, detail="PROJECT_MESSAGE_ACKNOWLEDGEMENT_UNKNOWN"
+            ) from exc
+        except (RuntimeError, OSError, EOFError) as exc:
+            raise HTTPException(
+                status_code=503, detail="PROJECT_ACCOUNT_UNAVAILABLE"
+            ) from exc
+    elif account_owned:
+        raise HTTPException(status_code=503, detail="PROJECT_ACCOUNT_UNAVAILABLE")
+    else:
+        background_tasks.add_task(_run_project_message, project.id, req.content)
     return UserMessageResponse(
         project_id=project.id,
         reply="收到，正在处理。",

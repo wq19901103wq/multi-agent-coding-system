@@ -9,11 +9,13 @@
     "kimi_code": {
       "enabled": true,
       "mode": "headless_cli",
+      "model": "kimi-code/k3-256k",
       "description": "External Kimi Code CLI. Choose it from configured capability and recent measured execution results, not from task keywords."
     },
     "codex": {
       "enabled": true,
       "mode": "headless_cli",
+      "model": "gpt-6.1-sol",
       "description": "External ephemeral Codex CLI. Prefer native Codex subagents for ordinary delegation; use this only when isolated CLI execution adds value."
     },
     "pi": {

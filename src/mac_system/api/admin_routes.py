@@ -12,7 +12,7 @@ from sqlmodel import select
 from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.config import get_settings
 from mac_system.core.project_service import ProjectNotFoundError, ProjectService
-from mac_system.models import RootAgentSession
+from mac_system.models import EventLog, RootAgentSession
 
 from mac_system.api.dependencies import get_orchestrator, get_project_service
 
@@ -131,6 +131,15 @@ def project_profile(
             RootAgentSession.project_id == project.id
         )
     ).first()
+    timing_rows = service.session.exec(
+        select(EventLog)
+        .where(
+            EventLog.project_id == project.id,
+            EventLog.message == "Root turn performance",
+        )
+        .order_by(EventLog.created_at.desc())
+        .limit(20)
+    ).all()
     return {
         "project_id": project.id,
         "execution_status": project.execution_status,
@@ -138,6 +147,7 @@ def project_profile(
         "active_turn_id": root.active_turn_id if root else None,
         "event_count": root.event_cursor if root else 0,
         "last_error": root.last_error if root else None,
+        "recent_turn_timings": [row.meta for row in timing_rows],
     }
 
 

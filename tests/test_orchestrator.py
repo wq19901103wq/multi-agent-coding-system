@@ -53,3 +53,16 @@ async def test_cancel_uses_native_interrupt(facade, monkeypatch):
     await facade.cancel_project("p1", "stop")
     facade.project_service.cancel_project.assert_awaited_once()
     engine.interrupt.assert_awaited_once_with("p1")
+
+
+@pytest.mark.asyncio
+async def test_stop_turn_preserves_project_and_uses_native_interrupt(
+    facade, monkeypatch
+):
+    engine = SimpleNamespace(interrupt=AsyncMock(return_value=True))
+    monkeypatch.setattr(facade, "_engine", lambda: engine)
+
+    assert await facade.stop_root_turn("p1") is True
+
+    facade.project_service.cancel_project.assert_not_awaited()
+    engine.interrupt.assert_awaited_once_with("p1")

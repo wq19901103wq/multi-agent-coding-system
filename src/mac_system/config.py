@@ -1,10 +1,32 @@
 import json
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_CHATGPT_BUNDLED_CODEX_PATHS = (
+    Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"),
+    Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+)
+
+
+def default_codex_bin() -> Path:
+    """Select a Codex binary compatible with the desktop-owned thread store.
+
+    ChatGPT updates the shared ``~/.codex`` store together with its bundled
+    Codex binary. Prefer that binary on macOS so an older standalone CLI does
+    not try to resume a newer on-disk thread format. ``CODEX_BIN`` remains an
+    explicit override, and hosts without ChatGPT keep PATH-based lookup.
+    """
+
+    for bundled in _CHATGPT_BUNDLED_CODEX_PATHS:
+        if bundled.is_file() and os.access(bundled, os.X_OK):
+            return bundled
+    return Path("codex")
 
 
 class Settings(BaseSettings):
@@ -40,7 +62,7 @@ class Settings(BaseSettings):
     # Alternative coding-agent CLIs. Provider selection is configured per
     # Agent in agent_config.json; these paths only describe local executables.
     kimi_bin: Path = Field(default=Path("kimi"), alias="KIMI_BIN")
-    codex_bin: Path = Field(default=Path("codex"), alias="CODEX_BIN")
+    codex_bin: Path = Field(default_factory=default_codex_bin, alias="CODEX_BIN")
     pi_bin: Path = Field(default=Path("pi"), alias="PI_BIN")
     zcode_bin: Path = Field(
         default=Path("/Applications/ZCode.app/Contents/MacOS/ZCode"),
@@ -50,6 +72,12 @@ class Settings(BaseSettings):
     # Feishu
     feishu_app_id: str | None = Field(default=None, alias="FEISHU_APP_ID")
     feishu_app_secret: str | None = Field(default=None, alias="FEISHU_APP_SECRET")
+    feishu_bot_accounts_json: str = Field(
+        default="", alias="FEISHU_BOT_ACCOUNTS_JSON"
+    )
+    feishu_default_bot_account_id: str = Field(
+        default="default", alias="FEISHU_DEFAULT_BOT_ACCOUNT_ID"
+    )
     feishu_verification_token: str | None = Field(default=None, alias="FEISHU_VERIFICATION_TOKEN")
     feishu_encrypt_key: str | None = Field(default=None, alias="FEISHU_ENCRYPT_KEY")
     feishu_event_prefix: str = Field(default="/feishu/events", alias="FEISHU_EVENT_PREFIX")
@@ -63,10 +91,29 @@ class Settings(BaseSettings):
 
     # Runtime
     agent_timeout_seconds: int = Field(default=600, alias="AGENT_TIMEOUT_SECONDS")
+    project_lead_provider: str = Field(
+        default="codex", alias="PROJECT_LEAD_PROVIDER"
+    )
+    project_lead_failover_provider: str = Field(
+        default="", alias="PROJECT_LEAD_FAILOVER_PROVIDER"
+    )
+    project_lead_silence_timeout_seconds: int = Field(
+        default=300, ge=1, alias="PROJECT_LEAD_SILENCE_TIMEOUT_SECONDS"
+    )
+    project_owner_provider: str = Field(
+        default="codex", alias="PROJECT_OWNER_PROVIDER"
+    )
+    project_owner_wakeup_seconds: int = Field(
+        default=15, alias="PROJECT_OWNER_WAKEUP_SECONDS"
+    )
 
     # Admin panel
     admin_token: str | None = Field(default=None, alias="ADMIN_TOKEN")
     control_api_token: str | None = Field(default=None, alias="CONTROL_API_TOKEN")
+    mac_public_base_url: str | None = Field(default=None, alias="MAC_PUBLIC_BASE_URL")
+    mac_file_link_secret: str | None = Field(
+        default=None, alias="MAC_FILE_LINK_SECRET"
+    )
 
     # Directory binding (chat-scoped /bind)
     # Comma-separated list of absolute paths the bot is allowed to scan and

@@ -36,8 +36,7 @@ env/
 # Environment variables
 .env
 .env.local
-.env.bak
-.env.bak.*
+.env.bak*
 .mac-secrets.json
 .mac-secrets.json.tmp
 
@@ -47,6 +46,8 @@ env/
 *.db-wal
 *.sqlite
 *.sqlite3
+*.sqlite*-shm
+*.sqlite*-wal
 
 # Project workspaces (generated code)
 projects/*/
@@ -62,3 +63,4 @@ logs/
 # macOS
 .DS_Store
 .worktrees/
+/.mac/

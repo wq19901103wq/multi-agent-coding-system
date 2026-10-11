@@ -67,14 +67,34 @@ class FeishuBridge:
         self.encrypt_key = encrypt_key
         self.verification_token = verification_token
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = self._create_client()
+        self._client_requests: dict[httpx.AsyncClient, int] = {}
+        self._closed = False
         self._token: str | None = None
         self._token_expire_at: float = 0.0
 
+    def _create_client(self) -> httpx.AsyncClient:
+        # Bounded pool with a short pool timeout: after a network flap or
+        # host sleep, a wedged acquisition must fail fast so the existing
+        # retry loop rotates to a fresh connection instead of stacking
+        # 30-second pool waits. Short keepalive expiry reaps half-open
+        # connections left behind by sleep/wake cycles.
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, pool=5.0),
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=10,
+                keepalive_expiry=15.0,
+            ),
+        )
     async def close(self) -> None:
-        await self._client.aclose()
+        self._closed = True
+        clients = set(self._client_requests) | {self._client}
+        await asyncio.gather(*(client.aclose() for client in clients))
 
-    async def _get_tenant_token(self) -> str:
+    async def _get_tenant_token(
+        self, client: httpx.AsyncClient | None = None
+    ) -> str:
         now = time.time()
         if self._token and now < self._token_expire_at:
             return self._token
@@ -87,7 +107,7 @@ class FeishuBridge:
             return self._token
 
         url = f"{self.base_url}/open-apis/auth/v3/tenant_access_token/internal"
-        resp = await self._client.post(
+        resp = await (client if client is not None else self._client).post(
             url,
             json={"app_id": self.app_id, "app_secret": self.app_secret},
         )
@@ -119,9 +139,11 @@ class FeishuBridge:
     ) -> dict[str, Any]:
         last_exc: Exception | None = None
         for attempt in range(max_retries):
+            client = self._client
+            self._client_requests[client] = self._client_requests.get(client, 0) + 1
             try:
-                token = await self._get_tenant_token()
-                resp = await self._client.request(
+                token = await self._get_tenant_token(client)
+                resp = await client.request(
                     method,
                     f"{self.base_url}{path}",
                     params=params,
@@ -137,14 +159,37 @@ class FeishuBridge:
                 httpx.HTTPStatusError,
                 httpx.NetworkError,
                 httpx.TimeoutException,
+                httpx.ProxyError,
             ) as exc:
                 if isinstance(exc, httpx.HTTPStatusError):
                     status = exc.response.status_code
                     if status < 500 and status != 429:
                         raise _status_error(exc) from exc
                 last_exc = exc
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(0.5 * (2 ** attempt))
+                if (
+                    isinstance(
+                        exc,
+                        (
+                            httpx.ConnectError,
+                            httpx.ConnectTimeout,
+                            httpx.PoolTimeout,
+                            httpx.ProxyError,
+                        ),
+                    )
+                    and client is self._client
+                    and not self._closed
+                ):
+                    self._client = self._create_client()
+            finally:
+                remaining = self._client_requests[client] - 1
+                if remaining:
+                    self._client_requests[client] = remaining
+                else:
+                    del self._client_requests[client]
+                    if client is not self._client:
+                        await client.aclose()
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5 * (2 ** attempt))
         if isinstance(last_exc, httpx.HTTPStatusError):
             raise _status_error(last_exc) from last_exc
         raise last_exc
@@ -252,6 +297,13 @@ class FeishuBridge:
             json_data={"content": json.dumps(card_content, ensure_ascii=False)},
         )
 
+    async def delete_message(self, message_id: str) -> None:
+        """Remove a bot-authored interaction once a later event resolves it."""
+        await self._request(
+            "DELETE",
+            f"/open-apis/im/v1/messages/{message_id}",
+        )
+
     async def add_reaction(self, message_id: str, emoji_type: str = "OnIt") -> str | None:
         """Attach a processing reaction to the user's original message."""
         if not message_id:
@@ -306,7 +358,8 @@ class FeishuBridge:
         value = action.get("value", {})
         form_value = action.get("form_value") or {}
         operator = event.get("operator", {})
-        open_id = operator.get("operator_id", {}).get("open_id", "")
+        operator_id = operator.get("operator_id", {})
+        open_id = operator_id.get("open_id", "")
         reserved = {
             "approval_id", "action", "state", "decision_id", "option_key",
             "chat_id", "chat_type",
@@ -335,6 +388,8 @@ class FeishuBridge:
             chat_type=value.get("chat_type", "p2p") or "p2p",
             message_id=event.get("context", {}).get("open_message_id"),
             created_at=created_at,
+            user_id=operator_id.get("user_id"),
+            union_id=operator_id.get("union_id"),
         )
 
     def parse_text_message(self, payload: dict[str, Any]) -> TextMessage:
@@ -365,12 +420,16 @@ class FeishuBridge:
             message_id=message_id,
             text=text,
             is_command=text.startswith("/"),
-            parent_id=message.get("parent_id") or message.get("root_id"),
+            # Only an explicit parent is a reply-routing signal. A thread
+            # root is conversation structure, not a selected card.
+            parent_id=message.get("parent_id"),
             chat_id=chat_id,
             chat_type=chat_type,
             sender_type=sender.get("sender_type", "user") or "user",
             mentions=mentions,
             created_at=created_at,
+            user_id=sender_id.get("user_id"),
+            union_id=sender_id.get("union_id"),
         )
 
     def verify_request(
@@ -415,6 +474,9 @@ class NullFeishuBridge:
         return ""
 
     async def update_card(self, message_id: str, card_content: dict[str, Any]) -> None:
+        return None
+
+    async def delete_message(self, message_id: str) -> None:
         return None
 
     async def add_reaction(self, message_id: str, emoji_type: str = "OnIt") -> str | None:

@@ -51,8 +51,15 @@ def build_main_menu_card(
                 "tag": "action",
                 "actions": [
                     _button("创建项目", "create_prompt", "primary", chat_id, chat_type),
+                    _button("打开目录", "open_directory", chat_id=chat_id, chat_type=chat_type),
                     _button("查看项目", "list_projects_status", chat_id=chat_id, chat_type=chat_type),
                     _button("切换项目", "list_projects_switch", chat_id=chat_id, chat_type=chat_type),
+                ],
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    _button("Coding-Agent", "show_agents", chat_id=chat_id, chat_type=chat_type),
                 ],
             },
         ],
@@ -79,9 +86,21 @@ def build_project_list_card(
         }
 
     action_prefix = "switch" if mode == "switch" else "status"
+    state_labels = {
+        "idle": "空闲",
+        "running": "执行中",
+        "owner_reviewing": "AI 正在判断",
+        "waiting_user": "等你决定",
+        "paused": "已暂停",
+        "failed": "失败",
+    }
     actions = [
         _button(
-            f"{project.get('name') or project['id']}（{project.get('execution_status', 'idle')}）",
+            (
+                f"{'当前 · ' if project.get('is_current') else ''}"
+                f"{str(project.get('name') or project['id'])[:22]}"
+                f"（{state_labels.get(project.get('execution_status', 'idle'), project.get('execution_status', 'idle'))}）"
+            ),
             f"{action_prefix}:{project['id']}",
             chat_id=chat_id,
             chat_type=chat_type,
@@ -96,7 +115,16 @@ def build_project_list_card(
         "config": {"wide_screen_mode": True},
         "header": _header("选择项目", "blue"),
         "elements": [
-            {"tag": "div", "text": _lark_md("点击项目查看或切换：")},
+            {
+                "tag": "div",
+                "text": _lark_md(
+                    (
+                        "点击项目查看状态："
+                        if mode == "status"
+                        else "点击项目切换；也可发送 `/use 项目名`："
+                    )
+                ),
+            },
             *rows,
             {
                 "tag": "action",
@@ -146,12 +174,12 @@ def build_directory_candidate_card(
     ]
     return {
         "config": {"wide_screen_mode": True},
-        "header": _header("选择绑定目录", "blue"),
+        "header": _header("打开已有项目", "blue"),
         "elements": [
             {
                 "tag": "div",
                 "text": _lark_md(
-                    "请选择允许范围内的 Git 仓库。" if candidates else "没有检测到可绑定的 Git 仓库。"
+                    "请选择要打开的 Git 仓库。" if candidates else "没有检测到可打开的 Git 仓库。"
                 ),
             },
             *rows,

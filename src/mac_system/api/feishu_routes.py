@@ -90,6 +90,9 @@ async def feishu_events(
             raise HTTPException(status_code=503, detail="FEISHU_NOT_CONFIGURED")
         msg = bridge.parse_text_message(payload)
         service = ProjectService(session)
+        service.register_user_identity(
+            msg.open_id, user_id=msg.user_id, union_id=msg.union_id
+        )
         if event_id and service.is_event_processed(event_id):
             return {"status": "ok"}
         if event_id:
@@ -111,6 +114,9 @@ async def feishu_events(
             raise HTTPException(status_code=503, detail="FEISHU_NOT_CONFIGURED")
         action = bridge.parse_button_action(payload)
         service = ProjectService(session)
+        service.register_user_identity(
+            action.open_id, user_id=action.user_id, union_id=action.union_id
+        )
         if event_id and service.is_event_processed(event_id):
             return {"status": "ok"}
         if event_id:

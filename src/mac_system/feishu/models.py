@@ -28,6 +28,8 @@ class ButtonAction:
     chat_type: str = "p2p"
     message_id: str | None = None
     created_at: datetime | None = None
+    user_id: str | None = None
+    union_id: str | None = None
 
 
 @dataclass
@@ -45,3 +47,5 @@ class TextMessage:
     is_at_bot: bool = False
     mentions: list[dict[str, Any]] = field(default_factory=list)
     created_at: datetime | None = None
+    user_id: str | None = None
+    union_id: str | None = None

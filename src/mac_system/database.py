@@ -62,6 +62,15 @@ def _run_migrations(engine) -> None:
         return
 
     inspector = inspect(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_event_logs_native_prune "
+                "ON event_logs ("
+                "json_extract(meta, '$.profile_type'), "
+                "json_extract(meta, '$.kind'), project_id)"
+            )
+        )
     for table in SQLModel.metadata.sorted_tables:
         if not inspector.has_table(table.name):
             continue
@@ -80,6 +89,89 @@ def _run_migrations(engine) -> None:
             except Exception as exc:
                 logger.warning(
                     "Failed to add column %s.%s: %s", table.name, column.name, exc
+                )
+
+    # SQLite cannot attach callable JSON defaults through ``ALTER TABLE``.
+    # Backfill only the newly introduced Owner memory fields so rows created
+    # by older MAC versions keep the same list semantics as new rows.
+    owner_list_columns = {
+        "project_decisions": (
+            "acceptance_criteria",
+            "result_refs",
+            "authority_refs",
+        ),
+        "project_policies": ("supersedes_refs",),
+        "project_owner_reviews": (
+            "memory_updates",
+            "policy_updates",
+            "authority_refs",
+        ),
+        "user_owner_memories": ("source_refs",),
+    }
+    refreshed = inspect(engine)
+    with engine.begin() as conn:
+        for table_name, column_names in owner_list_columns.items():
+            if not refreshed.has_table(table_name):
+                continue
+            existing = {
+                item["name"] for item in refreshed.get_columns(table_name)
+            }
+            for column_name in column_names:
+                if column_name in existing:
+                    conn.execute(
+                        text(
+                            f"UPDATE {table_name} SET {column_name} = '[]' "
+                            f"WHERE {column_name} IS NULL"
+                        )
+                    )
+        if refreshed.has_table("project_policies"):
+            policy_columns = {
+                item["name"] for item in refreshed.get_columns("project_policies")
+            }
+            if "source_context" in policy_columns:
+                conn.execute(
+                    text(
+                        "UPDATE project_policies SET source_context = '{}' "
+                        "WHERE source_context IS NULL"
+                    )
+                )
+        for table_name in ("user_owner_memories", "user_owner_sources"):
+            if not refreshed.has_table(table_name):
+                continue
+            columns = {
+                item["name"] for item in refreshed.get_columns(table_name)
+            }
+            if {"human_id", "bot_account_id", "open_id"}.issubset(columns):
+                conn.execute(
+                    text(
+                        f"UPDATE {table_name} "
+                        "SET human_id = 'feishu-open:' || "
+                        "COALESCE(bot_account_id, 'default') || ':' || open_id "
+                        "WHERE human_id IS NULL OR human_id = ''"
+                    )
+                )
+        # Older global Owner memories kept only a public review reference;
+        # recover the source project where that review is still available.
+        if refreshed.has_table("user_owner_memories") and refreshed.has_table(
+            "project_owner_reviews"
+        ):
+            memory_columns = {
+                item["name"]
+                for item in refreshed.get_columns("user_owner_memories")
+            }
+            if "source_project_id" in memory_columns:
+                conn.execute(
+                    text(
+                        "UPDATE user_owner_memories "
+                        "SET source_project_id = COALESCE("
+                        "source_project_id, project_id, ("
+                        "SELECT project_owner_reviews.project_id "
+                        "FROM project_owner_reviews "
+                        "WHERE project_owner_reviews.request_item_id = "
+                        "user_owner_memories.source_ref "
+                        "ORDER BY project_owner_reviews.created_at DESC LIMIT 1"
+                        ")) WHERE source_project_id IS NULL"
+                    )
                 )
 
 

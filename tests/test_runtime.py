@@ -12,6 +12,16 @@ from mac_system.agents.runtime import (
     RuntimeRouter,
     normalize_optional_nulls,
 )
+from mac_system.config import load_agent_config
+
+
+def test_configured_external_codex_uses_sol(tmp_path):
+    config = load_agent_config(Path(__file__).resolve().parents[1] / "agent_config.json")
+    runtime = CodexRuntime(Path("/usr/bin/codex"), config["runtimes"]["codex"]["model"])
+
+    command = runtime.build_command("read-only check", tmp_path, ["Read"])
+
+    assert command[command.index("--model") + 1] == "gpt-6.1-sol"
 
 
 def test_optional_nulls_are_omitted_without_changing_required_values():
@@ -81,6 +91,15 @@ def test_kimi_command_and_event_parser():
     assert error is None
 
 
+def test_kimi_tool_preface_is_not_a_final_answer():
+    runtime = KimiCodeRuntime(Path('kimi'))
+    final, tools, _, _ = runtime.parse_events([json.dumps({
+        'role': 'assistant', 'content': [{'type': 'text', 'text': 'I will read it'}],
+        'tool_calls': [{'id': 'read-1', 'function': {'name': 'ReadFile', 'arguments': '{}'}}],
+    })])
+    assert not final and tools
+
+
 def test_pi_is_ephemeral_and_capability_scoped():
     runtime = PiRuntime(
         Path("/usr/local/bin/pi"),
@@ -135,6 +154,9 @@ def test_codex_cli_permissions_are_derived_from_capabilities():
     assert writable[writable.index("-s") + 1] == "workspace-write"
     assert host[host.index("-s") + 1] == "danger-full-access"
     assert "--output-schema" not in writable
+    assert "model_provider=mac_openai_https" in readonly
+    assert "model_providers.mac_openai_https.supports_websockets=false" in readonly
+    assert "model_providers.mac_openai_https.stream_max_retries=10" in readonly
 
 
 def test_codex_jsonl_parser_extracts_final_message_and_usage():
@@ -157,6 +179,37 @@ def test_codex_jsonl_parser_extracts_final_message_and_usage():
     assert tools[0]["name"] == "command_execution"
     assert cost == {"input_tokens": 12, "output_tokens": 8}
     assert error is None
+
+
+def test_codex_jsonl_parser_treats_reconnect_error_as_transient_after_completion():
+    runtime = CodexRuntime(Path("codex"))
+    final, tools, cost, error = runtime.parse_events([
+        json.dumps({"type": "error", "message": "Reconnecting... 2/5"}),
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "error", "message": "Falling back to HTTPS"},
+        }),
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": "done"},
+        }),
+        json.dumps({"type": "turn.completed", "usage": {"output_tokens": 1}}),
+    ])
+    assert final == "done"
+    assert tools == []
+    assert cost == {"output_tokens": 1}
+    assert error is None
+
+
+def test_codex_jsonl_parser_reports_error_without_successful_terminal_event():
+    runtime = CodexRuntime(Path("codex"))
+    final, tools, cost, error = runtime.parse_events([
+        json.dumps({"type": "error", "message": "request timed out"}),
+    ])
+    assert final is None
+    assert tools == []
+    assert cost is None
+    assert error == "request timed out"
 
 
 @pytest.mark.asyncio
@@ -212,6 +265,16 @@ def test_runtime_router_exposes_only_available_provider_profiles():
         "claude_code": {"description": "Claude"},
         "codex": {"description": "Codex", "model": "configured-model"},
     }
+
+
+def test_runtime_router_rejects_unavailable_configured_provider():
+    router = RuntimeRouter(
+        {"claude_code": FakeRuntime({})},
+        {"external": "missing-provider"},
+    )
+
+    with pytest.raises(RuntimeError, match="missing-provider"):
+        router.provider_for("external")
 
 
 @pytest.mark.asyncio

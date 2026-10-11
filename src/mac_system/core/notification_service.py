@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from datetime import datetime
 
 import httpx
 
 from mac_system.core.project_service import ProjectService
+from mac_system.core.project_files import rewrite_card_project_file_links
 
 
 def is_retryable_delivery_error(exc: Exception) -> bool:
@@ -28,6 +30,7 @@ async def deliver_card(
     recipient_type: str,
     intent_type: str,
     card: dict[str, Any],
+    bot_account_id: str | None = None,
     project_id: str | None = None,
     conversation_id: str | None = None,
     update_message_id: str | None = None,
@@ -36,6 +39,7 @@ async def deliver_card(
     subject_id: str | None = None,
     lifecycle_status: str | None = None,
     selected_action: str | None = None,
+    view_state: str | None = None,
     resolved_by: str | None = None,
     resulting_state: str | None = None,
 ) -> str | None:
@@ -44,6 +48,12 @@ async def deliver_card(
     The intent is committed before calling Feishu. Replaying an already-sent
     intent returns its recorded message id without posting a duplicate.
     """
+    if project_id:
+        project = service.get_project(project_id)
+        if project is not None:
+            card = rewrite_card_project_file_links(
+                card, project, service.settings
+            )
     notification = service.enqueue_notification(
         dedupe_key=dedupe_key,
         recipient_id=recipient_id,
@@ -57,11 +67,13 @@ async def deliver_card(
             "subject_id": subject_id,
             "lifecycle_status": lifecycle_status,
             "selected_action": selected_action,
+            "view_state": view_state,
             "resolved_by": resolved_by,
             "resulting_state": resulting_state,
         },
         project_id=project_id,
         conversation_id=conversation_id,
+        bot_account_id=bot_account_id,
     )
     effective_projection_key = (
         projection_key
@@ -82,6 +94,7 @@ async def deliver_card(
             conversation_id=conversation_id,
             lifecycle_status=effective_lifecycle,
             selected_action=selected_action,
+            view_state=view_state,
             resolved_by=resolved_by,
             resulting_state=resulting_state,
         )
@@ -128,6 +141,7 @@ async def deliver_card(
                 "delivery_failed" if retryable else "delivery_terminal_failed"
             ),
             selected_action=selected_action,
+            view_state=view_state,
             resolved_by=resolved_by,
             resulting_state=resulting_state,
             last_error=str(exc)[:1000],
@@ -146,9 +160,15 @@ async def deliver_card(
         conversation_id=conversation_id,
         lifecycle_status=effective_lifecycle,
         selected_action=selected_action,
+        view_state=view_state,
         resolved_by=resolved_by,
         resulting_state=resulting_state,
     )
+    if intent_type == "progress" and effective_projection_key:
+        service.prune_sent_progress_notifications(
+            projection_key=effective_projection_key,
+            keep_notification_id=claimed.id,
+        )
     return message_id or update_message_id
 
 
@@ -169,6 +189,7 @@ async def retry_notification(service: ProjectService, bridge: Any, notification:
         recipient_type=notification.recipient_type,
         intent_type=notification.intent_type,
         card=card,
+        bot_account_id=notification.bot_account_id,
         project_id=notification.project_id,
         conversation_id=notification.conversation_id,
         update_message_id=payload.get("update_message_id"),
@@ -177,6 +198,83 @@ async def retry_notification(service: ProjectService, bridge: Any, notification:
         subject_id=payload.get("subject_id"),
         lifecycle_status=payload.get("lifecycle_status"),
         selected_action=payload.get("selected_action"),
+        view_state=payload.get("view_state"),
         resolved_by=payload.get("resolved_by"),
         resulting_state=payload.get("resulting_state"),
+    )
+
+
+def reconcile_retried_root_report(
+    service: ProjectService,
+    notification: Any,
+    *,
+    message_id: str | None,
+) -> Any | None:
+    """Finalize one Root report only after its durable retry reached Feishu."""
+
+    payload = dict(notification.payload or {})
+    if (
+        notification.intent_type != "report"
+        or payload.get("subject_type") != "root_turn"
+        or not notification.project_id
+        or not message_id
+    ):
+        return None
+    turn_id = str(payload.get("subject_id") or "").strip()
+    card = payload.get("card")
+    if not turn_id or not isinstance(card, dict):
+        return None
+    header = card.get("header")
+    title_node = header.get("title") if isinstance(header, dict) else None
+    title = str(title_node.get("content") or "") if isinstance(title_node, dict) else ""
+    body = card.get("body")
+    elements = body.get("elements") if isinstance(body, dict) else None
+    content = "\n\n".join(
+        str(item.get("content") or "")
+        for item in (elements or [])
+        if isinstance(item, dict)
+        and item.get("tag") == "markdown"
+        and str(item.get("content") or "").strip()
+    )
+    if not title or not content:
+        return None
+    history = service.record_project_history_report(
+        notification.project_id,
+        native_turn_id=turn_id,
+        title=title,
+        content=content,
+        report_ref=notification.dedupe_key,
+        report_status=(
+            "failed" if payload.get("lifecycle_status") == "failed" else "completed"
+        ),
+    )
+    user_request = "\n".join(
+        str(item.get("text") or "").strip()
+        for item in (history.user_instructions or [])
+        if isinstance(item, dict) and str(item.get("text") or "").strip()
+    )
+    project = service.require_project(notification.project_id)
+    reset_at = (project.context or {}).get("runtime_reset_at")
+    if reset_at and notification.created_at <= datetime.fromisoformat(reset_at):
+        # Deliver/retain the successful report, but an explicit reset cancels
+        # its old automatic continuation even if delivery finished later.
+        return None
+    return service.ensure_project_owner_review_job(
+        notification.project_id,
+        request_item_id=f"report:{turn_id}",
+        native_turn_id=turn_id,
+        title=title,
+        content=content,
+        user_request=user_request,
+        report_card={
+            "title": title,
+            "content": content,
+            "page": 1,
+            "total": 1,
+            "color": "red" if payload.get("lifecycle_status") == "failed" else "blue",
+            "projection_key": payload.get("projection_key"),
+            "message_id": message_id,
+        },
+        request_origin=history.request_origin,
+        parent_decision_id=history.parent_decision_id,
     )
