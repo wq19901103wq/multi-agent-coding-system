@@ -3,6 +3,8 @@ name = "mac-system"
 version = "0.1.0"
 description = "Mobile Codex project host with Feishu integration"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "lark-oapi>=1.4.0",
@@ -29,7 +31,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]

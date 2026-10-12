@@ -8,6 +8,11 @@ import tarfile
 
 import pytest
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "prepare_source_release.py"
 SPEC = importlib.util.spec_from_file_location("prepare_source_release", SCRIPT)
@@ -50,7 +55,9 @@ def test_candidate_excludes_host_data_and_hashes_every_file(source_tree, tmp_pat
         names = archive.getnames()
         manifest = json.load(archive.extractfile("mac-system-source/PUBLIC_MANIFEST.json"))
         assert len(manifest["files"]) == count == len(names) - 1
-        assert manifest["license_status"] == "not_selected"
+        assert manifest["license_status"] == "selected"
+        assert manifest["license"] == "MIT"
+        assert "mac-system-source/LICENSE" in names
         for item in manifest["files"]:
             content = archive.extractfile(f'mac-system-source/{item["path"]}').read()
             assert hashlib.sha256(content).hexdigest() == item["sha256"]
@@ -72,7 +79,7 @@ def test_candidate_is_reproducible_and_does_not_overwrite(source_tree, tmp_path)
     assert first.read_bytes() == original
 
 
-@pytest.mark.parametrize("target", ["README.md", "src/mac_system/main.py", "docs"])
+@pytest.mark.parametrize("target", ["README.md", "LICENSE", "src/mac_system/main.py", "docs"])
 def test_candidate_refuses_symlinks(source_tree, tmp_path, target):
     path = source_tree / target
     outside = tmp_path / "private.txt"
@@ -89,9 +96,29 @@ def test_candidate_refuses_symlinks(source_tree, tmp_path, target):
     assert not output.exists()
 
 
-def test_candidate_fails_before_output_if_required_file_missing(source_tree, tmp_path):
-    (source_tree / "README.md").unlink()
+@pytest.mark.parametrize("target", ["README.md", "LICENSE", "pyproject.toml"])
+def test_candidate_fails_before_output_if_required_file_missing(source_tree, tmp_path, target):
+    (source_tree / target).unlink()
     output = tmp_path / "candidate.tar.gz"
     with pytest.raises(ValueError, match="Required source file"):
         release.prepare_release(source_tree, output)
     assert not output.exists()
+
+
+def test_repository_license_matches_metadata_and_source_candidate(tmp_path):
+    root = SCRIPT.parents[1]
+    metadata = tomllib.loads((root / "pyproject.toml").read_text())
+    assert metadata["project"]["license"] == "MIT"
+    assert metadata["project"]["license-files"] == ["LICENSE"]
+    license_text = (root / "LICENSE").read_bytes()
+    assert license_text.startswith(b"MIT License\n")
+    assert b"Copyright (c) 2026 MAC contributors" in license_text
+    output = tmp_path / "repository.tar.gz"
+    release.prepare_release(root, output)
+    with tarfile.open(output) as archive:
+        manifest = json.load(archive.extractfile("mac-system-source/PUBLIC_MANIFEST.json"))
+        assert manifest["license_status"] == "selected"
+        assert manifest["license"] == metadata["project"]["license"]
+        assert archive.extractfile("mac-system-source/LICENSE").read() == license_text
+        license_entry = next(item for item in manifest["files"] if item["path"] == "LICENSE")
+        assert license_entry["sha256"] == hashlib.sha256(license_text).hexdigest()

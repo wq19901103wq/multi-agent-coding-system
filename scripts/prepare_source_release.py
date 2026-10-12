@@ -13,7 +13,7 @@ import tarfile
 
 TOP_LEVEL_FILES = (
     ".env.example", ".gitignore", "README.md", "CURRENT_STATE.md",
-    "SECURITY.md", "CONTRIBUTING.md", "pyproject.toml", "logging.yaml",
+    "SECURITY.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml", "logging.yaml",
     "agent_config.json",
 )
 DOC_FILES = (
@@ -65,7 +65,8 @@ def prepare_release(root: Path, output: Path) -> int:
                          0o755 if path.stat().st_mode & 0o111 else 0o644))
     manifest = {
         "schema_version": 1,
-        "license_status": "not_selected",
+        "license_status": "selected",
+        "license": "MIT",
         "publication_status": "local_candidate_only",
         "files": [{"path": name, "sha256": hashlib.sha256(content).hexdigest()}
                   for name, content, mode in snapshot],

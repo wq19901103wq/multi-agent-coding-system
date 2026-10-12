@@ -119,5 +119,10 @@ src/mac_system/
 [docs/release-readiness.md](docs/release-readiness.md)。源码包不包含本机凭据、数据库、用户项目
 或旧 Git 历史。本轮代码整理及真实 Kimi 复核见
 [docs/architecture-review-20261012.md](docs/architecture-review-20261012.md)。
-仓库所有者已授权复核后提交并推送当前分支；许可证尚未选择，公开可见不等于
-获得开源使用许可。此授权不包含备份分支、历史重写或部署。
+仓库所有者已授权复核后提交并推送当前分支；此授权不包含备份分支、历史重写或部署。
+
+## 使用许可
+
+MAC 项目源码与随附文档采用 [MIT License](LICENSE)，版权署名为 MAC contributors。
+商用、修改与再分发须遵守许可中的版权与许可声明保留要求。
+第三方依赖及外部 provider 保持各自的使用许可；本项目的 MIT 许可不替代其条款。

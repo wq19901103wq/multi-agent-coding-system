@@ -2,7 +2,9 @@
 
 准备日期：2026-10-10；Kimi 评审与修订：2026-10-11；代码整理与提交准备：2026-10-12。
 本清单保留各冻结候选的历史证据；最新验收以
-[本轮评审记录](architecture-review-20261012.md) 为准。提交源码不等于上线部署或授予开源许可。
+[本轮评审记录](architecture-review-20261012.md) 为准。提交源码不等于上线部署。
+用户于 2026-10-12 另行选择并授权落实 [MIT License](../LICENSE)，版权署名为
+MAC contributors；历史评审和旧候选中的未选许可状态不追溯改写。
 
 ## 已准备
 
@@ -25,10 +27,12 @@ python scripts/prepare_source_release.py --output dist/mac-system-source.tar.gz
 脚本不执行 Git、不停止服务、不调用 provider，也不上传。输出存在时拒绝覆盖。
 包内 `PUBLIC_MANIFEST.json` 列出每个输入文件的 SHA-256，便于核对评审版本。
 
-包括 Python 源码与测试、通用维护/导入/评估脚本、示例配置、白名单中的产品/开发/评审文档、CI 及
+包括 MIT 许可文件、Python 源码与测试、通用维护/导入/评估脚本、示例配置、白名单中的产品/开发/评审文档、CI 及
 存在时的 `uv.lock`。明确排除真实 `.env`、秘密存储、数据库/日志、用户项目、工作树、
 Git 历史、个人 AGENTS 指令、本机事故/用户案例文档与指定项目的一次性切换脚本。
 不携带第三方 provider 源码、CLI 或个人认证状态。
+新生成的候选清单声明 `license_status: selected`、`license: MIT`，并记录 LICENSE 的 SHA-256。
+wheel/sdist 通过 `pyproject.toml` 声明 MIT 并包含 LICENSE；第三方依赖保持各自许可。
 
 脚本默认从所在目录的源码生成候选（包含相关未跟踪源码），不等于现有 HEAD 的
 `git archive`。原交付的 `dist/mac-system-source-20261010-reviewed.tar.gz` 复用
@@ -125,7 +129,7 @@ T5 真实飞书 UI、完整 T6–T9 和停服重启演练不属于本轮新增�
 
 ## 当前发布边界
 
-- 许可证未选择；没有 LICENSE，不宣称已经正式开源。
+- 项目源码与随附文档采用 MIT；LICENSE、包元数据与新生成的源码候选清单保持一致。
 - 用户已授权 Kimi 复核后提交并普通推送当前分支；现有 origin 已公开，不另建仓库或修改可见性。
 - 不改写历史、不轮换凭据、不启动或重启服务，也不执行维护 CLI。
 - 旧备份分支不是候选；禁止 `push --all`、`push --mirror`。
