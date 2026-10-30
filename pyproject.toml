@@ -21,6 +21,8 @@ dependencies = [
     "click>=8.1.0",
     "jsonschema>=4.23.0",
     "psutil>=6.0.0",
+    "claude-agent-sdk==0.2.168",
+    "mcp==2.3.0",
 ]
 
 [project.optional-dependencies]

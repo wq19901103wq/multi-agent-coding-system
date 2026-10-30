@@ -29,6 +29,11 @@ def default_codex_bin() -> Path:
     return Path("codex")
 
 
+def default_dsh_bin() -> Path:
+    local = Path(__file__).resolve().parents[2] / ".mac/dsh-runtime/node_modules/.bin/dsh"
+    return local if local.is_file() else Path("dsh")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -61,6 +66,10 @@ class Settings(BaseSettings):
 
     # Alternative coding-agent CLIs. Provider selection is configured per
     # Agent in agent_config.json; these paths only describe local executables.
+    dsh_bin: Path = Field(default_factory=default_dsh_bin, alias="DSH_BIN")
+    dsh_home: Path | None = Field(default=None, alias="DSH_HOME")
+    deepseek_api_key: str | None = Field(default=None, alias="DEEPSEEK_API_KEY")
+    deepseek_base_url: str | None = Field(default=None, alias="DEEPSEEK_BASE_URL")
     kimi_bin: Path = Field(default=Path("kimi"), alias="KIMI_BIN")
     codex_bin: Path = Field(default_factory=default_codex_bin, alias="CODEX_BIN")
     pi_bin: Path = Field(default=Path("pi"), alias="PI_BIN")
@@ -84,6 +93,14 @@ class Settings(BaseSettings):
     feishu_transport: str = Field(default="websocket", alias="FEISHU_TRANSPORT")
     feishu_test_mode: bool = Field(default=False, alias="FEISHU_TEST_MODE")
 
+    # Reuse the existing OpenClaw iLink bot login without copying its secrets.
+    wechat_notifications_enabled: bool = Field(
+        default=False, alias="WECHAT_NOTIFICATIONS_ENABLED"
+    )
+    wechat_credentials_dir: Path = Field(
+        default=Path("~/.mcp-wechat-server"), alias="WECHAT_CREDENTIALS_DIR"
+    )
+
     # Git
     git_remote_url: str | None = Field(default=None, alias="GIT_REMOTE_URL")
     git_user_name: str = Field(default="MAC System", alias="GIT_USER_NAME")
@@ -99,6 +116,27 @@ class Settings(BaseSettings):
     )
     project_lead_silence_timeout_seconds: int = Field(
         default=300, ge=1, alias="PROJECT_LEAD_SILENCE_TIMEOUT_SECONDS"
+    )
+    codex_continuation_max_attempts: int = Field(
+        default=8, ge=0, le=8, alias="CODEX_CONTINUATION_MAX_ATTEMPTS"
+    )
+    codex_continuation_wait_budget_seconds: float = Field(
+        default=2030, ge=0, le=2030, alias="CODEX_CONTINUATION_WAIT_BUDGET_SECONDS"
+    )
+    codex_continuation_jitter_ratio: float = Field(
+        default=0.1, ge=0, le=1, alias="CODEX_CONTINUATION_JITTER_RATIO"
+    )
+    codex_provider_probe_enabled: bool = Field(
+        default=True, alias="CODEX_PROVIDER_PROBE_ENABLED"
+    )
+    codex_proxy_recovery_enabled: bool = Field(
+        default=True, alias="CODEX_PROXY_RECOVERY_ENABLED"
+    )
+    codex_proxy_recovery_socket: str = Field(
+        default="/tmp/verge/verge-mihomo.sock", alias="CODEX_PROXY_RECOVERY_SOCKET"
+    )
+    codex_proxy_recovery_cooldown_seconds: float = Field(
+        default=120.0, ge=0, alias="CODEX_PROXY_RECOVERY_COOLDOWN_SECONDS"
     )
     project_owner_provider: str = Field(
         default="codex", alias="PROJECT_OWNER_PROVIDER"

@@ -6,6 +6,27 @@ from mac_system import config
 from mac_system.config import Settings
 
 
+@pytest.mark.parametrize("key,value", [
+    ("CODEX_CONTINUATION_MAX_ATTEMPTS", -1),
+    ("CODEX_CONTINUATION_MAX_ATTEMPTS", 9),
+    ("CODEX_CONTINUATION_WAIT_BUDGET_SECONDS", -1),
+    ("CODEX_CONTINUATION_WAIT_BUDGET_SECONDS", 2031),
+    ("CODEX_CONTINUATION_WAIT_BUDGET_SECONDS", "nan"),
+    ("CODEX_CONTINUATION_JITTER_RATIO", 1.1),
+])
+def test_continuation_controls_reject_unbounded_values(key, value):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{key: value})
+
+
+def test_continuation_controls_can_disable_host_retries():
+    settings = Settings(_env_file=None, CODEX_CONTINUATION_MAX_ATTEMPTS=0)
+    assert settings.codex_continuation_max_attempts == 0
+    assert settings.codex_continuation_wait_budget_seconds == 2030
+
+
 @pytest.mark.parametrize("available", ["current", "legacy", "both"])
 def test_default_codex_bin_prefers_chatgpt_bundled_binary(
     monkeypatch, tmp_path: Path, available: str
