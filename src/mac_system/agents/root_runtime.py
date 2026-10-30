@@ -8,18 +8,24 @@ answers app-server requests and projects native events onto its UI/storage.
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import logging
 import os
+import random
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from math import isfinite
 from pathlib import Path
 from typing import Any, ClassVar
+from urllib.parse import unquote, urlparse
 
 from mac_system.agents.process_lifecycle import stop_process_tree
+from mac_system.agents.proxy_recovery import recover_dead_proxy_nodes
 
 
 JsonObject = dict[str, Any]
@@ -29,6 +35,11 @@ ServerRequestHandler = Callable[[str, JsonObject], Awaitable[JsonObject] | JsonO
 logger = logging.getLogger(__name__)
 _APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 _PROCESS_CLOSED_METHOD = "mac/process/closed"
+# Every Codex runtime MAC builds selects the built-in OpenAI provider
+# (``requires_openai_auth``), whose HTTPS traffic goes to this host. The
+# reachability probe only decides whether bounded continuation retries can
+# still succeed; it never changes the native turn/steer protocol.
+_CODEX_BUILTIN_PROVIDER_HOST = "chatgpt.com"
 _HOST_RUNTIME_ENV_KEYS = {
     "CONDA_DEFAULT_ENV",
     "CONDA_PREFIX",
@@ -154,7 +165,9 @@ class TurnResult:
     events: tuple[AgentEvent, ...]
 
 
-_SERVER_OVERLOADED_RETRY_DELAYS_SECONDS = (30.0, 60.0, 120.0)
+_SERVER_OVERLOADED_RETRY_DELAYS_SECONDS = (
+    30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
+)
 _RESPONSE_STREAM_DISCONNECTED_RETRY_DELAYS_SECONDS = (
     5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
 )
@@ -178,18 +191,63 @@ def _turn_error_code(result: TurnResult) -> str | None:
         elif event.kind == "error":
             error = event.payload.get("error")
         if isinstance(error, dict):
-            error_info = error.get("codexErrorInfo")
-            if isinstance(error_info, str) and error_info.strip():
-                return error_info.strip()
-            if isinstance(error_info, dict):
-                # Some app-server error variants are single-key objects, such
-                # as {"responseStreamDisconnected": {"httpStatusCode": null}}.
-                # Return the protocol's stable variant name instead of its
-                # string representation so callers can safely classify it.
-                for code in error_info:
-                    if isinstance(code, str) and code:
-                        return code
+            return _continuation_error_code(error)
     return None
+
+
+def _continuation_error_code(error: JsonObject) -> str | None:
+    error_info = error.get("codexErrorInfo")
+    error_code = None
+    details = None
+    if isinstance(error_info, str):
+        error_code = error_info.strip() or None
+    elif isinstance(error_info, dict):
+        error_code = next(
+            (code for code in error_info if isinstance(code, str) and code), None
+        )
+        details = error_info.get(error_code)
+    if error_code in {"serverOverloaded", "internalServerError"}:
+        return "serverOverloaded"
+    if error_code not in {
+        None, "other", "httpConnectionFailed", "responseStreamConnectionFailed",
+        "responseStreamDisconnected", "responseTooManyFailedAttempts",
+    }:
+        return error_code
+    message = error.get("message")
+    message_text = (
+        message.strip().casefold() if isinstance(message, str) else ""
+    )
+    # An account-level concurrency rejection is temporary: slots free up as
+    # ongoing requests finish, so bounded backoff retries are safe. Match
+    # only the upstream signature; other 401/403 failures (auth, quota,
+    # permission) stay non-retryable below.
+    if (
+        "access_terminated_error" in message_text
+        or "concurrent request limit" in message_text
+    ):
+        return "concurrentRequestLimit"
+    http_status = details.get("httpStatusCode") if isinstance(details, dict) else None
+    if isinstance(http_status, int) and not isinstance(http_status, bool):
+        if http_status in {429, 500, 502, 503, 504}:
+            return "serverOverloaded"
+        if 400 <= http_status < 500:
+            return None
+    if error_code in {
+        "httpConnectionFailed", "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+    }:
+        return error_code
+    message = error.get("message")
+    if isinstance(message, str):
+        message = message.strip().casefold()
+        if message.startswith("stream disconnected before completion:"):
+            return "responseStreamDisconnected"
+        status_prefix = "exceeded retry limit, last status: "
+        if message.startswith(status_prefix):
+            status_text = message[len(status_prefix):].partition(" ")[0]
+            if status_text in {"429", "500", "502", "503", "504"}:
+                return "serverOverloaded"
+    return error_code
 
 
 def _turn_retry_delays(result: TurnResult) -> tuple[float, ...]:
@@ -200,7 +258,7 @@ def _turn_retry_delays(result: TurnResult) -> tuple[float, ...]:
 
 def _error_retry_delays(error_code: str | None) -> tuple[float, ...]:
     match error_code:
-        case "serverOverloaded":
+        case "serverOverloaded" | "concurrentRequestLimit":
             return _SERVER_OVERLOADED_RETRY_DELAYS_SECONDS
         case "responseStreamDisconnected" | "responseStreamConnectionFailed" | "httpConnectionFailed":
             return _RESPONSE_STREAM_DISCONNECTED_RETRY_DELAYS_SECONDS
@@ -210,6 +268,140 @@ def _error_retry_delays(error_code: str | None) -> tuple[float, ...]:
 
 async def _wait_for_server_capacity(delay_seconds: float) -> None:
     await asyncio.sleep(delay_seconds)
+
+
+def _https_reachable_blocking(
+    host: str, port: int, timeout_seconds: float, proxy: tuple[str, int, str | None] | None
+) -> bool:
+    """Blocking HTTPS reachability check, optionally through a CONNECT proxy.
+
+    Unlike the TCP-level probe, this completes the TLS handshake, so a proxy
+    that accepts CONNECT but whose upstream node dead-drops the tunnel is
+    reported unreachable. Raises on timeout-level uncertainty so callers keep
+    their retry plan; returns False on a positively broken path.
+    """
+
+    import socket
+    import ssl
+
+    deadline = timeout_seconds
+    if proxy is None:
+        connect_target = (host, port)
+    else:
+        proxy_host, proxy_port, _authorization = proxy
+        connect_target = (proxy_host, proxy_port)
+    try:
+        raw = socket.create_connection(connect_target, timeout=deadline)
+    except ConnectionRefusedError:
+        # A refused listener (typically a stopped local proxy) is a positively
+        # broken path; only timeouts should stay probe uncertainty.
+        return False
+    if proxy is not None:
+        raw.settimeout(deadline)
+        raw.sendall(
+            f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode()
+        )
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        status_line = response.split(b"\r\n", 1)[0]
+        if b" 200 " not in status_line:
+            raw.close()
+            return False
+    try:
+        raw.settimeout(deadline)
+        context = ssl.create_default_context()
+        with context.wrap_socket(raw, server_hostname=host) as tls:
+            tls.getpeercert()
+    except (ssl.SSLError, OSError):
+        try:
+            raw.close()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+async def _probe_https_reachable(
+    host: str, port: int, timeout_seconds: float
+) -> bool:
+    """HTTPS reachability probe honoring the ambient forward proxy."""
+
+    proxy = None if host in {"localhost", "127.0.0.1", "::1"} else _proxy_connect_target()
+    return await asyncio.to_thread(
+        _https_reachable_blocking, host, port, timeout_seconds, proxy
+    )
+
+
+def _proxy_connect_target() -> tuple[str, int, str | None] | None:
+    """Return ``(host, port, authorization)`` for the ambient forward proxy."""
+
+    raw = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+    if not raw:
+        return None
+    parsed = urlparse(raw if "//" in raw else f"http://{raw}")
+    if not parsed.hostname:
+        return None
+    authorization = None
+    if parsed.username:
+        credentials = f"{unquote(parsed.username)}:{unquote(parsed.password or '')}"
+        authorization = "Basic " + base64.b64encode(credentials.encode()).decode()
+    return parsed.hostname, parsed.port or 80, authorization
+
+
+async def _probe_tcp_reachable(host: str, port: int, timeout_seconds: float) -> bool:
+    """TCP-level reachability probe following the ambient proxy environment.
+
+    A CONNECT through a forward proxy counts as reachable only on HTTP 200;
+    any other CONNECT status means the proxy positively failed to reach the
+    target. Uncertain outcomes (proxy connect refused, read timeout) raise so
+    callers keep the bounded retry plan instead of fast-failing on a blip.
+    """
+
+    proxy = (
+        None
+        if host in {"localhost", "127.0.0.1", "::1"}
+        else _proxy_connect_target()
+    )
+    if proxy is None:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout_seconds
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    proxy_host, proxy_port, authorization = proxy
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(proxy_host, proxy_port), timeout_seconds
+    )
+    try:
+        request = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+        if authorization:
+            request += f"Proxy-Authorization: {authorization}\r\n"
+        writer.write(f"{request}\r\n".encode())
+        await writer.drain()
+        response = await asyncio.wait_for(
+            reader.readuntil(b"\r\n\r\n"), timeout_seconds
+        )
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    status_line = response.split(b"\r\n", 1)[0]
+    return b" 200" in status_line
 
 
 @dataclass(frozen=True)
@@ -266,6 +458,16 @@ class ProjectLeadRuntime(ABC):
         An empty string starts Codex's supported empty-input continuation turn;
         it does not synthesize another user message.
         """
+
+    async def probe_provider_reachable(self, timeout_seconds: float = 5.0) -> bool | None:
+        """Best-effort probe of the provider's network path.
+
+        ``False`` means the path is positively broken, so bounded continuation
+        retries would only burn the wait budget; ``None`` means the runtime
+        cannot decide and callers must keep the native retry plan unchanged.
+        """
+
+        return None
 
     @abstractmethod
     async def steer(self, turn_id: str | None, text: str) -> None:
@@ -356,7 +558,23 @@ class CodexAppServerThread(ProjectLeadRuntime):
         thread_config: JsonObject | None = None,
         codex_home: Path | str | None = None,
         silence_timeout_seconds: float = 300,
+        continuation_max_attempts: int = 8,
+        continuation_wait_budget_seconds: float = 2030,
+        continuation_jitter_ratio: float = 0,
+        provider_probe_enabled: bool = True,
+        proxy_recovery_enabled: bool = False,
+        proxy_recovery_socket: str = "/tmp/verge/verge-mihomo.sock",
+        proxy_recovery_cooldown_seconds: float = 120.0,
     ) -> None:
+        if not 0 <= continuation_max_attempts <= 8:
+            raise ValueError("continuation_max_attempts must be between 0 and 8")
+        if (
+            not isfinite(continuation_wait_budget_seconds)
+            or not 0 <= continuation_wait_budget_seconds <= 2030
+        ):
+            raise ValueError("continuation_wait_budget_seconds must be between 0 and 2030")
+        if not isfinite(continuation_jitter_ratio) or not 0 <= continuation_jitter_ratio <= 1:
+            raise ValueError("continuation_jitter_ratio must be between 0 and 1")
         self.codex_bin = str(codex_bin)
         self.cwd = Path(cwd).resolve()
         self.tools = {tool.name: tool for tool in tools}
@@ -374,6 +592,13 @@ class CodexAppServerThread(ProjectLeadRuntime):
             else max(300.0, request_timeout_seconds)
         )
         self.silence_timeout_seconds = silence_timeout_seconds
+        self.continuation_max_attempts = continuation_max_attempts
+        self.continuation_wait_budget_seconds = continuation_wait_budget_seconds
+        self.continuation_jitter_ratio = continuation_jitter_ratio
+        self.provider_probe_enabled = provider_probe_enabled
+        self._proxy_recovery_enabled = proxy_recovery_enabled
+        self._proxy_recovery_socket = proxy_recovery_socket
+        self._proxy_recovery_cooldown_seconds = proxy_recovery_cooldown_seconds
         self.sandbox = sandbox
         self.approval_policy = approval_policy
         self.ephemeral = ephemeral
@@ -405,6 +630,8 @@ class CodexAppServerThread(ProjectLeadRuntime):
         self._turn_lock = asyncio.Lock()
         self._stderr_lines: deque[str] = deque(maxlen=80)
         self._interrupt_generation = 0
+        self._continuation_interrupt = asyncio.Event()
+        self._continuation_waiting = False
         self._stream_watchdog_turn_id: str | None = None
 
     def update_bindings(
@@ -626,10 +853,29 @@ class CodexAppServerThread(ProjectLeadRuntime):
             self.active_model = reported_model.strip()
         return self.thread_id
 
+    async def probe_provider_reachable(self, timeout_seconds: float = 5.0) -> bool | None:
+        """Probe the built-in ChatGPT provider's network path.
+
+        All MAC-built Codex runtimes authenticate against the built-in OpenAI
+        provider, so the probe target is its fixed HTTPS host. Any probe-side
+        uncertainty stays ``None``: only a positive refusal short-circuits
+        the bounded continuation retries.
+        """
+
+        if not self.provider_probe_enabled:
+            return None
+        try:
+            return await _probe_https_reachable(
+                _CODEX_BUILTIN_PROVIDER_HOST, 443, timeout_seconds
+            )
+        except Exception:
+            return None
+
     async def run_turn(
         self, text: str, *, output_schema: JsonObject | None = None
     ) -> TurnResult:
         async with self._turn_lock:
+            self._continuation_interrupt.clear()
             interrupt_generation = self._interrupt_generation
 
             def retry_code(result: TurnResult) -> str | None:
@@ -646,28 +892,163 @@ class CodexAppServerThread(ProjectLeadRuntime):
             result = await self._run_turn_locked(text, output_schema=output_schema)
             events = list(result.events)
             retry_error_code = retry_code(result)
-            for attempt, delay_seconds in enumerate(
-                _error_retry_delays(retry_error_code), start=1
-            ):
-                if retry_code(result) != retry_error_code:
+            delays = _error_retry_delays(retry_error_code)
+            if not delays:
+                return result
+            plan: list[float] = []
+            stop_reason = "attempts_exhausted"
+            for delay in delays:
+                if len(plan) >= self.continuation_max_attempts:
+                    stop_reason = "disabled" if not plan else "attempt_limit"
                     break
+                delay *= random.uniform(1 - self.continuation_jitter_ratio, 1)
+                if sum(plan) + delay > self.continuation_wait_budget_seconds:
+                    stop_reason = "wait_budget"
+                    break
+                plan.append(delay)
+            attempts = 0
+            scheduled_wait = 0.0
+
+            async def emit_retry(phase: str, **extra: Any) -> None:
+                event = AgentEvent(
+                    kind="mac/continuationRetry",
+                    thread_id=result.thread_id,
+                    turn_id=result.turn_id,
+                    payload={
+                        "phase": phase,
+                        "attempt": attempts,
+                        "maxAttempts": len(plan),
+                        "scheduledWaitSeconds": scheduled_wait,
+                        "waitBudgetSeconds": self.continuation_wait_budget_seconds,
+                        "errorCode": retry_error_code,
+                        **extra,
+                    },
+                )
+                events.append(event)
+                try:
+                    await self._emit(event)
+                except Exception:
+                    logger.warning("Continuation retry projection failed", exc_info=True)
+
+            provider_unreachable = False
+            probe_failures = 0
+            for attempt, delay_seconds in enumerate(plan, start=1):
+                # After the first continuation already failed, a positively
+                # broken network path makes every remaining attempt futile.
+                # Two consecutive probe failures stop the backoff early;
+                # probe uncertainty keeps the native retry plan unchanged.
+                if attempts >= 1:
+                    reachable = await self.probe_provider_reachable()
+                    # A proxy node can pass short probes yet keep killing the
+                    # long-lived model stream, in which case every attempt
+                    # dies with the same stream-class error and probing alone
+                    # never triggers a node switch. Treat repeated stream
+                    # failures as node evidence too and force a group
+                    # re-evaluation that lands on a different healthy node.
+                    stream_path_broken = (
+                        self._proxy_recovery_enabled
+                        and retry_code(result)
+                        in {
+                            "responseStreamDisconnected",
+                            "responseStreamConnectionFailed",
+                            "httpConnectionFailed",
+                        }
+                    )
+                    if reachable is False or stream_path_broken:
+                        # A dead local proxy node surfaces as transport-level
+                        # failures that bounded turn retries cannot outwait.
+                        # Ask the mihomo controller for a healthy node first.
+                        switches = await recover_dead_proxy_nodes(
+                            f"https://{_CODEX_BUILTIN_PROVIDER_HOST}",
+                            socket_path=self._proxy_recovery_socket,
+                            cooldown_seconds=self._proxy_recovery_cooldown_seconds,
+                            force=stream_path_broken and reachable is not False,
+                        )
+                        if switches:
+                            reachable = await self.probe_provider_reachable()
+                            if reachable is True:
+                                await emit_retry(
+                                    "proxyRecovered",
+                                    switches=[list(s) for s in switches],
+                                )
+                    if reachable is False:
+                        probe_failures += 1
+                        if probe_failures >= 2:
+                            provider_unreachable = True
+                            await emit_retry(
+                                "exhausted", stopReason="provider_unreachable"
+                            )
+                            break
+                    else:
+                        probe_failures = 0
                 logger.warning(
                     "Codex native continuation retry %s after %s; waiting %.0fs",
                     attempt,
                     retry_error_code,
                     delay_seconds,
                 )
-                await _wait_for_server_capacity(delay_seconds)
+                scheduled_wait += delay_seconds
+                self._continuation_waiting = True
+                try:
+                    await emit_retry(
+                        "waiting",
+                        attempt=attempt,
+                        delaySeconds=delay_seconds,
+                        retryAt=(
+                            datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+                        ).isoformat(),
+                    )
+                    if self._interrupt_generation == interrupt_generation:
+                        await self._wait_for_continuation(delay_seconds)
+                    if self._interrupt_generation == interrupt_generation:
+                        await emit_retry("resuming", attempt=attempt)
+                finally:
+                    self._continuation_waiting = False
                 if self._interrupt_generation != interrupt_generation:
-                    break
+                    await emit_retry("cancelled", stopReason="user_interrupt")
+                    return TurnResult(
+                        thread_id=result.thread_id,
+                        turn_id=result.turn_id,
+                        status="interrupted",
+                        final_message=result.final_message,
+                        events=tuple(events),
+                    )
                 # The failed turn already persisted its user input and any
                 # completed tool effects. Codex's supported empty-input turn
                 # continues that native history without replaying the human
                 # message or inventing a recovery instruction.
+                attempts = attempt
                 result = await self._run_turn_locked(
                     "", output_schema=output_schema
                 )
                 events.extend(result.events)
+                if result.status == "completed":
+                    await emit_retry("recovered")
+                    break
+                if self._interrupt_generation != interrupt_generation or (
+                    result.status == "interrupted"
+                    and retry_code(result) != "responseStreamDisconnected"
+                ):
+                    await emit_retry("cancelled", stopReason="turn_interrupted")
+                    break
+                # The same outage surfaces under different retryable
+                # classifications across attempts (serverOverloaded,
+                # httpConnectionFailed, responseStreamDisconnected, or an
+                # "other" terminal message in upstream transport format).
+                # Only a failure that no longer carries a bounded retry plan
+                # (401/403, quota, unconfirmed "other") ends the
+                # continuation, so the terminal provider error reaches the
+                # user unchanged.
+                if not _error_retry_delays(retry_code(result)):
+                    await emit_retry("exhausted", stopReason="error_changed")
+                    break
+            else:
+                await emit_retry("exhausted", stopReason=stop_reason)
+            if provider_unreachable:
+                raise AppServerProtocolError(
+                    "Codex 服务网络不可达（探测 chatgpt.com 失败），已提前停止重试；"
+                    "恢复网络/代理后重新发送「继续」即可续跑本轮。"
+                )
             if (
                 result.status == "interrupted"
                 and retry_code(result) == "responseStreamDisconnected"
@@ -685,6 +1066,21 @@ class CodexAppServerThread(ProjectLeadRuntime):
                 final_message=result.final_message,
                 events=tuple(events),
             )
+
+    async def _wait_for_continuation(self, delay_seconds: float) -> None:
+        wait_task = asyncio.create_task(_wait_for_server_capacity(delay_seconds))
+        interrupt_task = asyncio.create_task(self._continuation_interrupt.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {wait_task, interrupt_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if wait_task in done:
+                await wait_task
+        finally:
+            for task in (wait_task, interrupt_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(wait_task, interrupt_task, return_exceptions=True)
 
     async def _run_turn_locked(
         self, text: str, *, output_schema: JsonObject | None = None
@@ -925,6 +1321,10 @@ class CodexAppServerThread(ProjectLeadRuntime):
         if self.thread_id is None:
             raise AppServerProtocolError("Cannot steer before creating a thread")
         target_turn_id = self.active_turn_id or turn_id
+        if not target_turn_id:
+            raise AppServerProtocolError(
+                "Cannot steer without an active turn"
+            )
         try:
             await self._request(
                 "turn/steer",
@@ -954,6 +1354,9 @@ class CodexAppServerThread(ProjectLeadRuntime):
         """Interrupt the actually active native turn."""
 
         self._interrupt_generation += 1
+        self._continuation_interrupt.set()
+        if self._continuation_waiting:
+            return True
         return await self._interrupt_active_turn(turn_id)
 
     async def _interrupt_active_turn(self, turn_id: str | None = None) -> bool:

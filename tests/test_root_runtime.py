@@ -1,9 +1,11 @@
 import asyncio
 import json
+import socket
 
 import pytest
 
 from mac_system.agents.root_runtime import (
+    AgentEvent,
     AppServerProtocolError,
     CodexAppServerThread,
     DynamicTool,
@@ -11,8 +13,24 @@ from mac_system.agents.root_runtime import (
     ProjectLeadRuntimeContext,
     ProjectLeadRuntimeError,
     ProjectLeadRuntimeRegistry,
+    TurnResult,
+    _https_reachable_blocking,
     _isolated_project_process_env,
+    _probe_tcp_reachable,
+    _turn_error_code,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reachable_provider_probe(monkeypatch):
+    """Continuation tests never touch the real provider network path."""
+
+    async def fake_probe(self, timeout_seconds: float = 5.0):
+        return True
+
+    monkeypatch.setattr(
+        CodexAppServerThread, "probe_provider_reachable", fake_probe
+    )
 
 
 class _FakeStdin:
@@ -564,11 +582,13 @@ class _CapacityProcess(_FakeProcess):
     def __init__(
         self, *, failures: int, codex_error_info="serverOverloaded",
         recovery_status: str | None = None,
+        error_message: str = "The upstream turn failed.",
     ):
         super().__init__()
         self.failures = failures
         self.codex_error_info = codex_error_info
         self.recovery_status = recovery_status
+        self.error_message = error_message
         self.turn_attempts = 0
 
     async def receive(self, message):
@@ -600,7 +620,7 @@ class _CapacityProcess(_FakeProcess):
         )
         if self.turn_attempts <= self.failures:
             error = {
-                "message": "The upstream turn failed.",
+                "message": self.error_message,
                 "codexErrorInfo": self.codex_error_info,
             }
             self._feed(
@@ -1087,11 +1107,405 @@ async def test_server_overloaded_retry_is_bounded(monkeypatch, tmp_path):
         message for message in process.messages if message.get("method") == "turn/start"
     ]
     assert result.status == "failed"
-    assert result.turn_id == "capacity-turn-4"
-    assert waits == [30.0, 60.0, 120.0]
-    assert len(starts) == 4
+    assert result.turn_id == "capacity-turn-7"
+    assert waits == [30.0, 60.0, 120.0, 300.0, 600.0, 900.0]
+    assert len(starts) == 7
     assert starts[0]["params"]["input"][0]["text"] == "继续当前实验"
     assert all(message["params"]["input"] == [] for message in starts[1:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options, expected_waits, reason", [
+    ({"continuation_max_attempts": 0}, [], "disabled"),
+    ({"continuation_max_attempts": 1}, [30.0], "attempt_limit"),
+    ({"continuation_wait_budget_seconds": 29}, [], "wait_budget"),
+    ({"continuation_wait_budget_seconds": 90}, [30.0, 60.0], "wait_budget"),
+    ({}, [30.0, 60.0, 120.0, 300.0, 600.0, 900.0], "attempts_exhausted"),
+])
+async def test_continuation_controls_and_terminal_events(
+    monkeypatch, tmp_path, options, expected_waits, reason
+):
+    process = _CapacityProcess(failures=99)
+    waits = []
+    observed = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", no_wait)
+    runtime = CodexAppServerThread(
+        codex_bin="codex", cwd=tmp_path, tools=[], event_handler=observed.append, **options
+    )
+    schema = {"type": "object"}
+    try:
+        result = await runtime.run_turn("只执行一次原请求", output_schema=schema)
+    finally:
+        await runtime.close()
+
+    assert waits == expected_waits
+    retries = [event for event in result.events if event.kind == "mac/continuationRetry"]
+    assert all(event in observed for event in retries)
+    assert [event.payload["phase"] for event in retries] == (
+        [phase for _delay in waits for phase in ("waiting", "resuming")] + ["exhausted"]
+    )
+    assert retries[-1].payload["attempt"] == len(waits)
+    assert retries[-1].payload["stopReason"] == reason
+    assert retries[-1].payload["scheduledWaitSeconds"] <= runtime.continuation_wait_budget_seconds
+    starts = [message for message in process.messages if message.get("method") == "turn/start"]
+    assert len(starts) == len(waits) + 1
+    assert all(message["params"]["threadId"] == "capacity-thread" for message in starts)
+    assert all(message["params"]["outputSchema"] == schema for message in starts)
+    assert all(message["params"]["input"] == [] for message in starts[1:])
+    assert all("model" not in message["params"] for message in starts)
+    assert result.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_steer_without_active_turn_raises_before_request(tmp_path):
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    runtime.thread_id = "thread-1"
+    runtime.active_turn_id = None
+    try:
+        with pytest.raises(
+            AppServerProtocolError, match="without an active turn"
+        ):
+            await runtime.steer(None, "继续")
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_continuation_wait_can_be_cancelled_immediately(monkeypatch, tmp_path):
+    process = _CapacityProcess(failures=99)
+    entered, cleaned = asyncio.Event(), asyncio.Event()
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def long_wait(_delay):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", long_wait)
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    task = asyncio.create_task(runtime.run_turn("继续"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert await runtime.interrupt("capacity-turn-1") is True
+        result = await asyncio.wait_for(task, 1)
+        assert result.status == "interrupted"
+        assert cleaned.is_set()
+        assert process.turn_attempts == 1
+        assert not any(message.get("method") == "turn/interrupt" for message in process.messages)
+        assert result.events[-1].payload["phase"] == "cancelled"
+        process.failures = 0
+        assert (await runtime.run_turn("新的请求")).status == "completed"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["waiting", "resuming"])
+async def test_stop_during_retry_projection_never_starts_another_turn(
+    monkeypatch, tmp_path, phase
+):
+    process = _CapacityProcess(failures=99)
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(_delay):
+        return None
+
+    async def on_event(event):
+        if event.kind == "mac/continuationRetry" and event.payload["phase"] == phase:
+            assert await runtime.interrupt() is True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", no_wait)
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[], event_handler=on_event)
+    try:
+        result = await asyncio.wait_for(runtime.run_turn("继续"), 1)
+    finally:
+        await runtime.close()
+    assert result.status == "interrupted"
+    assert process.turn_attempts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["unauthorized", "usageLimitExceeded", "badRequest", "sandboxError"])
+async def test_non_transient_errors_never_start_continuation(monkeypatch, tmp_path, error_code):
+    process = _CapacityProcess(failures=99, codex_error_info=error_code)
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    try:
+        result = await runtime.run_turn("继续")
+    finally:
+        await runtime.close()
+    assert result.status == "failed"
+    assert process.turn_attempts == 1
+    assert not any(event.kind == "mac/continuationRetry" for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_retry_projection_failure_does_not_replay_success(monkeypatch, tmp_path):
+    process = _CapacityProcess(failures=1)
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(_delay):
+        return None
+
+    def broken_projection(event):
+        if event.kind == "mac/continuationRetry":
+            raise RuntimeError("card transport unavailable")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", no_wait)
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[], event_handler=broken_projection)
+    try:
+        result = await runtime.run_turn("继续")
+    finally:
+        await runtime.close()
+    assert result.status == "completed"
+    assert result.final_message == "done"
+    assert process.turn_attempts == 2
+    assert result.events[-1].payload["phase"] == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_error_change_stops_without_resetting_retry_budget(monkeypatch, tmp_path):
+    class ChangedErrorProcess(_CapacityProcess):
+        async def receive(self, message):
+            if message.get("method") == "turn/start" and self.turn_attempts:
+                # A change to a non-retryable classification ends the
+                # continuation; retryable forms changing shape no longer do.
+                self.codex_error_info = "unauthorized"
+            await super().receive(message)
+
+    process = ChangedErrorProcess(failures=99)
+    waits = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", no_wait)
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    try:
+        result = await runtime.run_turn("继续")
+    finally:
+        await runtime.close()
+    assert waits == [30.0]
+    assert process.turn_attempts == 2
+    assert result.events[-1].payload["stopReason"] == "error_changed"
+
+
+@pytest.mark.asyncio
+async def test_retryable_error_form_change_keeps_continuation(monkeypatch, tmp_path):
+    # The same network outage surfaces under different retryable
+    # classifications across turns: an httpConnectionFailed terminal status
+    # first, then the upstream "other" message form after Codex exhausts
+    # its native stream reconnects. The continuation must ride out the
+    # outage on the original bounded plan instead of stopping on the form
+    # change.
+    class TransportFormProcess(_CapacityProcess):
+        async def receive(self, message):
+            if message.get("method") == "turn/start" and self.turn_attempts:
+                self.codex_error_info = "other"
+                self.error_message = (
+                    "stream disconnected before completion: "
+                    "stream closed before response.completed"
+                )
+            await super().receive(message)
+
+    process = TransportFormProcess(
+        failures=2, codex_error_info={"httpConnectionFailed": {"httpStatusCode": None}},
+        error_message="Connection failed: error sending request",
+    )
+    waits = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", no_wait)
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    try:
+        result = await runtime.run_turn("继续")
+    finally:
+        await runtime.close()
+    assert waits == [5.0, 15.0]
+    assert process.turn_attempts == 3
+    assert result.status == "completed"
+    retry_events = [event for event in result.events if event.kind == "mac/continuationRetry"]
+    assert [event.payload["phase"] for event in retry_events] == [
+        "waiting", "resuming", "waiting", "resuming", "recovered",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fraction, expected", [(0, 27.0), (1, 30.0)])
+async def test_retry_jitter_never_exceeds_previous_ceiling(monkeypatch, tmp_path, fraction, expected):
+    process = _CapacityProcess(failures=1)
+    waits = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", no_wait)
+    monkeypatch.setattr("mac_system.agents.root_runtime.random.uniform", lambda low, high: low + fraction * (high - low))
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[], continuation_jitter_ratio=0.1)
+    try:
+        result = await runtime.run_turn("继续")
+    finally:
+        await runtime.close()
+    assert waits == [expected]
+    assert result.status == "completed"
+
+
+@pytest.mark.parametrize("terminal_code", [None, "other", "unauthorized", "usageLimitExceeded"])
+def test_terminal_failure_does_not_reuse_earlier_transient_classification(terminal_code):
+    result = TurnResult(
+        thread_id="thread-1", turn_id="turn-1", status="failed", final_message=None,
+        events=(
+            AgentEvent(
+                kind="error", thread_id="thread-1", turn_id="turn-1",
+                payload={"willRetry": True, "error": {
+                    "message": "Connection failed", "codexErrorInfo": "responseStreamDisconnected",
+                }},
+            ),
+            AgentEvent(
+                kind="turn/completed", thread_id="thread-1", turn_id="turn-1",
+                payload={"turn": {"status": "failed", "error": {
+                    "message": "The terminal failure is not a transport error.",
+                    "codexErrorInfo": terminal_code,
+                }}},
+            ),
+        ),
+    )
+    assert _turn_error_code(result) == terminal_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_info,message,expected_delay", [
+    ("other", "stream disconnected before completion: stream closed before response.completed", 5.0),
+    (None, "stream disconnected before completion: stream closed before response.completed", 5.0),
+    ("other", "stream disconnected before completion: error sending request", 5.0),
+    ({"responseTooManyFailedAttempts": {"httpStatusCode": None}},
+     "stream disconnected before completion: stream closed before response.completed", 5.0),
+    ("other", "exceeded retry limit, last status: 429 Too Many Requests, request id: test", 30.0),
+    (None, "exceeded retry limit, last status: 503 Service Unavailable", 30.0),
+    ({"responseTooManyFailedAttempts": {"httpStatusCode": 429}}, "HTTP request failed", 30.0),
+    ({"httpConnectionFailed": {"httpStatusCode": 502}}, "HTTP request failed", 30.0),
+    ({"responseStreamDisconnected": {"httpStatusCode": 429}}, "HTTP request failed", 30.0),
+    ("internalServerError", "Internal server error", 30.0),
+    ("other", "The upstream turn failed.", None),
+    ("other", "exceeded retry limit, last status: 401 Unauthorized", None),
+    ("other", "exceeded retry limit, last status: ", None),
+    ("other", "A tool mentioned stream disconnected before completion: an example", None),
+    # Account-level concurrency rejection is temporary: retry on the
+    # capacity backoff plan. Auth/quota 403s without the upstream
+    # signature stay non-retryable.
+    (None, "{'code': -32003, 'message': 'Error code: 403 - {\"error\": {\"message\": \"You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again.\", \"type\": \"access_terminated_error\"}}', 'data': None}", 30.0),
+    ("other", "Error code: 403 - concurrent request limit reached", 30.0),
+    (None, "Error code: 403 - {'error': {'message': 'Unauthorized request', 'type': 'access_terminated'}}", None),
+    (None, "Error code: 403 Forbidden", None),
+    ("usageLimitExceeded", "stream disconnected before completion: stream closed", None),
+    ("usageLimitExceeded", "You've reached your concurrent request limit.", None),
+    ("unauthorized", "exceeded retry limit, last status: 429 Too Many Requests", None),
+    ({"responseStreamDisconnected": {"httpStatusCode": 403}},
+     "stream disconnected before completion: stream closed", None),
+])
+async def test_transport_failure_continuation_preserves_original_error(
+    monkeypatch, tmp_path, error_info, message, expected_delay
+):
+    process = _CapacityProcess(
+        failures=1, codex_error_info=error_info, error_message=message,
+    )
+    waits = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", no_wait)
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    try:
+        result = await runtime.run_turn("继续已有任务，不重发原请求")
+    finally:
+        await runtime.close()
+
+    retry_events = [event for event in result.events if event.kind == "mac/continuationRetry"]
+    assert waits == ([] if expected_delay is None else [expected_delay])
+    assert result.status == ("failed" if expected_delay is None else "completed")
+    assert process.turn_attempts == (1 if expected_delay is None else 2)
+    assert [event.payload["phase"] for event in retry_events] == (
+        [] if expected_delay is None else ["waiting", "resuming", "recovered"]
+    )
+    error_event = next(event for event in result.events if event.kind == "error")
+    assert error_event.payload["error"] == {"message": message, "codexErrorInfo": error_info}
+    starts = [message for message in process.messages if message.get("method") == "turn/start"]
+    assert all(message["params"]["input"] == [] for message in starts[1:])
+    assert all(message["params"]["threadId"] == "capacity-thread" for message in starts)
+    assert all("model" not in message["params"] for message in starts)
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_recovers_after_short_retries_without_user_input(monkeypatch, tmp_path):
+    process = _CapacityProcess(
+        failures=4, codex_error_info="other",
+        error_message="exceeded retry limit, last status: 429 Too Many Requests, request id: test",
+    )
+    waits = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", no_wait)
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    try:
+        result = await runtime.run_turn("保留已有进度")
+    finally:
+        await runtime.close()
+
+    assert waits == [30.0, 60.0, 120.0, 300.0]
+    assert result.status == "completed"
+    assert result.final_message == "done"
+    assert process.turn_attempts == 5
+    assert result.events[-1].payload["phase"] == "recovered"
 
 
 @pytest.mark.asyncio
@@ -1173,6 +1587,209 @@ async def test_response_stream_disconnect_retry_is_bounded(monkeypatch, tmp_path
     assert len(starts) == 9
     assert starts[0]["params"]["input"][0]["text"] == "继续当前实验"
     assert all(message["params"]["input"] == [] for message in starts[1:])
+
+
+@pytest.mark.asyncio
+async def test_stream_disconnect_retry_forces_proxy_recovery_when_probe_passes(
+    monkeypatch, tmp_path
+):
+    process = _CapacityProcess(
+        failures=2,
+        codex_error_info={
+            "responseStreamDisconnected": {"httpStatusCode": None},
+        },
+    )
+    waits: list[float] = []
+    recovery_forces: list[bool] = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay_seconds):
+        waits.append(delay_seconds)
+
+    async def reachable_probe(self, timeout_seconds: float = 5.0):
+        return True
+
+    async def fake_recovery(
+        target_url, *, socket_path, cooldown_seconds, force=False
+    ):
+        recovery_forces.append(force)
+        return [("节点选择", "旧节点", "新节点")]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime._wait_for_server_capacity", no_wait
+    )
+    monkeypatch.setattr(
+        CodexAppServerThread, "probe_provider_reachable", reachable_probe
+    )
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime.recover_dead_proxy_nodes", fake_recovery
+    )
+    runtime = CodexAppServerThread(
+        codex_bin="codex",
+        cwd=tmp_path,
+        tools=[],
+        proxy_recovery_enabled=True,
+    )
+    try:
+        result = await runtime.run_turn("继续当前实验")
+    finally:
+        await runtime.close()
+
+    assert result.status == "completed"
+    # Recovery is only forced once a continuation attempt already failed with
+    # a stream-class error, even though the probe keeps succeeding.
+    assert recovery_forces == [True]
+
+
+@pytest.mark.asyncio
+async def test_overloaded_retry_never_forces_proxy_recovery(monkeypatch, tmp_path):
+    process = _CapacityProcess(failures=1, codex_error_info="serverOverloaded")
+    waits: list[float] = []
+    recovery_calls: list[bool] = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay_seconds):
+        waits.append(delay_seconds)
+
+    async def reachable_probe(self, timeout_seconds: float = 5.0):
+        return True
+
+    async def fake_recovery(
+        target_url, *, socket_path, cooldown_seconds, force=False
+    ):
+        recovery_calls.append(force)
+        return []
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime._wait_for_server_capacity", no_wait
+    )
+    monkeypatch.setattr(
+        CodexAppServerThread, "probe_provider_reachable", reachable_probe
+    )
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime.recover_dead_proxy_nodes", fake_recovery
+    )
+    runtime = CodexAppServerThread(
+        codex_bin="codex",
+        cwd=tmp_path,
+        tools=[],
+        proxy_recovery_enabled=True,
+    )
+    try:
+        result = await runtime.run_turn("继续当前实验")
+    finally:
+        await runtime.close()
+
+    assert result.status == "completed"
+    # serverOverloaded is provider-side, not a broken proxy node.
+    assert recovery_calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_unreachable_stops_continuation_early(monkeypatch, tmp_path):
+    process = _CapacityProcess(
+        failures=99,
+        codex_error_info={
+            "responseStreamDisconnected": {"httpStatusCode": None},
+        },
+    )
+    waits: list[float] = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay_seconds):
+        waits.append(delay_seconds)
+
+    async def unreachable_probe(self, timeout_seconds: float = 5.0):
+        return False
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime._wait_for_server_capacity", no_wait
+    )
+    monkeypatch.setattr(
+        CodexAppServerThread, "probe_provider_reachable", unreachable_probe
+    )
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    try:
+        with pytest.raises(AppServerProtocolError, match="网络不可达"):
+            await runtime.run_turn("继续当前实验")
+    finally:
+        await runtime.close()
+
+    starts = [
+        message for message in process.messages if message.get("method") == "turn/start"
+    ]
+    # One original attempt plus two failed continuations: the third probe
+    # failure stops the backoff long before the 8-attempt budget.
+    assert len(starts) == 3
+    assert waits == [5.0, 15.0]
+
+
+def test_https_probe_treats_refused_local_proxy_as_unreachable():
+    # A stopped local proxy (e.g. Clash Verge quit) is a definitive outage,
+    # not probe uncertainty; otherwise the bounded retry plan burns ~30 min.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    assert _https_reachable_blocking(
+        "chatgpt.com", 443, 1.0, ("127.0.0.1", port, None)
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_probe_tcp_reachable_direct_success():
+    server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        assert await _probe_tcp_reachable("127.0.0.1", port, 2) is True
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_probe_tcp_reachable_refused_raises():
+    probe_socket = socket.socket()
+    probe_socket.bind(("127.0.0.1", 0))
+    port = probe_socket.getsockname()[1]
+    probe_socket.close()
+    with pytest.raises(OSError):
+        await _probe_tcp_reachable("127.0.0.1", port, 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,expected",
+    [(b"HTTP/1.1 200 Connection established", True), (b"HTTP/1.1 502 Bad Gateway", False)],
+)
+async def test_probe_tcp_reachable_via_connect_proxy(monkeypatch, status, expected):
+    requests: list[bytes] = []
+
+    async def handle(reader, writer):
+        requests.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(status + b"\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{port}")
+    try:
+        assert await _probe_tcp_reachable("chatgpt.com", 443, 2) is expected
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert requests and requests[0].startswith(b"CONNECT chatgpt.com:443 ")
 
 
 @pytest.mark.asyncio
