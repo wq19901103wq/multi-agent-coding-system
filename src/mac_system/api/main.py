@@ -18,6 +18,7 @@ from mac_system.agents.orchestrator import AgentOrchestrator
 from mac_system.config import get_settings
 from mac_system.config import get_agent_config
 from mac_system.core.notification_service import deliver_card, retry_notification
+from mac_system.core.wechat_notifications import retry_wechat_reminder
 from mac_system.core.project_files import (
     resolve_project_file,
     verify_project_file_signature,
@@ -323,8 +324,6 @@ async def _drain_notification_outbox(
     ws_clients: dict[str, FeishuWebSocketClient] | None = None,
 ) -> None:
     accounts = get_feishu_bot_accounts(settings)
-    if not accounts:
-        return
     bridges = {
         account_id: create_feishu_bridge(settings, account_id)
         for account_id in accounts
@@ -343,6 +342,19 @@ async def _drain_notification_outbox(
                         recovered_claims,
                     )
                 for notification in service.list_retryable_notifications():
+                    if notification.channel == "wechat":
+                        try:
+                            await retry_wechat_reminder(service, notification)
+                        except Exception:
+                            session.rollback()
+                            logger.warning("WeChat outbox retry failed id=%s", notification.id)
+                        continue
+                    if notification.channel != "feishu":
+                        service.finish_notification(
+                            notification.id, error="Unsupported notification channel",
+                            retryable=False,
+                        )
+                        continue
                     bridge = bridges.get(notification.bot_account_id)
                     if bridge is None:
                         service.finish_notification(

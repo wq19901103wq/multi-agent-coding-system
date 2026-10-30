@@ -39,6 +39,13 @@ echo "claimed pid=$$ at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$OPERATION_DIR/stat
 bash scripts/start_server.sh --check
 bash scripts/stop_server.sh
 echo 'stopped; starting' > "$OPERATION_DIR/status"
-bash scripts/start_server.sh
+if ! bash scripts/start_server.sh >"$OPERATION_DIR/start.log" 2>&1; then
+    # One bounded retry inside the same authorized operation: transient
+    # bootstrap races (e.g. a stale launchd label handoff) recover here,
+    # while the operation's stop/start still happens at most once per claim.
+    echo 'start failed once; retrying in 5s within the same operation' > "$OPERATION_DIR/status"
+    sleep 5
+    bash scripts/start_server.sh >>"$OPERATION_DIR/start.log" 2>&1
+fi
 echo 'restart_completed; independent verification still required' > "$OPERATION_DIR/status"
 echo "Restart operation $OPERATION_ID completed; verify without replaying deployment."

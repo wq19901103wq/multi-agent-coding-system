@@ -109,6 +109,10 @@ wait_for_health() {
         sleep 0.1
     done
     echo "Server did not become healthy within 120s under $SERVICE_LABEL; see $PROJECT_ROOT/server_launchctl.log" >&2
+    echo "--- launchctl state ---" >&2
+    launchctl print "$SERVICE_TARGET" 2>&1 | grep -E "state =|pid =|last exit code" >&2 || true
+    echo "--- last server log lines ---" >&2
+    tail -n 30 "$PROJECT_ROOT/server_launchctl.log" >&2 || true
     return 1
 }
 
@@ -138,6 +142,14 @@ if [ -n "$RUNNING_PID" ]; then
 fi
 
 install_launch_agent
+# launchd refuses to bootstrap a job whose label sits in the disabled list
+# (an earlier stop can leave it there) and only reports a bare
+# "Input/output error". Restore the enabled state up front instead of
+# retrying against a launchd that will keep refusing.
+if launchctl print-disabled "gui/$(id -u)" 2>/dev/null \
+    | awk -v label="\"$SERVICE_LABEL\"" '$1 == label && ($3 == "true" || $3 == "disabled") {found=1} END {exit !found}'; then
+    launchctl enable "$SERVICE_TARGET" 2>/dev/null || true
+fi
 if service_loaded; then
     # ``launchctl bootout`` returns before the label is always fully released.
     # A stop && start sequence can therefore observe the stale label here and
@@ -164,8 +176,9 @@ if service_loaded; then
     fi
 else
     BOOTSTRAPPED=false
+    BOOTSTRAP_ERR=""
     for _ in $(seq 1 50); do
-        if launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH" 2>/dev/null; then
+        if BOOTSTRAP_ERR="$(launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH" 2>&1)"; then
             BOOTSTRAPPED=true
             break
         fi
@@ -179,7 +192,7 @@ else
         sleep 0.1
     done
     if [ "$BOOTSTRAPPED" != true ]; then
-        echo "Failed to load launchd service $SERVICE_LABEL" >&2
+        echo "Failed to load launchd service $SERVICE_LABEL: ${BOOTSTRAP_ERR:-launchctl gave no error details}" >&2
         exit 1
     fi
 fi

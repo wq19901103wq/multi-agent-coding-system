@@ -10,6 +10,7 @@ import httpx
 
 from mac_system.core.project_service import ProjectService
 from mac_system.core.project_files import rewrite_card_project_file_links
+from mac_system.core.wechat_notifications import queue_wechat_reminder
 
 
 def is_retryable_delivery_error(exc: Exception) -> bool:
@@ -75,6 +76,16 @@ async def deliver_card(
         conversation_id=conversation_id,
         bot_account_id=bot_account_id,
     )
+    if intent_type == "report" and lifecycle_status == "failed" and project_id:
+        queue_wechat_reminder(
+            service, event_key=f"failure:{dedupe_key}", project_id=project_id,
+        )
+    if (project_id and subject_type == "project_decision" and subject_id
+            and lifecycle_status == "requires_user"):
+        queue_wechat_reminder(
+            service, event_key=f"decision:{subject_id}", project_id=project_id,
+            decision_id=subject_id,
+        )
     effective_projection_key = (
         projection_key
         or (f"provider:{update_message_id}" if update_message_id else dedupe_key)

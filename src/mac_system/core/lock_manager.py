@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import threading
 import asyncio
-from typing import Any, Coroutine
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Coroutine
 
 
 class _CrossLoopAsyncLock:
@@ -64,6 +65,18 @@ class ProjectLockManager:
         with self._guard:
             lock = self._locks.setdefault(project_id, threading.Lock())
         return _CrossLoopAsyncLock(lock)
+
+    @asynccontextmanager
+    async def try_acquire(self, project_id: str) -> AsyncIterator[bool]:
+        """Try to hold the project lock without waiting for active work."""
+        with self._guard:
+            lock = self._locks.setdefault(project_id, threading.Lock())
+        acquired = lock.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                lock.release()
 
     async def run_locked(self, project_id: str, coro: Coroutine[Any, Any, Any]) -> Any:
         """Run ``coro`` while holding the project lock."""

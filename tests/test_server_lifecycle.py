@@ -10,9 +10,7 @@ import time
 import pytest
 
 
-@pytest.mark.parametrize("disabled_state", ["enabled", "disabled", "true"])
-@pytest.mark.parametrize("venv_name", [".venv", ".worktrees/feat-core/.venv"])
-def test_stop_waits_for_process_after_port_closes(tmp_path, disabled_state, venv_name):
+def run_stop_script(tmp_path, disabled_state, venv_name, extra_env=None):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     source = Path(__file__).resolve().parents[1] / "scripts" / "stop_server.sh"
@@ -20,11 +18,18 @@ def test_stop_waits_for_process_after_port_closes(tmp_path, disabled_state, venv
     shutil.copyfile(source, script)
     shim = tmp_path / "commands.sh"
     shim.write_text(r'''
+state="$TEST_DISABLED"
 launchctl() {
     case "$1" in
         print) echo 'pid = 42';;
         print-disabled)
-            echo "\"com.mac-system.dev\" => $TEST_DISABLED";;
+            echo "\"com.mac-system.dev\" => $state";;
+        disable)
+            echo disable >> "$TEST_ROOT/actions"
+            state=disabled;;
+        enable)
+            echo enable >> "$TEST_ROOT/actions"
+            [ "${TEST_STILL_DISABLED:-0}" = 1 ] || state=enabled;;
         *) echo "$1" >> "$TEST_ROOT/actions";;
     esac
 }
@@ -44,18 +49,35 @@ sleep() {
     echo wait >> "$TEST_ROOT/actions"
 }
 ''')
-    result = subprocess.run(
+    return subprocess.run(
         ["bash", str(script)], capture_output=True, text=True,
         env={**os.environ, "BASH_ENV": str(shim), "TEST_ROOT": str(tmp_path),
-             "TEST_DISABLED": disabled_state, "TEST_VENV_NAME": venv_name},
+             "TEST_DISABLED": disabled_state, "TEST_VENV_NAME": venv_name,
+             **(extra_env or {})},
         timeout=10,
     )
+
+
+@pytest.mark.parametrize("disabled_state", ["enabled", "disabled", "true"])
+@pytest.mark.parametrize("venv_name", [".venv", ".worktrees/feat-core/.venv"])
+def test_stop_waits_for_process_after_port_closes(tmp_path, disabled_state, venv_name):
+    result = run_stop_script(tmp_path, disabled_state, venv_name)
     assert result.returncode == 0, result.stderr
     actions = (tmp_path / "actions").read_text().splitlines()
     expected = ["TERM", "wait", "wait", "bootout"]
     if disabled_state == "enabled":
         expected = ["disable", *expected, "enable"]
     assert actions == expected
+
+
+def test_stop_warns_when_disabled_state_survives_restore(tmp_path):
+    # enable does not take effect (e.g. launchd rejected it): the trap must
+    # surface the stale disabled state instead of leaving the next
+    # start_server.sh bootstrap to fail with an opaque EIO.
+    result = run_stop_script(tmp_path, "enabled", ".venv",
+                             extra_env={"TEST_STILL_DISABLED": "1"})
+    assert result.returncode == 0, result.stderr
+    assert "still disabled" in result.stderr
 
 
 @pytest.fixture
@@ -79,6 +101,12 @@ exit "${STOP_EXIT:-0}"
     (scripts / "start_server.sh").write_text('''#!/bin/bash
 if [ "${1:-}" = --check ]; then exit "${PREFLIGHT_EXIT:-0}"; fi
 echo start >> actions
+count=${START_FAIL_TIMES:-0}
+[ -f .start_fail_remaining ] && count=$(cat .start_fail_remaining)
+if [ "$count" -gt 0 ]; then
+    echo $((count - 1)) > .start_fail_remaining
+    exit 1
+fi
 if [ "${WAIT_FOR_RELEASE:-0}" = 1 ]; then
     while [ ! -f release ]; do sleep 0.01; done
 fi
@@ -100,6 +128,31 @@ def test_restart_attempt_is_never_replayed(restart_entry, failure_env):
     assert second.returncode == 75
     assert (root / "actions").read_text() == actions
     assert not (root / ".mac/restart_operations/.active-lock").exists()
+
+
+def test_restart_retries_failed_start_within_operation(restart_entry):
+    root, script = restart_entry
+    result = subprocess.run(["bash", str(script), "deploy-retry"],
+                            env={**os.environ, "START_FAIL_TIMES": "1"},
+                            capture_output=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert (root / "actions").read_text().splitlines() == ["stop", "start", "start"]
+    # The failed first start is recorded inside the same operation claim.
+    assert (root / ".mac/restart_operations/deploy-retry/start.log").exists()
+    # A later attempt with the same operation id is still refused.
+    replay = subprocess.run(["bash", str(script), "deploy-retry"], capture_output=True, timeout=5)
+    assert replay.returncode == 75
+
+
+def test_restart_gives_up_after_two_failed_starts(restart_entry):
+    root, script = restart_entry
+    result = subprocess.run(["bash", str(script), "deploy-retry-fail"],
+                            env={**os.environ, "START_FAIL_TIMES": "5"},
+                            capture_output=True, timeout=15)
+    assert result.returncode != 0
+    assert (root / "actions").read_text().splitlines() == ["stop", "start", "start"]
+    assert "failed_or_interrupted" in \
+        (root / ".mac/restart_operations/deploy-retry-fail/status").read_text()
 
 
 def test_restart_claim_survives_process_death(restart_entry):
@@ -210,12 +263,19 @@ def start_entry(tmp_path):
     shim = tmp_path / "commands.sh"
     shim.write_text(r'''
 launchctl() {
-    if [ "$1" = print ]; then
-        [ "$TEST_MODE" != unmanaged ] || return 1
-        echo 'pid = 43'
-    else
-        echo "launchctl $*" >> "$TEST_ROOT/actions"
-    fi
+    case "$1" in
+        print)
+            case "$TEST_MODE" in unmanaged|down) return 1;; esac
+            echo 'pid = 43';;
+        print-disabled)
+            echo "\"com.mac-system.dev\" => ${TEST_DISABLED:-enabled}";;
+        bootstrap)
+            echo bootstrap >> "$TEST_ROOT/actions"
+            echo "Bootstrap failed: 5: Input/output error"
+            return 1;;
+        *)
+            echo "$1" >> "$TEST_ROOT/actions";;
+    esac
 }
 lsof() {
     if [ "$TEST_MODE" = unmanaged ]; then echo 42; fi
@@ -298,6 +358,29 @@ def test_start_waits_without_killing_existing_startup(start_entry):
     assert "kill " not in actions
     assert "/health" in (root / "health_requests").read_text()
     assert "/admin/projects" not in (root / "health_requests").read_text()
+
+
+def test_start_reenables_stale_disabled_label_before_bootstrap(start_entry):
+    # A previous stop can leave the label in launchd's disabled list, which
+    # makes bootstrap fail with a bare EIO. start must re-enable first.
+    root, script, env = start_entry
+    result = subprocess.run(["bash", str(script)],
+                            env={**env, "TEST_MODE": "down",
+                                 "TEST_DISABLED": "disabled"},
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode != 0
+    actions = (root / "actions").read_text().splitlines()
+    assert actions.index("enable") < actions.index("bootstrap")
+
+
+def test_start_surfaces_real_bootstrap_error(start_entry):
+    root, script, env = start_entry
+    result = subprocess.run(["bash", str(script)],
+                            env={**env, "TEST_MODE": "down",
+                                 "TEST_DISABLED": "enabled"},
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode != 0
+    assert "Bootstrap failed: 5: Input/output error" in result.stderr
 
 
 def test_start_health_timeout_uses_elapsed_time(start_entry):

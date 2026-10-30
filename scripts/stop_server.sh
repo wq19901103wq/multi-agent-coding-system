@@ -58,6 +58,12 @@ fi
 restore_launchd_state() {
     if [ "$RESTORE_ENABLED" = true ]; then
         launchctl enable "$SERVICE_TARGET"
+        # Surface a stale disabled state: otherwise the next start_server.sh
+        # bootstrap fails with an opaque "Input/output error".
+        if launchctl print-disabled "gui/$(id -u)" 2>/dev/null \
+            | awk -v label="\"$SERVICE_LABEL\"" '$1 == label && ($3 == "true" || $3 == "disabled") {found=1} END {exit !found}'; then
+            echo "WARNING: $SERVICE_LABEL is still disabled in launchd; start_server.sh cannot load it" >&2
+        fi
     fi
 }
 trap restore_launchd_state EXIT

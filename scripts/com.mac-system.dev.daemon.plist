@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mac-system.dev</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec "/Users/yihanwang/multi-agent-coding-system/scripts/run_server.sh"</string>
+    </array>
+    <key>UserName</key>
+    <string>yihanwang</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/yihanwang/multi-agent-coding-system</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ExitTimeOut</key>
+    <integer>120</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/Users/yihanwang/multi-agent-coding-system/server_launchctl.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/yihanwang/multi-agent-coding-system/server_launchctl.log</string>
+</dict>
+</plist>

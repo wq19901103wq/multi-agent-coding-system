@@ -59,3 +59,57 @@ def test_project_lock_serializes_different_event_loops():
             future.result(timeout=5)
 
     assert state["max_active"] == 1
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_does_not_wait_or_release_another_holder():
+    manager = ProjectLockManager()
+    holder = await manager.acquire("busy-project")
+
+    async def probe(project_id):
+        async with manager.try_acquire(project_id) as acquired:
+            return acquired
+
+    async with holder:
+        assert await asyncio.wait_for(probe("busy-project"), 0.5) is False
+        assert await probe("other-project") is True
+        assert await probe("busy-project") is False
+    assert await probe("busy-project") is True
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_releases_on_exception():
+    manager = ProjectLockManager()
+    with pytest.raises(RuntimeError, match="failed inside lock"):
+        async with manager.try_acquire("project") as acquired:
+            assert acquired
+            raise RuntimeError("failed inside lock")
+    async with manager.try_acquire("project") as acquired:
+        assert acquired
+        async with manager.try_acquire("project") as nested:
+            assert not nested
+
+
+def test_try_acquire_respects_holder_on_another_event_loop():
+    manager = ProjectLockManager()
+    entered, release = threading.Event(), threading.Event()
+
+    async def hold():
+        lock = await manager.acquire("cross-loop-project")
+        async with lock:
+            entered.set()
+            await asyncio.to_thread(release.wait, 2)
+
+    async def probe():
+        async with manager.try_acquire("cross-loop-project") as acquired:
+            return acquired
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        holder = pool.submit(asyncio.run, hold())
+        try:
+            assert entered.wait(1)
+            assert asyncio.run(probe()) is False
+        finally:
+            release.set()
+            holder.result(timeout=3)
+    assert asyncio.run(probe()) is True
