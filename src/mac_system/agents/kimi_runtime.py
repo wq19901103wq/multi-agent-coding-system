@@ -166,12 +166,29 @@ class KimiWireThread(ProjectLeadRuntime):
         if output_schema is not None:
             raise KimiWireError("Kimi Wire does not support native output schemas")
         async with self._turn_lock:
-            if self._process is None:
+            if (self._process is None or self._process.returncode is not None
+                    or (self._reader is not None and self._reader.done())):
+                # Recover only before submitting a new request. resume_thread
+                # stops the old writers and keeps the native session; never
+                # replay a prompt that may already have executed tools.
                 await self.resume_thread(self.thread_id or str(uuid4()))
             self.active_turn_id = str(uuid4())
             turn_id = self.active_turn_id
             self._terminal.clear()
             events, parts, requests, tool_ids = [], [], set(), {}
+            message_id = None
+
+            async def complete_public_message(phase):
+                nonlocal message_id
+                if message_id is not None:
+                    await self._emit("item/completed", {
+                        "threadId": self.thread_id, "turnId": turn_id,
+                        "item": {"id": message_id, "type": "agentMessage",
+                                 "text": "".join(parts).strip(), "phase": phase},
+                    }, events)
+                parts.clear()
+                message_id = None
+
             self._prompt_id = self._next_id()
             try:
                 await self._emit("turn/started", {
@@ -195,22 +212,32 @@ class KimiWireThread(ProjectLeadRuntime):
                     if "closed" in message:
                         raise KimiWireError(message["closed"])
                     if message.get("id") == self._prompt_id and not message.get("method"):
+                        for task in list(requests):
+                            if task.done():
+                                requests.remove(task)
+                                task.result()
                         error = message.get("error")
                         native_status = (message.get("result") or {}).get("status")
                         final = "".join(parts).strip()
                         status = ("interrupted" if native_status == "cancelled" else
-                                  "completed" if native_status == "finished" and final and not error
+                                  "completed" if native_status == "finished" and final
+                                  and not error and not tool_ids and not requests
                                   else "failed")
                         payload = {"id": turn_id, "status": status}
                         if status == "failed":
-                            payload["error"] = {"message": str(error or (
-                                f"Kimi returned {native_status or 'no status'} without a final answer"))}
-                        if status == "completed":
-                            await self._emit("item/completed", {
-                                "threadId": self.thread_id, "turnId": turn_id,
-                                "item": {"id": f"{turn_id}:final", "type": "agentMessage",
-                                         "text": final, "phase": "final_answer"},
-                            }, events)
+                            if error:
+                                reason = str(error)
+                            elif native_status != "finished":
+                                reason = f"Kimi returned terminal status: {native_status or 'no status'}"
+                            elif tool_ids or requests:
+                                reason = ("Kimi finished with unfinished tool calls or host requests; "
+                                          "completion could not be confirmed")
+                            else:
+                                reason = "Kimi finished without a final answer (empty response)"
+                            payload["error"] = {"message": reason}
+                        await complete_public_message(
+                            "final_answer" if status == "completed" else "commentary"
+                        )
                         await self._emit("turn/completed", {
                             "threadId": self.thread_id, "turn": payload,
                         }, events)
@@ -223,15 +250,24 @@ class KimiWireThread(ProjectLeadRuntime):
                         requests.add(task)
                         # Keep tasks until their result is checked (no lost exceptions).
                     elif kind == "StepBegin":
-                        parts.clear()
+                        await complete_public_message("commentary")
                     elif kind == "ContentPart" and payload.get("type") == "text":
                         delta = str(payload.get("text") or "")
+                        if not delta:
+                            continue
+                        if message_id is None:
+                            message_id = f"{turn_id}:message:{uuid4()}"
+                            await self._emit("item/started", {
+                                "threadId": self.thread_id, "turnId": turn_id,
+                                "item": {"id": message_id, "type": "agentMessage", "text": ""},
+                            }, events)
                         parts.append(delta)
                         await self._emit("item/agentMessage/delta", {
-                            "threadId": self.thread_id, "turnId": turn_id, "delta": delta,
+                            "threadId": self.thread_id, "turnId": turn_id,
+                            "itemId": message_id, "delta": delta,
                         }, events)
                     elif kind == "ToolCall":
-                        parts.clear()
+                        await complete_public_message("commentary")
                         name = (payload.get("function") or {}).get("name")
                         item_type = ("dynamicToolCall" if name in {"run_external_agent", "run_external_agents"}
                                      else "nativeToolCall")
