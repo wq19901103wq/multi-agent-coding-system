@@ -62,7 +62,7 @@ def _walk_dirs(root: Path, *, max_depth: int) -> Any:
         if depth >= max_depth:
             continue
         try:
-            children = list(current.iterdir())
+            children = sorted(current.iterdir(), key=lambda child: child.name)
         except OSError:
             continue
         for child in children:
@@ -366,13 +366,15 @@ class ProjectService:
             check=True,
         )
 
-    def _prepare_bound_directory(self, directory: str) -> Path:
+    def _prepare_bound_directory(self, directory: str, *, existing_only: bool = False) -> Path:
         path = Path(directory).expanduser()
         if not path.is_absolute():
             raise ValueError("绑定目录必须是绝对路径")
         path = path.resolve()
         if not path_within_allowed_bind_roots(path):
             raise ValueError("绑定目录不在 MAC_ALLOWED_BIND_ROOTS 允许范围内")
+        if existing_only and (not path.is_dir() or not (path / ".git").exists()):
+            raise ValueError("没有找到已有 Git 仓库，请指定 Git 仓库根目录。")
         if path.exists() and not path.is_dir():
             raise ValueError(f"绑定路径不是目录: {path}")
         path.mkdir(parents=True, exist_ok=True)
@@ -394,12 +396,14 @@ class ProjectService:
             if head.returncode != 0:
                 self._initialize_repository(path)
         else:
+            if existing_only:
+                raise ValueError("路径不是有效的 Git 仓库根目录。")
             self._initialize_repository(path)
         return path
 
     @staticmethod
     def scan_candidate_repositories(
-        allowed_roots: list[Path], *, max_depth: int = 2, limit: int = 12
+        allowed_roots: list[Path], *, max_depth: int = 2, limit: int | None = 12
     ) -> list[dict[str, str]]:
         output: list[dict[str, str]] = []
         seen: set[Path] = set()
@@ -411,7 +415,7 @@ class ProjectService:
                     continue
                 seen.add(candidate)
                 output.append({"path": str(candidate), "name": candidate.name})
-                if len(output) >= limit:
+                if limit is not None and len(output) >= limit:
                     return output
         return output
 
@@ -687,7 +691,7 @@ class ProjectService:
         return project if project and project.status in {"active", "paused"} else None
 
     def get_user_project_for_directory(
-        self, open_id: str, directory: str, *, chat_id: str
+        self, open_id: str, directory: str, *, chat_id: str, existing_only: bool = False
     ) -> Project | None:
         """Return this chat's latest live project for ``directory``.
 
@@ -697,7 +701,7 @@ class ProjectService:
         Codex thread so conversation history cannot cross chat boundaries.
         """
 
-        path = self._prepare_bound_directory(directory)
+        path = self._prepare_bound_directory(directory, existing_only=existing_only)
         return self.session.exec(
             select(Project)
             .join(ProjectUser, ProjectUser.project_id == Project.id)
@@ -3325,6 +3329,7 @@ class ProjectService:
         project_id: str | None = None,
         conversation_id: str | None = None,
         bot_account_id: str | None = None,
+        channel: str = "feishu",
     ) -> NotificationOutbox:
         existing = self.session.exec(
             select(NotificationOutbox).where(NotificationOutbox.dedupe_key == dedupe_key)
@@ -3338,6 +3343,7 @@ class ProjectService:
                 account_id = project.bot_account_id
         row = NotificationOutbox(
             id=generate_id("notification"),
+            channel=channel,
             bot_account_id=account_id,
             project_id=project_id,
             conversation_id=conversation_id,

@@ -60,14 +60,23 @@ Codex 协议和行为的实现基准：
 
 ## 每次修改后的验证
 
+### 0. 校验节制（优先于下述默认流程）
+
+1. 仅在代码变更之后执行校验；代码未改动时禁止重复校验、禁止重读已读取文件。
+2. 单次问题最多重试校验 1 次；连续 2 次校验结果一致就停止循环，不再反复验证。
+3. 校验只运行最小必要用例，不要全量跑所有测试；只验证本次修改相关范围。
+4. 如果校验通过，立刻停止，禁止额外自检、额外代码审查。
+5. 禁止无目的反复读同一文件；文件读取后记录哈希，内容不变不再重读。
+6. 当连续两轮没有实质性代码改动，直接终止迭代，向用户汇报当前状态。
+
 ### 1. T1–T3
 
 ```bash
 cd /Users/yihanwang/multi-agent-coding-system
 source .worktrees/feat-core/.venv/bin/activate
-python -m compileall -q src tests
-pytest tests/ -q
 ```
+
+只编译或导入本次修改相关的 Python 文件，pytest 显式指定相关测试文件和必要用例，不默认执行全量测试。
 
 ### 2. 安装并重启（影响运行服务时）
 
@@ -110,6 +119,7 @@ pip install -e .
 ## 运行注意事项
 
 - 服务端口：18080。
+- 外部看门狗：`com.mac-system.watchdog`（独立 LaunchAgent，每 60s 检查 `/health`，服务 down 时自动执行 `start_server.sh` 并按 300s 冷却限频，宕机/恢复/恢复失败经微信 iLink 通知）。安装：`./scripts/install_watchdog.sh`，卸载：`./scripts/install_watchdog.sh --uninstall`，日志：`server_watchdog.log`。launchd 的 KeepAlive 只管已加载的 job，bootstrap 失败类故障由看门狗兜底。
 - 数据库：SQLite `mac_system.db`。
 - 项目目录：`projects/`，或用户通过 `/bind` 绑定的 Git 目录。
 - 服务启动：`./scripts/start_server.sh`，停止：`./scripts/stop_server.sh`。

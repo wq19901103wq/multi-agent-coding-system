@@ -31,6 +31,31 @@ def test_progress_identity_is_opaque_and_unique():
     assert generate_id("progress") != first
 
 
+def test_retry_countdown_and_terminal_summary_are_visible():
+    state = progress_state()
+    state.continuation_retry = {
+        "phase": "waiting", "attempt": 2, "maxAttempts": 3,
+        "delaySeconds": 60, "scheduledWaitSeconds": 90, "waitBudgetSeconds": 210,
+    }
+    state.continuation_retry_due_monotonic = 160
+    waiting = _progress_card_view(state, now_monotonic=130)
+    assert "第 2/3 次" in waiting.current
+    assert "还有 30 秒" in waiting.current
+    assert "/stop" in waiting.current
+    assert "90 秒 / 预算 210 秒" in waiting.current
+    assert "暂未收到" not in waiting.current
+    assert "还有 0 秒" in _progress_card_view(state, now_monotonic=180).current
+    state.status = "failed"
+    state.continuation_retry.update(phase="exhausted", stopReason="wait_budget")
+    terminal = _progress_card_view(state, now_monotonic=180)
+    assert "超出额外等待预算" in terminal.current
+    assert "任务未完成" in terminal.current
+    assert "还有" not in terminal.current
+    state.status = "completed"
+    state.continuation_retry.update(phase="recovered")
+    assert "共追加 2 次" in _progress_card_view(state, now_monotonic=180).current
+
+
 def test_progress_projection_rotates_without_mutating_previous_key():
     state = progress_state()
     original = _progress_projection_key("project", state)

@@ -1011,8 +1011,8 @@ async def _handle_command(
                 (
                     "直接发送需求、问题或修改意见即可。\n\n"
                     "- `/create` 或 `/c` 加需求：新建项目\n"
-                    "- `/proj` 或 `/ls`：查看项目\n"
-                    "- `/use` 或 `/s` 加项目名 / ID 前缀：切换项目\n"
+                    "- `/proj` 或 `/ls`：查看当前聊天项目和可打开的 Git 仓库\n"
+                    "- `/use` 或 `/s` 加项目名 / 仓库名 / ID 前缀 / 绝对路径：切换或打开项目\n"
                     "- `/info` 或 `/i`：当前项目、目录和状态\n"
                     "- `/agents` 或 `/a`：查看可用 Coding-Agent\n"
                     "- `/agent`：查看项目执行助手；`/agent codex`、`/agent kimi` 切换后续消息\n"
@@ -1076,7 +1076,7 @@ async def _handle_command(
                 ctx, open_id, "无法切换助手", "请先创建或切换项目。", color="orange"
             )
             return
-        provider_names = {"codex": "Codex", "kimi_code": "Kimi", "claude_code": "Claude"}
+        provider_names = {"codex": "Codex", "kimi_code": "Kimi", "claude_code": "Claude", "dsh": "DeepSeek Harness"}
         requested = argument.casefold()
         if not requested or requested in {"status", "list"}:
             current = RootSessionStore(ctx.service.session).ensure(project.id).provider
@@ -1084,18 +1084,17 @@ async def _handle_command(
                 ctx, open_id, "当前项目执行助手",
                 f"**项目**：{project.name or project.id}\n\n"
                 f"**当前**：{provider_names.get(current, current)}\n\n"
-                "发送 `/agent codex` 或 `/agent kimi` 切换后续消息。"
-                "Claude 尚未接入项目主会话；`/agents` 查看外部 Coding-Agent。",
+                "发送 `/agent codex`、`/agent kimi` 、`/agent claude` 或 `/agent dsh` 切换后续消息。"
+                "`/agents` 查看外部 Coding-Agent。",
             )
             return
         provider = {"codex": "codex", "kimi": "kimi_code",
                     "kimi_code": "kimi_code", "claude": "claude_code",
-                    "claude_code": "claude_code"}.get(requested)
+                    "claude_code": "claude_code", "dsh": "dsh"}.get(requested)
         if provider is None:
             await _send_card(
                 ctx, open_id, "助手名称不支持",
-                "可用命令：`/agent codex`、`/agent kimi`；"
-                "Claude 主会话尚未接入。", color="orange",
+                "可用命令：`/agent codex`、`/agent kimi`、`/agent claude`、`/agent dsh`。", color="orange",
             )
             return
         try:
@@ -1527,25 +1526,68 @@ async def _handle_command(
     )
 
 
-async def _show_projects(ctx: FeishuHandlerContext, open_id: str) -> None:
+def _project_choices(ctx: FeishuHandlerContext, open_id: str) -> list[dict[str, Any]]:
     chat_id = _chat_id(ctx, open_id)
     projects = ctx.service.list_projects_for_chat(chat_id)
-    if not projects:
-        await _send_card(ctx, open_id, "项目", "还没有项目。")
-        return
     selected = ctx.service.get_chat_user_selected_project(chat_id, open_id)
     projects = sorted(
         projects,
         key=lambda item: (bool(selected and selected.id == item.id), item.updated_at),
         reverse=True,
     )
+    payload = [
+        {
+            "id": project.id,
+            "name": project.name or project.id,
+            "workspace_path": project.workspace_path,
+            "execution_status": project.execution_status,
+            "is_current": bool(selected and selected.id == project.id),
+        }
+        for project in projects
+    ]
+    represented = {Path(project.workspace_path).resolve() for project in projects}
+    payload.extend(
+        repository
+        for repository in ProjectService.scan_candidate_repositories(
+            get_allowed_bind_roots(), limit=None
+        )
+        if Path(repository["path"]) not in represented
+    )
+    return payload
+
+
+def _matching_project_choices(
+    choices: list[dict[str, Any]], query: str
+) -> list[dict[str, Any]]:
+    lowered = query.casefold()
+    exact = [
+        item for item in choices
+        if "id" in item
+        and (item["id"] == query or item["name"].casefold() == lowered)
+    ]
+    return exact or [
+        item for item in choices if item["name"].casefold() == lowered
+    ] or [
+        item for item in choices
+        if item.get("id", "").startswith(query)
+        or item["name"].casefold().startswith(lowered)
+    ]
+
+
+async def _show_projects(ctx: FeishuHandlerContext, open_id: str) -> None:
+    choices = _project_choices(ctx, open_id)
+    projects = [item for item in choices if "id" in item]
+    repositories = [item for item in choices if "path" in item]
+    if not choices:
+        await _send_card(ctx, open_id, "项目", "还没有项目，也没有检测到可打开的 Git 仓库。")
+        return
     visible = projects[:_PROJECT_LIST_LIMIT]
     body = "\n".join(
         (
-            f"- {'▶ ' if selected and selected.id == project.id else ''}"
-            f"**{project.name or project.id}** · {project.execution_status}\n"
-            f"  `{project.workspace_path}`\n"
-            f"  `{project.id}`"
+            f"- {'▶ ' if project['is_current'] else ''}"
+            f"**{project['name']}** · {project['execution_status']}\n"
+            f"  `{project['workspace_path']}`\n"
+            f"  `{project['id']}`"
         )
         for project in visible
     )
@@ -1554,37 +1596,36 @@ async def _show_projects(ctx: FeishuHandlerContext, open_id: str) -> None:
             f"\n\n仅显示当前及最近 {len(visible)} 个项目；"
             "发送 `/use 项目名` 或 `/use ID前缀` 可直接切换。"
         )
+    if repositories:
+        body += "\n\n**可打开的 Git 仓库（当前聊天尚未打开）**\n" + "\n".join(
+            f"- **{repository['name']}**\n  `{repository['path']}`"
+            for repository in repositories
+        )
+    body += "\n\n发送 `/use 仓库名` 或 `/use 绝对路径` 打开；同名时会让你选择。"
     await _send_card(ctx, open_id, "项目", body)
 
 
 async def _show_switch_card(
-    ctx: FeishuHandlerContext, open_id: str, *, mode: str = "switch"
+    ctx: FeishuHandlerContext, open_id: str, *, mode: str = "switch",
+    page: int = 0, query: str = "",
 ) -> None:
-    chat_id = _chat_id(ctx, open_id)
-    projects = ctx.service.list_projects_for_chat(chat_id)
-    selected = ctx.service.get_chat_user_selected_project(chat_id, open_id)
-    projects = sorted(
-        projects,
-        key=lambda item: (bool(selected and selected.id == item.id), item.updated_at),
-        reverse=True,
-    )[:_PROJECT_LIST_LIMIT]
-    payload = [
-        {
-            "id": project.id,
-            "name": project.name or project.id,
-            "execution_status": project.execution_status,
-            "is_current": bool(selected and selected.id == project.id),
-        }
-        for project in projects
-    ]
+    choices = _project_choices(ctx, open_id)
+    if query:
+        choices = _matching_project_choices(choices, query)
+    total_pages = max(1, (len(choices) + _PROJECT_LIST_LIMIT - 1) // _PROJECT_LIST_LIMIT)
+    page = min(max(0, page), total_pages - 1)
+    start = page * _PROJECT_LIST_LIMIT
     await _send_interactive(
         ctx,
         open_id,
         build_project_list_card(
-            payload,
+            choices[start : start + _PROJECT_LIST_LIMIT],
             mode=mode,
             chat_id=ctx.chat_id,
             chat_type=ctx.chat_type,
+            page=page,
+            total_pages=total_pages,
+            query=query,
         ),
     )
 
@@ -1597,51 +1638,30 @@ async def _switch_project(
     announce: bool = True,
 ) -> None:
     chat_id = _chat_id(ctx, open_id)
-    available = ctx.service.list_projects_for_chat(chat_id)
     query = project_id.strip()
-    lowered = query.casefold()
-    exact = [
-        item
-        for item in available
-        if item.id == query or str(item.name or "").casefold() == lowered
-    ]
-    candidates = exact or [
-        item
-        for item in available
-        if item.id.startswith(query)
-        or str(item.name or "").casefold().startswith(lowered)
-    ]
+    if query.startswith(("/", "~/")):
+        await _bind_directory(ctx, open_id, query, announce=announce, existing_only=True)
+        return
+    candidates = _matching_project_choices(_project_choices(ctx, open_id), query)
     if len(candidates) != 1:
         if candidates:
-            selected = ctx.service.get_chat_user_selected_project(chat_id, open_id)
-            await _send_interactive(
-                ctx,
-                open_id,
-                build_project_list_card(
-                    [
-                        {
-                            "id": item.id,
-                            "name": item.name or item.id,
-                            "execution_status": item.execution_status,
-                            "is_current": bool(selected and selected.id == item.id),
-                        }
-                        for item in candidates[:_PROJECT_LIST_LIMIT]
-                    ],
-                    mode="switch",
-                    chat_id=ctx.chat_id,
-                    chat_type=ctx.chat_type,
-                ),
-            )
+            await _show_switch_card(ctx, open_id, query=query)
         else:
             await _send_card(
                 ctx,
                 open_id,
                 "切换失败",
-                "没有找到匹配项目。发送 `/use` 查看最近项目，或输入更完整的项目名。",
+                "没有找到匹配项目或 Git 仓库。发送 `/use` 查看候选，或输入更完整的名称 / Git 仓库绝对路径。",
                 color="orange",
             )
         return
-    project = candidates[0]
+    candidate = candidates[0]
+    if "path" in candidate:
+        await _bind_directory(
+            ctx, open_id, candidate["path"], announce=announce, existing_only=True
+        )
+        return
+    project = ctx.service.require_project(candidate["id"])
     ctx.service.bind_project_to_chat(
         project.id,
         chat_id,
@@ -1712,7 +1732,7 @@ async def _show_current(ctx: FeishuHandlerContext, open_id: str) -> None:
 
 async def _show_agents(ctx: FeishuHandlerContext, open_id: str) -> None:
     display_names = {
-        "claude_code": "Claude Code",
+        "claude_code": "Claude Code", "dsh": "DeepSeek Harness",
         "kimi_code": "Kimi Code",
         "codex": "Codex CLI",
         "pi": "Pi",
@@ -1768,6 +1788,7 @@ async def _bind_directory(
     directory: str,
     *,
     announce: bool = True,
+    existing_only: bool = False,
 ) -> Project | None:
     try:
         chat_id = _chat_id(ctx, open_id)
@@ -1775,6 +1796,7 @@ async def _bind_directory(
             open_id,
             directory,
             chat_id=chat_id,
+            existing_only=existing_only,
         )
         resumed = project is not None
         if project is None:
@@ -2156,6 +2178,17 @@ async def _handle_menu_action(
     elif option in {"list_projects_switch", "list_projects_bind"}:
         await _resolve_menu_card(ctx, action, "已选择", "切换当前项目。")
         await _show_switch_card(ctx, action.open_id, mode="switch")
+    elif option.startswith("project_list_page:"):
+        try:
+            _, mode, page, query = option.split(":", 3)
+            page = int(page)
+            if mode not in {"switch", "status"} or page < 0:
+                raise ValueError("invalid project list page")
+        except ValueError:
+            await _send_card(ctx, action.open_id, "无效选项", "请重新发送 `/use`。")
+            return
+        await _resolve_menu_card(ctx, action, "已翻页", "查看其他项目和 Git 仓库。")
+        await _show_switch_card(ctx, action.open_id, mode=mode, page=page, query=query)
     elif option == "show_agents":
         await _resolve_menu_card(ctx, action, "已选择", "查看 Coding-Agent。")
         await _show_agents(ctx, action.open_id)
@@ -2216,6 +2249,7 @@ async def _handle_menu_action(
             action.open_id,
             option.split(":", 1)[1],
             announce=False,
+            existing_only=True,
         )
         if project is not None:
             await _resolve_menu_card(

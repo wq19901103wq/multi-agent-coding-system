@@ -44,6 +44,11 @@
   已有旧字段，恢复时删除本次创建的临时行，保留期间的真人开关选择。
 - 等所有执行、审阅和投递结束；维护开始时活动轮次的结果必须全部送达，
   分页齐全并有飞书消息 ID，才允许重启。失败轮次没有结果时会保守超时。
+  同一飞书消息的已送达更新按消息身份合并，恢复审阅时取最后一次内容；
+  未送达更新、缺页、不同消息重复页码和更新间分页冲突仍然阻塞。
+  后台执行只保留仍匹配 PID 与创建时间的身份；明确退出或 PID 已被复用的
+  旧执行不永久阻塞，但仍存活的独立进程组和孤儿子任务继续阻塞。
+  服务观察者消失、身份变化或权限不明也继续阻塞，不因此放宽停服条件。
 - 调用既有 `restart_server_once.sh`，同一操作最多尝试一次。
   超时、新工作或失败都不能自动换 ID 重试。
 - 正常结束、异常或 TERM/INT 均比较并恢复 Owner 原状态，不覆盖期间的
@@ -74,6 +79,23 @@ SIGKILL、宿主断电或恢复步骤本身失败时，先核对 `status.json`�
 
 `restore` 只恢复 Owner 和当前轮缺失的审阅；维护 PID 仍存在时拒绝争抢。
 它不停止或启动服务。进程权限不足、PID 被复用时也应先人工核查。
+
+仅当旧等待器还没有进入维护窗口、没有 `snapshot.json`、没有重启 claim，
+且旧等待器 PID 确已不存在时，才可将原一次性 launchd job 的 action 改为
+`resume-passive` 并接续同一个 operation ID；其余参数保持不变。不要另起
+operation、删除记录或把 `resume-passive` 用作重启重试。替换等待器时只退出
+这个维护 job，不停止 MAC 主服务或任何业务任务。
+
+```bash
+.worktrees/feat-core/.venv/bin/python scripts/deploy_long_conversation_once.py \
+  resume-passive long-conversation-20261011-resume --wait-ready --timeout 300 \
+  --notify-project <project_id> --wait-execution <original_witness_path>
+```
+
+接续保留原 `readiness.json` 的时间、活动轮次和全部后台 witness，并将原
+状态记录到 `passive_resumes.json`。文件锁阻止两个新等待器同时接管；旧 PID
+仍存在或无法核实、观察者身份不一致、已暂缓 Owner 或已尝试重启时拒绝。
+该入口不修改会话、待办或模型配置，不再次准备已完成的上线成果。
 
 验收独立于部署：T4 核对新 PID、18080、`/admin/projects` 200、各飞书
 WebSocket、原 thread、Owner 恢复及项目继续推进；T6 核对原长对话真实续接。

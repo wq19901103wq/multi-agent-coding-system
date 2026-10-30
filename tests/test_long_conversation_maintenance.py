@@ -330,6 +330,54 @@ def test_sent_report_still_requires_valid_delivery_evidence(maintenance_context,
         assert not maintenance.report_delivered(rows)
 
 
+@pytest.mark.parametrize("total", [1, 2])
+def test_report_updates_count_real_messages_and_recover_latest_content(maintenance_context, total):
+    bind, root = maintenance_context
+    snapshot = maintenance.defer_owners(bind, root / "snapshot.json")
+    for page in range(1, total + 1):
+        add_report(bind, page, total)
+    with Session(bind) as session:
+        original = session.get(NotificationOutbox, "notice-1")
+        session.add(NotificationOutbox(
+            **original.model_dump(exclude={"id", "dedupe_key", "created_at", "updated_at", "payload"}),
+            id="update-1", dedupe_key="report-update-1",
+            payload={**original.payload, "card": build_content_card("结果", "最终第一部分", 1, total)},
+        ))
+        session.commit()
+        rows = session.exec(select(NotificationOutbox)).all()
+        assert maintenance.report_delivered(rows)
+        assert len(maintenance.latest_delivered_report_rows(rows)) == total
+    snapshot["active_turns"] = {"implicit": "turn"}
+    assert not maintenance.drain_blockers(bind, snapshot)["active_turn_reports"]
+    maintenance.restore_reviews(bind, snapshot, maintenance.restore_owners(bind, snapshot))
+    with Session(bind) as session:
+        review = session.exec(select(ProjectOwnerReview)).one()
+        assert review.input_payload["content"] == (
+            "最终第一部分" if total == 1 else "最终第一部分\n\n第 2 部分"
+        )
+        assert len(session.exec(select(NotificationOutbox)).all()) == total + 1
+
+
+@pytest.mark.parametrize("invalid", ["pending_update", "changed_page", "changed_total"])
+def test_report_message_updates_do_not_hide_incomplete_delivery(maintenance_context, invalid):
+    bind, root = maintenance_context
+    add_report(bind, 1, 2)
+    add_report(bind, 2, 2)
+    with Session(bind) as session:
+        original = session.get(NotificationOutbox, "notice-1")
+        values = original.model_dump(exclude={"id", "dedupe_key", "created_at", "updated_at"})
+        if invalid == "pending_update":
+            values["status"] = "pending"
+        else:
+            values["payload"] = {**original.payload, "card": build_content_card(
+                "结果", "更新", 2 if invalid == "changed_page" else 1,
+                3 if invalid == "changed_total" else 2,
+            )}
+        session.add(NotificationOutbox(id="update-1", dedupe_key="report-update-1", **values))
+        session.commit()
+        assert not maintenance.report_delivered(session.exec(select(NotificationOutbox)).all())
+
+
 @pytest.mark.parametrize("newer", ["active_round", "completed_round", "review"])
 def test_restore_never_revives_review_overtaken_by_new_work(maintenance_context, newer):
     bind, root = maintenance_context
@@ -518,6 +566,13 @@ def process_observer(monkeypatch):
     monkeypatch.setattr(maintenance.psutil, "Process", lookup)
     monkeypatch.setattr(maintenance.os, "getpgrp", lambda: 100)
     monkeypatch.setattr(maintenance.os, "getpgid", lambda process_id: lookup(process_id).group)
+
+    def group_exists(group, signum):
+        assert signum == 0
+        if not any(process.group == group for process in processes.values()):
+            raise ProcessLookupError(group)
+
+    monkeypatch.setattr(maintenance.os, "killpg", group_exists)
     return processes, {"processes": [], "groups": [],
                        "observers": [{"pid": 10, "created_at": 10.0}]}
 
@@ -537,7 +592,7 @@ def test_observer_captures_new_execution_without_counting_infrastructure(process
     assert set(refreshed) == {"processes", "groups", "observers", "unverifiable"}
 
 
-@pytest.mark.parametrize("condition", ["observer_reused", "observer_gone", "denied", "execution_reused"])
+@pytest.mark.parametrize("condition", ["observer_reused", "observer_gone", "denied", "os_denied"])
 def test_uncertain_process_identity_blocks_maintenance(process_observer, maintenance_context,
                                                       monkeypatch, condition):
     processes, witness = process_observer
@@ -545,10 +600,10 @@ def test_uncertain_process_identity_blocks_maintenance(process_observer, mainten
         processes[10].created_at = 11.0
     elif condition == "observer_gone":
         del processes[10]
-    elif condition == "execution_reused":
-        witness["processes"] = [{"pid": 60, "created_at": 59.0}]
     else:
         def denied(process_id):
+            if condition == "os_denied":
+                raise PermissionError(process_id)
             raise maintenance.psutil.AccessDenied(process_id)
         monkeypatch.setattr(maintenance.psutil, "Process", denied)
     refreshed = maintenance.refresh_execution_witness(witness)
@@ -557,6 +612,78 @@ def test_uncertain_process_identity_blocks_maintenance(process_observer, mainten
     snapshot = {"started_at": maintenance.datetime.utcnow().isoformat(),
                 "background_execution": refreshed}
     assert maintenance.drain_blockers(bind, snapshot)["background_execution"]
+
+
+@pytest.mark.parametrize("condition", ["gone", "reused", "zombie"])
+def test_exited_execution_identities_and_groups_are_retired(process_observer, maintenance_context,
+                                                          condition):
+    processes, witness = process_observer
+    witness = maintenance.refresh_execution_witness(witness)
+    processes[10].descendants = []
+    del processes[61]
+    if condition == "gone":
+        del processes[60]
+    elif condition == "reused":
+        processes[60].created_at = 62.0
+        processes[60].group = 62
+    else:
+        processes[60].status = lambda: maintenance.psutil.STATUS_ZOMBIE
+        processes[60].group = 62
+        processes[60].descendants = []
+    refreshed = maintenance.refresh_execution_witness(witness)
+    assert refreshed["processes"] == []
+    assert refreshed["groups"] == []
+    assert not refreshed["unverifiable"]
+    bind, root = maintenance_context
+    assert not maintenance.drain_blockers(bind, {
+        "started_at": maintenance.datetime.utcnow().isoformat(),
+        "background_execution": refreshed,
+    })["background_execution"]
+
+
+def test_orphan_background_child_still_blocks_after_parent_exit(process_observer):
+    processes, witness = process_observer
+    witness = maintenance.refresh_execution_witness(witness)
+    processes[10].descendants = []
+    del processes[60]
+    refreshed = maintenance.refresh_execution_witness(witness)
+    assert refreshed["processes"] == [{"pid": 61, "created_at": 61.0}]
+    assert refreshed["groups"] == [60]
+
+
+def test_live_group_without_known_processes_remains_a_blocker(process_observer):
+    processes, witness = process_observer
+    processes[10].descendants = []
+    witness["groups"] = [60]
+    refreshed = maintenance.refresh_execution_witness(witness)
+    assert refreshed["processes"] == []
+    assert refreshed["groups"] == [60]
+    assert not refreshed["unverifiable"]
+
+
+@pytest.mark.parametrize("denied", ["execution", "group"])
+def test_unverifiable_execution_witness_is_preserved(process_observer, monkeypatch, denied):
+    processes, witness = process_observer
+    witness = maintenance.refresh_execution_witness(witness)
+    processes[10].descendants = []
+    if denied == "execution":
+        lookup = maintenance.psutil.Process
+
+        def restricted_lookup(process_id):
+            if process_id == 60:
+                raise maintenance.psutil.AccessDenied(process_id)
+            return lookup(process_id)
+
+        monkeypatch.setattr(maintenance.psutil, "Process", restricted_lookup)
+    else:
+        def restricted_group(group, signum):
+            raise PermissionError(group)
+
+        monkeypatch.setattr(maintenance.os, "killpg", restricted_group)
+    refreshed = maintenance.refresh_execution_witness(witness)
+    assert refreshed["unverifiable"]
+    assert {"pid": 60, "created_at": 60.0} in refreshed["processes"]
+    assert refreshed["groups"] == [60]
 
 
 def test_passive_readiness_wait_has_no_deadline_or_owner_mutation(maintenance_context, monkeypatch):
@@ -689,6 +816,123 @@ def test_wait_ready_rechecks_before_single_restart_and_restores_owners(maintenan
     with pytest.raises(FileExistsError):
         maintenance.run(bind, root, "single-resume", 300, "implicit", {}, wait_ready=True)
     assert len(calls) == 1
+
+
+@pytest.fixture
+def stopped_passive_operation(maintenance_context, monkeypatch):
+    bind, root = maintenance_context
+    state_dir = root / ".mac/long_conversation_maintenance/original-operation"
+    state_dir.mkdir(parents=True)
+    witness = {"processes": [{"pid": 60, "created_at": 60.0}], "groups": [60],
+               "observers": [{"pid": 10, "created_at": 10.0}], "unverifiable": False}
+    readiness = {"started_at": "2026-10-11T12:00:00", "active_turns": {"implicit": "original-turn"},
+                 "background_execution": witness}
+    status = {"stage": "not_completed", "pid": 99999, "restart_attempted": False,
+              "restarted": False, "error_type": "SystemExit"}
+    maintenance.write_state(state_dir / "readiness.json", readiness)
+    maintenance.write_state(state_dir / "status.json", status)
+
+    def missing_process(process_id):
+        raise maintenance.psutil.NoSuchProcess(process_id)
+
+    monkeypatch.setattr(maintenance.psutil, "Process", missing_process)
+    return bind, root, state_dir, witness, readiness, status
+
+
+def test_passive_resume_preserves_readiness_and_restarts_only_once(stopped_passive_operation,
+                                                                 monkeypatch):
+    bind, root, state_dir, witness, readiness, status = stopped_passive_operation
+    clock = [0]
+    calls = []
+    monkeypatch.setattr(maintenance.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(maintenance.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(maintenance, "refresh_execution_witness", lambda current: current)
+
+    def blockers(*args):
+        assert json.loads((state_dir / "readiness.json").read_text()) == readiness
+        return {}
+
+    monkeypatch.setattr(maintenance, "drain_blockers", blockers)
+    monkeypatch.setattr(maintenance, "wait_for_drain", lambda *args, **kwargs: None)
+    monkeypatch.setattr(maintenance.subprocess, "run", lambda *args, **kwargs: calls.append(args[0]))
+    monkeypatch.setattr(maintenance, "dispatch_acceptance", lambda *args: "acceptance-review")
+    maintenance.run(bind, root, "original-operation", 300, "implicit", witness,
+                    wait_ready=True, resume_passive=True)
+    assert clock[0] == 30
+    assert len(calls) == 1
+    assert calls[0] == ["bash", "scripts/restart_server_once.sh", "original-operation"]
+    assert json.loads((state_dir / "readiness.json").read_text()) == readiness
+    assert json.loads((state_dir / "passive_resumes.json").read_text())[0]["previous_status"] == status
+    assert json.loads((state_dir / "status.json").read_text())["stage"] == "restarted_pending_acceptance"
+    with Session(bind) as session:
+        assert session.get(RootAgentSession, "root").native_thread_id == "original-long-thread"
+        assert session.get(ProjectOwnerState, "enabled").enabled
+        assert session.get(ProjectOwnerState, "implicit") is None
+    with pytest.raises(RuntimeError, match="already entered"):
+        maintenance.run(bind, root, "original-operation", 300, "implicit", witness,
+                        wait_ready=True, resume_passive=True)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("condition", [
+    "live_pid", "denied_pid", "snapshot", "restart_claim", "restart_attempted",
+    "owners_deferred", "wrong_stage", "changed_observer", "missing_readiness", "no_passive_mode",
+])
+def test_passive_resume_refuses_unsafe_or_already_attempted_state(stopped_passive_operation,
+                                                               monkeypatch, condition):
+    bind, root, state_dir, witness, readiness, status = stopped_passive_operation
+    if condition == "live_pid":
+        monkeypatch.setattr(maintenance.psutil, "Process", lambda process_id: object())
+    elif condition == "denied_pid":
+        def denied(process_id):
+            raise maintenance.psutil.AccessDenied(process_id)
+
+        monkeypatch.setattr(maintenance.psutil, "Process", denied)
+    elif condition == "snapshot":
+        maintenance.write_state(state_dir / "snapshot.json", {})
+    elif condition == "restart_claim":
+        (root / ".mac/restart_operations/original-operation").mkdir(parents=True)
+    elif condition in {"restart_attempted", "owners_deferred"}:
+        status[condition] = True
+        maintenance.write_state(state_dir / "status.json", status)
+    elif condition == "wrong_stage":
+        status["stage"] = "waiting_for_natural_completion"
+        maintenance.write_state(state_dir / "status.json", status)
+    elif condition == "changed_observer":
+        witness = {**witness, "observers": [{"pid": 11, "created_at": 11.0}]}
+    elif condition == "missing_readiness":
+        (state_dir / "readiness.json").unlink()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Unsafe passive resume must not defer Owner or restart")
+
+    monkeypatch.setattr(maintenance, "defer_owners", unexpected)
+    monkeypatch.setattr(maintenance.subprocess, "run", unexpected)
+    with pytest.raises((RuntimeError, FileNotFoundError)):
+        maintenance.run(bind, root, "original-operation", 300, "implicit", witness,
+                        wait_ready=condition != "no_passive_mode", resume_passive=True)
+    assert json.loads((state_dir / "status.json").read_text()) == status
+    assert not (state_dir / "passive_resumes.json").exists()
+    with Session(bind) as session:
+        assert session.get(ProjectOwnerState, "enabled").enabled
+        assert session.get(ProjectOwnerState, "implicit") is None
+
+
+def test_passive_resume_cannot_compete_with_another_waiter(stopped_passive_operation):
+    bind, root, state_dir, witness, readiness, status = stopped_passive_operation
+    with (state_dir / "operation.lock").open("a") as lock:
+        maintenance.fcntl.flock(lock, maintenance.fcntl.LOCK_EX | maintenance.fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="already running"):
+            maintenance.run(bind, root, "original-operation", 300, "implicit", witness,
+                            wait_ready=True, resume_passive=True)
+    assert json.loads((state_dir / "status.json").read_text()) == status
+
+
+def test_passive_resume_does_not_create_a_new_operation(maintenance_context):
+    bind, root = maintenance_context
+    with pytest.raises(RuntimeError, match="existing passive operation"):
+        maintenance.run(bind, root, "new-operation", 300, resume_passive=True, wait_ready=True)
+    assert not (root / ".mac/long_conversation_maintenance/new-operation").exists()
 
 
 def test_passive_interruption_does_not_defer_or_dispatch(maintenance_context, monkeypatch):

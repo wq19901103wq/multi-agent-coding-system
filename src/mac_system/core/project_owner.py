@@ -78,7 +78,7 @@ Owner 可以在用户已授权代决策的范围内，高把握理解用户意�
 原文、回复对象和相邻上下文；不能可靠解决且决定重要时，给出建议和真实选项让用户选择。
 current_human_instructions 是触发本轮执行的请求，不是对本轮结果的事后反馈。不能拿“请修复”“打不开”
 这类触发语句证明修复后的结果仍然失败。只有时间晚于本轮结果的新用户输入，才能作为对该结果的反馈；
-没有新反馈时，判断是否完成应依据本轮可见结果和独立证据，不能要求用户重复确认系统本可验证的事实。
+没有新反馈时，判断是否完成应依据本轮可见结果和已有证据，不能要求用户重复确认系统本可验证的事实。
 任何 instruction 存在 authority.reply_ref 时，必须结合 evidence 中同一 turn_ref 的 reply_to、
 结构化用户选择或 parent_decision 理解；reply_to 只限定这句话回应的对象，不是新的用户原话。
 没有明确回应对象时，不得靠猜测扩张成新的方向、长期偏好或授权。
@@ -135,7 +135,11 @@ correction_counterexample 同时给出 rejected_owner_decision 和 user_choice�
 一个候选完成或淘汰后，选择下一个新假设不属于普通实现细节。若用户未选定该方向，且现行项目规则也没有直接给出优先级，
 先给出明确推荐和取舍，由用户选择；不得把连续局部实验当成无需对齐的自动循环。
 
-技术结果没有独立验证时，不亲自设计验证方案，只要求 Root“确认结果真实可用”或“补足独立证据”。
+结果核验应优先复用已有产物和校验证据，不得仅因缺少独立复核而要求 Root 重新核验。
+已有证据足以支持本轮结果时立即收尾，不再追加自检或代码审查。
+对代码修改任务，校验只在实质性代码变更之后进行，只验证本次修改相关的最小必要范围，不运行全量测试。
+单次问题最多重试校验一次；连续两次校验结果一致就停止。校验通过后立即停止，不追加新的核验工作。
+连续两轮没有实质性代码改动时，停止该修改任务的迭代，汇报当前状态。
 不得形成审计链、调研链、验证链或为了完善流程而继续工作的循环。每个继续决定必须指向一个用户可见
 结果；若只是普通工程工作未完成，要求 Root 继续完成原目标，不把实现细节升级成项目方向问题。
 
@@ -2228,11 +2232,19 @@ class ProjectOwner:
         prompt = json.dumps(prompt_payload, ensure_ascii=False)
         failed_attempts: list[str] = []
         validation_feedback = ""
-        # Each attempt is an isolated read-only turn. A
-        # malformed result gets one targeted correction attempt; it is never
-        # converted into another business outcome by deterministic code.
+        # Each attempt is an isolated read-only turn. A malformed result gets
+        # one correction attempt. Native approvals also use that same bounded
+        # budget for a transport failure, after the previous runtime is closed.
+        # Neither case becomes an approval without a validated Owner result.
         max_attempts = 2
-        turn_timeout = min(180, max(30, self.settings.agent_timeout_seconds))
+        is_native_approval = prompt_payload["task"]["kind"] == "answer_approval"
+        # The old 180s cap cancelled approval reviews before Codex's 300s
+        # stream watchdog could recover. Allow the configured execution budget
+        # (capped at 600s) for approvals, including startup and native recovery.
+        turn_timeout = min(
+            600 if is_native_approval else 180,
+            max(30, self.settings.agent_timeout_seconds),
+        )
         output_schema = _owner_output_schema(report_review=report_review is not None)
         for attempt in range(max_attempts):
             while True:
@@ -2302,8 +2314,17 @@ class ProjectOwner:
                     latest_usage = {}
                     continue
                 if transport_error is not None:
+                    if is_native_approval and attempt + 1 < max_attempts:
+                        failed_attempts.append(redact_text(
+                            str(transport_error)
+                            or f"Owner approval review timed out after {turn_timeout:g}s"
+                        ))
+                        latest_usage = {}
+                        break
                     raise transport_error
                 break
+            if transport_error is not None:
+                continue
             if turn_result is None or not turn_result.final_message:
                 failed_attempts.append(
                     _turn_failure_message(turn_result)

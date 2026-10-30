@@ -13,7 +13,9 @@ import mac_system.core.root_agent as root_agent_module
 from mac_system.agents.root_runtime import (
     AgentEvent,
     AppServerProtocolError,
+    CodexAppServerThread,
     DynamicTool,
+    ProjectLeadRuntimeContext,
     ProjectLeadRuntimeRegistry,
     ToolContext,
     TurnResult,
@@ -163,6 +165,56 @@ def test_native_approval_specs_follow_codex_v2_response_shapes():
         permission_response({"approval_decision": "不存在的选择"})
 
 
+def test_native_approval_truncation_preserves_distinct_native_decisions():
+    prefix = "x" * (99 - len("允许规则："))
+    decisions = [
+        {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": [prefix, suffix]}}
+        for suffix in ("one", "two")
+    ]
+    questions, respond = _native_approval_spec(
+        "item/commandExecution/requestApproval",
+        {"command": "review", "availableDecisions": decisions},
+    )
+    labels = [option["label"] for option in questions[0]["options"]]
+    assert len(set(labels)) == 2
+    assert all(label == label.strip() for label in labels)
+    for label, decision in zip(labels, decisions):
+        assert respond({"approval_decision": label}) == {"decision": decision}
+
+
+@pytest.mark.asyncio
+async def test_native_answer_preserves_legacy_option_whitespace(root_context, monkeypatch):
+    session, engine = root_context
+    label = "允许规则：" + "x" * 93 + " "
+    decision = {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["review"]}}
+    interaction = await engine.service.create_question_interaction(
+        "proj-root", None, 1, "ACTIVE", "root_agent", "native_approval", "legacy",
+        [{"question_id": "approval_decision", "question": "执行审阅？",
+          "options": [{"key": label, "label": label}], "allow_free_text": False}],
+        request_item_id="legacy-approval",
+    )
+    question = engine.service.get_questions_for_interaction(interaction.id)[0]
+    await engine.service.submit_question_answer(question.id, label, label, False, "user")
+    await engine.service.resolve_question_interaction(interaction.id)
+    engine.store.set_turn("proj-root", turn_id="turn-original", status="waiting_user")
+    future = asyncio.get_running_loop().create_future()
+
+    def respond(selected):
+        assert selected["approval_decision"] == label
+        return {"decision": decision}
+
+    pending = root_agent_module._PendingUserRequest(
+        "proj-root", interaction.id, "legacy-approval", asyncio.get_running_loop(),
+        future, respond,
+    )
+    monkeypatch.setitem(root_agent_module._PENDING_USER_REQUESTS, "legacy-approval", pending)
+    assert resolve_root_user_input(engine.service, interaction.id)
+    assert await asyncio.wait_for(future, 1) == {"decision": decision}
+    assert engine.store.ensure("proj-root").active_turn_id == "turn-original"
+    assert engine.store.ensure("proj-root").status == "running"
+    assert len(session.exec(select(QuestionAnswer)).all()) == 1
+
+
 def test_file_approval_shows_operations_and_move_destination_without_diff():
     questions, response = _native_approval_spec(
         "item/fileChange/requestApproval",
@@ -296,6 +348,44 @@ def root_context(tmp_path):
         root_agent_module._ROOT_THREADS.clear()
 
 
+def test_continuation_settings_apply_only_to_codex_lead(root_context):
+    _session, engine = root_context
+    engine.settings = Settings(
+        CODEX_CONTINUATION_MAX_ATTEMPTS=2,
+        CODEX_CONTINUATION_WAIT_BUDGET_SECONDS=90,
+        CODEX_CONTINUATION_JITTER_RATIO=0.25,
+    )
+    context = ProjectLeadRuntimeContext(
+        cwd=Path(engine.service.require_project("proj-root").workspace_path),
+        tools=(),
+    )
+
+    codex = engine._create_codex_lead_runtime(context)
+    kimi = engine._create_kimi_lead_runtime(context)
+
+    assert codex.continuation_max_attempts == 2
+    assert codex.continuation_wait_budget_seconds == 90
+    assert codex.continuation_jitter_ratio == 0.25
+    assert not hasattr(kimi, "continuation_max_attempts")
+
+
+def test_claude_lead_uses_native_settings_and_host_bindings(root_context):
+    _session, engine = root_context
+    engine.settings = Settings(_env_file=None, CLAUDE_BIN="/native/claude",
+                               CLAUDE_MODEL="configured-model",
+                               ANTHROPIC_AUTH_TOKEN="test-only-token",
+                               ANTHROPIC_BASE_URL="https://provider.example")
+    context = ProjectLeadRuntimeContext(cwd=Path("/project"), tools=())
+    runtime = engine._create_claude_lead_runtime(context)
+    assert runtime.provider_id == "claude_code"
+    assert runtime.claude_bin == "/native/claude"
+    assert runtime.active_model == "configured-model"
+    assert runtime.cwd == context.cwd
+    assert runtime.env["ANTHROPIC_AUTH_TOKEN"] == "test-only-token"
+    assert runtime.env["ANTHROPIC_BASE_URL"] == "https://provider.example"
+    assert "claude_code" in engine.lead_runtime_registry.available_providers()
+
+
 @pytest.mark.asyncio
 async def test_explicit_project_lead_switch_is_idle_and_does_not_run_turn(root_context):
     session, engine = root_context
@@ -306,8 +396,55 @@ async def test_explicit_project_lead_switch_is_idle_and_does_not_run_turn(root_c
     )
     assert engine.store.ensure("proj-root").native_thread_id is None
     assert session.get(Project, "proj-root").context["execution_provider"] == "kimi_code"
+    assert await engine.set_lead_provider("proj-root", "claude_code") == (
+        "kimi_code", "claude_code"
+    )
+    assert engine.store.ensure("proj-root").provider == "claude_code"
+    assert await engine.set_lead_provider("proj-root", "dsh") == ("claude_code", "dsh")
+    assert engine.store.ensure("proj-root").provider == "dsh"
     with pytest.raises(RuntimeError, match="尚未接入"):
-        await engine.set_lead_provider("proj-root", "claude_code")
+        await engine.set_lead_provider("proj-root", "unknown")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["idle", "running"])
+async def test_provider_switch_rejects_busy_lock_immediately(root_context, status):
+    from mac_system.core.lock_manager import get_default_lock_manager
+
+    session, engine = root_context
+    engine.store.switch_provider("proj-root", "kimi_code")
+    engine.store.set_native_thread("proj-root", "kimi-thread")
+    engine.store.set_turn("proj-root", turn_id=None, status=status)
+    context = dict(session.get(Project, "proj-root").context)
+    lock = await get_default_lock_manager().acquire("proj-root")
+    async with lock:
+        with pytest.raises(RuntimeError, match="本次未切换助手"):
+            await asyncio.wait_for(engine.set_lead_provider("proj-root", "codex"), 0.5)
+        durable = engine.store.ensure("proj-root")
+        assert durable.provider == "kimi_code"
+        assert durable.native_thread_id == "kimi-thread"
+        assert durable.status == status
+        assert session.get(Project, "proj-root").context == context
+    engine.store.set_turn("proj-root", turn_id=None, status="idle")
+    assert await engine.set_lead_provider("proj-root", "codex") == ("kimi_code", "codex")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,turn_id", [("running", None), ("idle", "active-turn")])
+async def test_provider_switch_checks_durable_state_and_releases_lock(
+    root_context, status, turn_id,
+):
+    _session, engine = root_context
+    engine.store.set_native_thread("proj-root", "codex-thread")
+    engine.store.set_turn("proj-root", turn_id=turn_id, status=status)
+    with pytest.raises(RuntimeError, match="本次未切换助手"):
+        await engine.set_lead_provider("proj-root", "kimi_code")
+    durable = engine.store.ensure("proj-root")
+    assert durable.provider == "codex"
+    assert durable.native_thread_id == "codex-thread"
+    assert durable.active_turn_id == turn_id
+    engine.store.set_turn("proj-root", turn_id=None, status="idle")
+    assert await engine.set_lead_provider("proj-root", "kimi_code") == ("codex", "kimi_code")
 
 
 @pytest.mark.asyncio
@@ -516,6 +653,71 @@ async def test_stop_cleans_provider_background_terminals(root_context):
     assert calls == [("interrupt", "turn-running"), ("clean", None)]
     assert engine.store.ensure("proj-root").status == "idle"
     assert engine.service.require_project("proj-root").execution_status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_stop_during_continuation_wait_preserves_thread_and_history(
+    root_context, monkeypatch, tmp_path
+):
+    session, engine = root_context
+    entered = asyncio.Event()
+    requests = []
+    turn_inputs = []
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    runtime.thread_id = "thread-stop-wait"
+
+    async def failed_turn(text, *, output_schema=None):
+        turn_inputs.append(text)
+        return TurnResult(
+            thread_id=runtime.thread_id,
+            turn_id="failed-turn",
+            status="failed",
+            final_message=None,
+            events=(AgentEvent(
+                kind="error",
+                thread_id=runtime.thread_id,
+                turn_id="failed-turn",
+                payload={"error": {"codexErrorInfo": "responseStreamDisconnected"}},
+            ),),
+        )
+
+    async def long_wait(_delay):
+        entered.set()
+        await asyncio.Event().wait()
+
+    async def native_request(method, params):
+        requests.append((method, params))
+        return {}
+
+    monkeypatch.setattr(runtime, "_run_turn_locked", failed_turn)
+    monkeypatch.setattr(runtime, "_request", native_request)
+    monkeypatch.setattr("mac_system.agents.root_runtime._wait_for_server_capacity", long_wait)
+    engine.store.set_native_thread("proj-root", runtime.thread_id)
+    row = engine.store.begin_turn("proj-root", user_request="继续原任务")
+    history_id = row.active_history_round_id
+    engine.store.set_turn("proj-root", turn_id=None, status="idle")
+    with root_agent_module._ROOT_THREADS_GUARD:
+        root_agent_module._ROOT_THREADS["proj-root"] = root_agent_module._RootHandle(
+            runtime, asyncio.get_running_loop(), "codex"
+        )
+    task = asyncio.create_task(runtime.run_turn("继续原任务"))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert await asyncio.wait_for(engine.interrupt("proj-root"), 1) is True
+        result = await asyncio.wait_for(task, 1)
+        assert result.status == "interrupted"
+        assert result.events[-1].payload["phase"] == "cancelled"
+        assert turn_inputs == ["继续原任务"]
+        assert requests == [(
+            "thread/backgroundTerminals/clean", {"threadId": "thread-stop-wait"}
+        )]
+        assert engine.store.ensure("proj-root").native_thread_id == "thread-stop-wait"
+        assert engine.store.ensure("proj-root").status == "idle"
+        assert session.get(ProjectHistoryRound, history_id).report_status == "interrupted"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -1143,11 +1345,71 @@ async def test_runtime_exception_reviews_failure_with_current_visible_request(
 
     assert published == [
         {
+            "native_turn_id": None,
             "user_request": "继续完成项目",
             "request_origin": "human",
             "parent_decision_id": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_failure", [False, True])
+async def test_runtime_exception_persists_failure_without_report_delivery(
+    root_context, monkeypatch, delivery_failure
+):
+    session, engine = root_context
+
+    class FailingRoot(_FakeLeadBindings):
+        def __init__(self, **kwargs):
+            self.thread_id = None
+            self.event_handler = kwargs["event_handler"]
+
+        async def create_thread(self):
+            self.thread_id = "thread-transport-failed"
+            return self.thread_id
+
+        async def run_turn(self, _text):
+            await self.event_handler(AgentEvent(
+                "turn/started", self.thread_id, "turn-transport-failed",
+                {"threadId": self.thread_id,
+                 "turn": {"id": "turn-transport-failed", "status": "inProgress"}},
+            ))
+            raise RuntimeError("connection closed; api_key=sk-secret-value")
+
+        async def close(self):
+            return None
+
+    async def fail_delivery(*_args, **_kwargs):
+        raise RuntimeError("Feishu unavailable")
+
+    if delivery_failure:
+        project = session.get(Project, "proj-root")
+        project.feishu_chat_id = "oc-chat"
+        session.add(project)
+        session.commit()
+        engine.feishu_bridge = object()
+        monkeypatch.setattr(root_agent_module, "deliver_card", fail_delivery)
+    monkeypatch.setattr("mac_system.core.root_agent.CodexAppServerThread", FailingRoot)
+
+    with pytest.raises(RuntimeError, match="connection closed"):
+        await engine.run(
+            "proj-root", "[内部上下文]\n继续任务", visible_request="继续任务"
+        )
+
+    session.expire_all()
+    history = session.exec(select(ProjectHistoryRound)).one()
+    root = session.exec(select(RootAgentSession)).one()
+    assert history.user_instructions[0]["text"] == "继续任务"
+    assert history.native_thread_id == "thread-transport-failed"
+    assert history.native_turn_id == "turn-transport-failed"
+    assert history.report_status == "failed"
+    assert history.completed_at is not None
+    assert history.report_ref.startswith("root-failure:")
+    assert "connection closed" in history.report_content
+    assert "sk-secret-value" not in history.report_content
+    assert root.status == "idle"
+    assert root.active_history_round_id is None
 
 
 @pytest.mark.asyncio
@@ -1214,6 +1476,7 @@ async def test_native_recovered_answer_is_persisted_and_delivered_once(
     from tests.test_root_runtime import _CapacityProcess, _ReconnectingProcess
 
     session, engine = root_context
+    engine.settings.codex_continuation_jitter_ratio = 0
     process = _CapacityProcess(
         failures=1,
         codex_error_info={"responseStreamDisconnected": {"httpStatusCode": None}},
@@ -1349,6 +1612,27 @@ async def test_explicit_new_thread_replaces_history_without_changing_project(
     assert "root_thread_reset_pending" not in (
         session.get(Project, "proj-root").context or {}
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["idle", "running", "waiting_user"])
+async def test_new_thread_rejects_busy_lock_immediately(root_context, status):
+    from mac_system.core.lock_manager import get_default_lock_manager
+
+    session, engine = root_context
+    engine.store.set_native_thread("proj-root", "original-thread")
+    turn_id = None if status == "idle" else "original-turn"
+    engine.store.set_turn("proj-root", turn_id=turn_id, status=status)
+    context = dict(session.get(Project, "proj-root").context)
+    lock = await get_default_lock_manager().acquire("proj-root")
+    async with lock:
+        with pytest.raises(RuntimeError, match="当前项目仍在处理消息"):
+            await asyncio.wait_for(engine.start_new_thread("proj-root"), 0.5)
+        durable = engine.store.ensure("proj-root")
+        assert (durable.native_thread_id, durable.active_turn_id, durable.status) == (
+            "original-thread", turn_id, status,
+        )
+        assert session.get(Project, "proj-root").context == context
 
 
 @pytest.mark.asyncio
@@ -1839,7 +2123,7 @@ def test_native_retry_error_updates_progress_without_ending_turn():
             "willRetry": True,
         },
     ) == (
-        "与 Codex 的连接暂时中断，正在自动重连。",
+        "Codex 正在原生自动重试，尚未启动 MAC 追加续跑。",
         "orange",
         "running",
     )
@@ -1850,11 +2134,60 @@ def test_native_retry_error_updates_progress_without_ending_turn():
             "willRetry": False,
         },
     ) == (
-        "所选模型暂时容量不足，正在等待同模型自动续跑。",
+        "所选模型暂时容量不足，本次原生执行正在结束。",
         "orange",
         "running",
     )
     assert _native_status_card("warning", {"message": "notice"}) is None
+
+
+@pytest.mark.asyncio
+async def test_host_retry_events_are_durable_without_faking_native_turn(
+    root_context, monkeypatch
+):
+    session, engine = root_context
+    engine.store.set_native_thread("proj-root", "thread-1")
+    engine.store.set_turn("proj-root", turn_id=None, status="idle")
+    identities = []
+
+    def queue_snapshot(project_id, *, event_identity):
+        assert project_id == "proj-root"
+        identities.append(event_identity)
+
+    monkeypatch.setattr(engine, "_queue_progress_snapshot", queue_snapshot)
+    for phase, attempt in (("waiting", 1), ("resuming", 1), ("waiting", 2)):
+        payload = {
+            "phase": phase,
+            "attempt": attempt,
+            "maxAttempts": 3,
+            "delaySeconds": 30,
+            "scheduledWaitSeconds": 30 * attempt,
+            "waitBudgetSeconds": 210,
+            "retryAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+        }
+        await engine._on_event(
+            "proj-root",
+            AgentEvent("mac/continuationRetry", "thread-1", "turn-1", payload),
+        )
+
+    events = session.exec(
+        select(EventLog).where(
+            EventLog.message == "Root Agent event: mac/continuationRetry"
+        )
+    ).all()
+    assert len(events) == 3
+    assert [event.meta["payload"]["phase"] for event in events] == [
+        "waiting", "resuming", "waiting"
+    ]
+    assert len(set(identities)) == 3
+    state = engine._progress["proj-root"]
+    assert state.continuation_retry["attempt"] == 2
+    assert 0 < state.continuation_retry_due_monotonic - monotonic() <= 30
+    assert "第 2/3 次" in root_agent_module._progress_card_view(state).current
+    session.expire_all()
+    assert engine.store.ensure("proj-root").status == "idle"
+    assert engine.store.ensure("proj-root").active_turn_id is None
+    assert engine.service.require_project("proj-root").execution_status == "idle"
 
 
 def test_progress_card_reports_elapsed_and_stale_wait_without_fake_activity():
@@ -2032,6 +2365,35 @@ async def test_rejected_native_steer_is_queued_as_a_new_turn(root_context):
 
 
 @pytest.mark.asyncio
+async def test_steer_without_known_turn_id_skips_native_steer(root_context):
+    _session, engine = root_context
+
+    class NoActiveTurnRuntime:
+        active_turn_id = None
+
+        def __init__(self):
+            self.calls = []
+
+        async def steer(self, turn_id, text):
+            self.calls.append((turn_id, text))
+
+    runtime = NoActiveTurnRuntime()
+    # The row still says running but carries no turn id (finished native
+    # turn, durable state lagging). A native steer cannot be addressed;
+    # the input must fall through to a new turn without a doomed request.
+    engine.store.set_turn("proj-root", turn_id=None, status="running")
+    with root_agent_module._ROOT_THREADS_GUARD:
+        root_agent_module._ROOT_THREADS["proj-root"] = root_agent_module._RootHandle(
+            runtime=runtime,
+            loop=asyncio.get_running_loop(),
+            provider="codex",
+        )
+
+    assert await engine.steer("proj-root", "继续") is False
+    assert runtime.calls == []
+
+
+@pytest.mark.asyncio
 async def test_accepted_native_steer_updates_owning_progress_state(root_context):
     _session, engine = root_context
 
@@ -2092,8 +2454,9 @@ async def test_accepted_native_steer_updates_owning_progress_state(root_context)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retrying", [False, True])
 async def test_human_timeline_event_rotates_progress_to_a_new_card(
-    root_context,
+    root_context, retrying,
 ):
     _session, engine = root_context
 
@@ -2130,8 +2493,17 @@ async def test_human_timeline_event_rotates_progress_to_a_new_card(
     old_key = root_agent_module._progress_projection_key(project.id, state)
     assert await engine.rotate_progress_for_timeline_event(project.id) is True
 
-    state.label = "正在结合最新补充继续处理"
-    engine._queue_progress_snapshot(project.id, event_identity="after-human-message")
+    if retrying:
+        await engine._project_native_activity(
+            project.id,
+            AgentEvent(
+                "mac/continuationRetry", "thread-1", "turn-1",
+                {"phase": "resuming", "attempt": 1, "maxAttempts": 3},
+            ),
+        )
+    else:
+        state.label = "正在结合最新补充继续处理"
+        engine._queue_progress_snapshot(project.id, event_identity="after-human-message")
     await engine._flush_progress_snapshots(project.id)
 
     assert state.projection_segment == 1
@@ -2282,6 +2654,75 @@ async def test_native_commentary_remains_visible_during_following_tool(root_cont
     assert state.detail == "工具：终端命令；目录：site"
     assert state.big_steps[-1].title == "已定位共同根因，正在补齐连续两轮测试。"
     assert state.big_steps[-1].small_steps[-1].detail == "工具：终端命令；目录：site"
+
+
+@pytest.mark.asyncio
+async def test_kimi_wire_public_commentary_reaches_progress_card(
+    root_context, monkeypatch, tmp_path,
+):
+    from mac_system.agents.kimi_runtime import KimiWireThread
+    from tests.test_feishu import RecordingBridge
+    from tests.test_kimi_runtime import WireProcess, started
+
+    session, engine = root_context
+    project = engine.service.require_project("proj-root")
+    project.feishu_chat_id = "oc-chat"
+    session.add(project)
+    session.commit()
+    engine.store.switch_provider("proj-root", "kimi_code")
+    engine.store.set_native_thread("proj-root", "kimi-session-uuid")
+    engine.feishu_bridge = RecordingBridge()
+    engine._progress_min_delivery_interval = 0
+    engine._update_progress("proj-root")
+    state = engine._progress["proj-root"]
+    state.root_provider_name = "Kimi"
+    process = WireProcess()
+    ready = asyncio.Event()
+
+    async def spawn(*args, **kwargs):
+        return process
+
+    async def on_event(event):
+        await engine._on_event("proj-root", event)
+        if event.kind == "item/started" and event.payload["item"].get("type") == "nativeToolCall":
+            ready.set()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    runtime = KimiWireThread(
+        kimi_bin="kimi", cwd=tmp_path, tools=[], event_handler=on_event,
+        silence_timeout_seconds=1,
+    )
+    task = await started(runtime, process)
+    try:
+        process.text("已定位问题，正在检查配置。")
+        process.event("ContentPart", {"type": "think", "think": "PRIVATE"})
+        process.event("SubagentEvent", {"private": "PRIVATE"})
+        process.event("ToolCall", {"id": "read", "function": {"name": "ReadFile"}})
+        await asyncio.wait_for(ready.wait(), 1)
+        await engine._flush_progress_snapshots("proj-root")
+
+        assert not task.done()
+        assert state.narrative == "已定位问题，正在检查配置。"
+        assert state.big_steps[-1].title == "已定位问题，正在检查配置。"
+        assert "已定位问题，正在检查配置。" in _progress_card_body(state)
+        rendered = str(engine.feishu_bridge.cards + engine.feishu_bridge.updates)
+        assert "已定位问题，正在检查配置。" in rendered
+        assert "PRIVATE" not in rendered
+
+        process.event("ToolResult", {"tool_call_id": "read", "output": "PRIVATE OUTPUT"})
+        process.event("StepBegin", {"n": 2})
+        process.text("检查结果。")
+        process.finish()
+        result = await task
+        await engine._flush_progress_snapshots("proj-root")
+        assert result.final_message == "检查结果。"
+        assert "PRIVATE" not in repr(session.exec(select(EventLog)).all())
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.close()
+        await engine._flush_progress_snapshots("proj-root")
 
 
 @pytest.mark.asyncio
@@ -2773,8 +3214,30 @@ async def test_stale_owner_review_cannot_decide_or_update_project(root_context, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_message", "retry_payload", "stop_summary"),
+    [
+        (
+            "provider at capacity",
+            {
+                "phase": "exhausted", "attempt": 2, "maxAttempts": 2,
+                "stopReason": "attempt_limit",
+            },
+            "达到配置的次数上限",
+        ),
+        (
+            "Selected model is at capacity. Please try a different model.",
+            {
+                "phase": "exhausted", "attempt": 3, "maxAttempts": 3,
+                "stopReason": "attempts_exhausted",
+            },
+            "达到该错误类型的次数上限",
+        ),
+        ("provider at capacity", None, ""),
+    ],
+)
 async def test_failed_terminal_status_stops_after_visible_failure_card(
-    root_context, monkeypatch
+    root_context, monkeypatch, failure_message, retry_payload, stop_summary
 ):
     session, engine = root_context
 
@@ -2800,6 +3263,23 @@ async def test_failed_terminal_status_stops_after_visible_failure_card(
         reviewed.append((len(engine.feishu_bridge.cards), kwargs))
 
     monkeypatch.setattr(engine, "_queue_delivered_report_review", review)
+    events = [
+        AgentEvent(
+            "error",
+            "thread-1",
+            "turn-failed-review",
+            {"error": {"message": failure_message, "codexErrorInfo": "serverOverloaded"}},
+        ),
+    ]
+    if retry_payload is not None:
+        events.append(
+            AgentEvent(
+                "mac/continuationRetry",
+                "thread-1",
+                "turn-failed-review",
+                retry_payload,
+            )
+        )
     await engine._publish_turn_status(
         project,
         TurnResult(
@@ -2807,20 +3287,23 @@ async def test_failed_terminal_status_stops_after_visible_failure_card(
             turn_id="turn-failed-review",
             status="failed",
             final_message=None,
-            events=(
-                AgentEvent(
-                    "error",
-                    "thread-1",
-                    "turn-failed-review",
-                    {"error": {"message": "provider at capacity"}},
-                ),
-            ),
+            events=tuple(events),
         ),
         user_request="继续迭代，直到封箱期超额收益超过 10%",
     )
 
     assert len(engine.feishu_bridge.cards) == 2
-    assert "provider at capacity" in str(engine.feishu_bridge.cards[-1][2])
+    failure_card = str(engine.feishu_bridge.cards[-1][2])
+    assert failure_message in failure_card
+    if retry_payload is None:
+        assert "本轮未完成，项目可直接重试。" in failure_card
+        assert "自动续跑已停止" not in failure_card
+    else:
+        assert "本轮未完成，自动续跑已停止。" in failure_card
+        assert "本轮未完成，项目可直接重试。" not in failure_card
+        assert stop_summary in failure_card
+        assert f"共追加 {retry_payload['attempt']} 次" in failure_card
+        assert "未切换模型" in failure_card
     assert reviewed == []
 
 
@@ -3172,6 +3655,7 @@ async def test_report_owner_decide_publishes_next_step_options(
     decisions = session.exec(select(ProjectDecision)).all()
     advice = next(row for row in decisions if row.decision_type == "advice")
     assert advice.status == "requires_user"
+    assert advice.answer_payload["continue_execution"] is continue_execution
     assert [option["label"] for option in advice.options] == [
         "采纳提速方案",
         "暂不改造",
@@ -4189,12 +4673,19 @@ async def test_failed_turn_releases_transport_and_resumes_same_thread(
     assert root.active_turn_id is None
     assert root.last_error == "provider transport failed"
     assert session.get(Project, "proj-root").execution_status == "idle"
+    first_history = session.exec(select(ProjectHistoryRound)).one()
+    assert first_history.report_status == "failed"
+    assert "provider transport failed" in first_history.report_content
+    assert root.active_history_round_id is None
     assert await engine.steer("proj-root", "不会发给已结束的进程") is False
 
     await engine.run("proj-root", "第二轮")
 
     assert ("resume", "durable-thread") in calls
     assert calls.count(("close", "durable-thread")) == 1
+    session.refresh(first_history)
+    assert first_history.report_status == "failed"
+    assert len(session.exec(select(ProjectHistoryRound)).all()) == 2
 
 
 @pytest.mark.asyncio
@@ -4292,6 +4783,9 @@ async def test_project_owner_answers_native_question_and_publishes_decision_card
     root_context, monkeypatch
 ):
     session, engine = root_context
+    from unittest.mock import Mock
+    reminder = Mock()
+    monkeypatch.setattr(root_agent_module, "queue_wechat_reminder", reminder)
 
     class RecordingBridge:
         def __init__(self):
@@ -4361,6 +4855,7 @@ async def test_project_owner_answers_native_question_and_publishes_decision_card
     )
 
     assert response == {"answers": {"style": {"answers": ["现代简洁"]}}}
+    reminder.assert_not_called()
     decision = session.exec(select(ProjectDecision)).one()
     assert decision.status == "applied"
     assert decision.card_message_id == "om-3"
@@ -4639,6 +5134,9 @@ async def test_native_approval_becomes_user_task_only_after_owner_defers(
     root_context, monkeypatch
 ):
     session, engine = root_context
+    from unittest.mock import Mock
+    reminder = Mock()
+    monkeypatch.setattr(root_agent_module, "queue_wechat_reminder", reminder)
     card_updated = asyncio.Event()
 
     class RecordingBridge:
@@ -4694,6 +5192,10 @@ async def test_native_approval_becomes_user_task_only_after_owner_defers(
     interaction = session.exec(select(QuestionInteraction)).one()
     assert interaction.requested_to == "user"
     assert interaction.escalated_to_user is True
+    reminder.assert_called_once_with(
+        engine.service, event_key=f"interaction:{interaction.id}",
+        project_id=project.id, interaction_id=interaction.id,
+    )
     assert engine.feishu_bridge.cards[0][2]["header"]["title"]["content"] == (
         "Owner 审阅中"
     )
@@ -4924,6 +5426,9 @@ async def test_project_owner_defer_preserves_native_user_question(
     root_context, monkeypatch
 ):
     session, engine = root_context
+    from unittest.mock import Mock
+    reminder = Mock()
+    monkeypatch.setattr(root_agent_module, "queue_wechat_reminder", reminder)
 
     class RecordingBridge:
         def __init__(self):
@@ -4987,6 +5492,7 @@ async def test_project_owner_defer_preserves_native_user_question(
     )
 
     assert response == {"answers": {}}
+    reminder.assert_called_once()
     assert session.exec(select(ProjectDecision)).all() == []
     interaction = session.exec(select(QuestionInteraction)).one()
     assert interaction.requested_to == "user"
@@ -5654,3 +6160,18 @@ async def test_external_provider_returns_failure_and_compact_activity_to_root(
     assert "/secret/path" not in str(result)
     agent = session.exec(select(AgentSession)).one()
     assert agent.result["tool_calls"][0]["input"]["file_path"] == "/secret/path"
+
+
+def test_dsh_lead_uses_native_settings_and_host_bindings(root_context):
+    _session, engine = root_context
+    engine.settings = Settings(_env_file=None, DSH_BIN="/native/dsh", DSH_HOME="/native/home",
+                               DEEPSEEK_API_KEY="test-only-token", DEEPSEEK_BASE_URL="https://provider.example")
+    context = ProjectLeadRuntimeContext(cwd=Path("/project"), tools=())
+    runtime = engine._create_dsh_lead_runtime(context)
+    assert runtime.provider_id == "dsh"
+    assert runtime.dsh_bin == "/native/dsh"
+    assert runtime.dsh_home == Path("/native/home")
+    assert runtime.cwd == context.cwd
+    assert runtime.env["DEEPSEEK_API_KEY"] == "test-only-token"
+    assert runtime.env["DEEPSEEK_BASE_URL"] == "https://provider.example"
+    assert "dsh" in engine.lead_runtime_registry.available_providers()

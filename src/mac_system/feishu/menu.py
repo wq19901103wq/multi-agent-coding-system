@@ -71,13 +71,17 @@ def build_project_list_card(
     mode: str = "status",
     chat_id: str | None = None,
     chat_type: str = "p2p",
+    *,
+    page: int = 0,
+    total_pages: int = 1,
+    query: str = "",
 ) -> dict[str, Any]:
     if not projects:
         return {
             "config": {"wide_screen_mode": True},
             "header": _header("暂无项目", "grey"),
             "elements": [
-                {"tag": "div", "text": _lark_md("还没有项目。")},
+                {"tag": "div", "text": _lark_md("没有匹配的项目或可打开的 Git 仓库。")},
                 {
                     "tag": "action",
                     "actions": [_button("创建项目", "create_prompt", "primary", chat_id, chat_type)],
@@ -94,23 +98,47 @@ def build_project_list_card(
         "paused": "已暂停",
         "failed": "失败",
     }
-    actions = [
-        _button(
-            (
-                f"{'当前 · ' if project.get('is_current') else ''}"
-                f"{str(project.get('name') or project['id'])[:22]}"
-                f"（{state_labels.get(project.get('execution_status', 'idle'), project.get('execution_status', 'idle'))}）"
-            ),
-            f"{action_prefix}:{project['id']}",
-            chat_id=chat_id,
-            chat_type=chat_type,
-        )
-        for project in projects
-    ]
-    rows = [
-        {"tag": "action", "actions": actions[index : index + 2]}
-        for index in range(0, len(actions), 2)
-    ]
+    rows = []
+    for project in projects:
+        unopened = "path" in project
+        name = str(project.get("name") or project.get("id"))
+        state = project.get("execution_status", "idle")
+        label = "未打开" if unopened else state_labels.get(state, state)
+        path = project.get("path") or project.get("workspace_path")
+        detail = f"`{path}`" if path else f"`{project['id']}`"
+        if not unopened and path:
+            detail += f"\n`{project['id']}`"
+        rows.extend([
+            {"tag": "div", "text": _lark_md(detail)},
+            {
+                "tag": "action",
+                "actions": [_button(
+                    f"{'当前 · ' if project.get('is_current') else ''}{name}（{label}）",
+                    (
+                        f"bind_dir_select:{project['path']}" if unopened
+                        else f"{action_prefix}:{project['id']}"
+                    ),
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                )],
+            },
+        ])
+    if total_pages > 1:
+        navigation = []
+        if page > 0:
+            navigation.append(_button(
+                "上一页", f"project_list_page:{mode}:{page - 1}:{query}",
+                chat_id=chat_id, chat_type=chat_type,
+            ))
+        if page + 1 < total_pages:
+            navigation.append(_button(
+                "下一页", f"project_list_page:{mode}:{page + 1}:{query}",
+                chat_id=chat_id, chat_type=chat_type,
+            ))
+        rows.extend([
+            {"tag": "div", "text": _lark_md(f"第 {page + 1} / {total_pages} 页")},
+            {"tag": "action", "actions": navigation},
+        ])
     return {
         "config": {"wide_screen_mode": True},
         "header": _header("选择项目", "blue"),
@@ -119,9 +147,9 @@ def build_project_list_card(
                 "tag": "div",
                 "text": _lark_md(
                     (
-                        "点击项目查看状态："
+                        "点击项目查看状态，或打开尚未使用的 Git 仓库："
                         if mode == "status"
-                        else "点击项目切换；也可发送 `/use 项目名`："
+                        else "点击项目切换，或打开 Git 仓库；也可发送 `/use 名称` 或 `/use 绝对路径`："
                     )
                 ),
             },

@@ -5,6 +5,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from mac_system.config import Settings
 from mac_system.core.notification_service import deliver_card
 from mac_system.core.project_service import ProjectService
+from mac_system.core.root_sessions import RootSessionStore
 from mac_system.feishu.card import (
     build_content_card,
     build_progress_card,
@@ -304,8 +305,6 @@ class Orchestrator:
 
     async def set_root_provider(self, project_id, provider):
         self.providers_set.append((project_id, provider))
-        if provider == "claude_code":
-            raise RuntimeError("该助手尚未接入项目主会话，不能安全切换。")
         return "codex", provider
 
     def provider_catalog(self):
@@ -717,7 +716,8 @@ def test_owner_advice_card_renders_choices_without_exposing_details():
 
 
 @pytest.fixture
-def ctx(tmp_path):
+def ctx(tmp_path, monkeypatch):
+    monkeypatch.setattr("mac_system.feishu.handlers.get_allowed_bind_roots", lambda: [])
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -760,6 +760,42 @@ def message_in_chat(text, chat_id):
     return item
 
 
+@pytest.fixture
+def repository_root(ctx, tmp_path, monkeypatch):
+    root = tmp_path / "repositories"
+    root.mkdir()
+    monkeypatch.setattr(
+        "mac_system.feishu.handlers.get_allowed_bind_roots", lambda: [root]
+    )
+    monkeypatch.setattr(
+        "mac_system.core.project_service.path_within_allowed_bind_roots",
+        lambda path: path.is_relative_to(root),
+    )
+    return root
+
+
+def initialize_repository(ctx, path):
+    path.mkdir(parents=True)
+    ctx.service._initialize_repository(path)
+    return path
+
+
+def menu_action(option_key, message_id=None):
+    return ButtonAction(
+        open_id="ou-user", approval_id="", action="menu", state="",
+        decision_id=None, option_key=option_key, extras={},
+        chat_id="oc-chat", message_id=message_id,
+    )
+
+
+def menu_option_keys(card):
+    return [
+        node["value"]["option_key"]
+        for node in _card_nodes(card)
+        if node.get("tag") == "button" and "value" in node
+    ]
+
+
 @pytest.mark.asyncio
 async def test_agents_command_reports_actual_provider_state_without_starting_turn(ctx):
     await handle_text_message(ctx, message("/agents"))
@@ -791,17 +827,44 @@ async def test_agent_command_switches_future_project_lead_without_running_turn(c
 
 
 @pytest.mark.asyncio
-async def test_agent_command_does_not_claim_unsupported_claude_switch(ctx):
+@pytest.mark.parametrize("command,provider,label", [
+    ("claude", "claude_code", "Claude"), ("dsh", "dsh", "DeepSeek Harness"),
+])
+async def test_agent_command_switches_to_claude_or_dsh(ctx, command, provider, label):
     project = await ctx.service.create_project(
         "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
     )
     ctx.service.set_chat_user_context("oc-chat", "ou-user", project.id)
 
-    await handle_text_message(ctx, message("/agent claude"))
+    await handle_text_message(ctx, message(f"/agent {command}"))
 
-    assert ctx.orchestrator.providers_set == [(project.id, "claude_code")]
+    assert ctx.orchestrator.providers_set == [(project.id, provider)]
     assert ctx.orchestrator.scheduled == []
-    assert "不能安全切换" in str(ctx.bridge.cards[-1][2])
+    assert f"Codex → {label}" in str(ctx.bridge.cards[-1][2])
+    assert "下一条普通消息" in str(ctx.bridge.cards[-1][2])
+
+
+@pytest.mark.asyncio
+async def test_agent_command_reports_busy_without_claiming_a_switch(ctx, monkeypatch):
+    project = await ctx.service.create_project(
+        "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+    ctx.service.set_chat_user_context("oc-chat", "ou-user", project.id)
+
+    async def busy(project_id, provider):
+        assert project_id == project.id and provider == "codex"
+        raise RuntimeError("当前项目仍在处理消息，本次未切换助手；请等本轮结束后再切换。")
+
+    monkeypatch.setattr(ctx.orchestrator, "set_root_provider", busy)
+    await handle_text_message(ctx, message("/agent codex"))
+
+    assert len(ctx.bridge.cards) == 1
+    rendered = str(ctx.bridge.cards[-1][2])
+    assert "暂时无法切换助手" in rendered
+    assert "本次未切换助手" in rendered
+    assert "orange" in rendered
+    assert "执行助手已切换" not in rendered
+    assert ctx.orchestrator.scheduled == []
 
 
 @pytest.mark.asyncio
@@ -1299,6 +1362,231 @@ async def test_newthread_is_explicit_project_control(ctx):
     assert card["header"]["title"]["content"] == "当前项目已清空对话"
     assert project.workspace_path in card["body"]["elements"][0]["content"]
     assert "下一条普通消息会开始新的 Codex 对话" in card["body"]["elements"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_ls_discovers_repositories_without_local_projects_or_writes(ctx, repository_root):
+    for index in range(15):
+        marker = repository_root / f"repo-{index:02}" / ".git"
+        marker.mkdir(parents=True)
+    repository = repository_root / "digital-human"
+    (repository / ".git").mkdir(parents=True)
+    before = sorted(repository_root.rglob("*"))
+
+    await handle_text_message(ctx, message("/ls"))
+
+    rendered = str(ctx.bridge.cards[-1][2])
+    assert "digital-human" in rendered
+    assert str(repository) in rendered
+    assert "repo-14" in rendered
+    assert ctx.service.list_projects_for_chat("oc-chat") == []
+    assert sorted(repository_root.rglob("*")) == before
+    assert ctx.orchestrator.scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_use_repository_reuses_local_project_and_thread(ctx, repository_root):
+    repository = initialize_repository(ctx, repository_root / "digital-human")
+    await handle_text_message(ctx, message("/use DIGITAL-HUMAN"))
+    opened = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert opened is not None and opened.workspace_path == str(repository)
+    store = RootSessionStore(ctx.service.session)
+    store.set_native_thread(opened.id, "local-thread")
+    await handle_text_message(ctx, message("/close"))
+
+    await handle_text_message(ctx, message("/use digital-hu"))
+    assert ctx.service.get_chat_user_selected_project("oc-chat", "ou-user").id == opened.id
+    assert store.ensure(opened.id).native_thread_id == "local-thread"
+    assert len(ctx.service.list_projects_for_chat("oc-chat")) == 1
+    assert ctx.orchestrator.scheduled == []
+
+    await handle_text_message(ctx, message("/ls"))
+    rendered = str(ctx.bridge.cards[-1][2])
+    assert opened.id in rendered
+    assert "当前聊天尚未打开" not in rendered
+    await handle_text_message(ctx, message("/use"))
+    assert f"bind_dir_select:{repository}" not in menu_option_keys(ctx.bridge.cards[-1][2])
+
+
+@pytest.mark.asyncio
+async def test_use_exact_registered_name_precedes_repository_name(ctx, repository_root):
+    initialize_repository(ctx, repository_root / "digital-human")
+    existing = await ctx.service.create_project(
+        "digital-human", "feature", "one", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+
+    await handle_text_message(ctx, message("/use digital-human"))
+
+    assert ctx.service.get_chat_user_selected_project("oc-chat", "ou-user").id == existing.id
+    assert len(ctx.service.list_projects_for_chat("oc-chat")) == 1
+
+
+@pytest.mark.asyncio
+async def test_use_exact_repository_precedes_project_prefix(ctx, repository_root):
+    repository = initialize_repository(ctx, repository_root / "digital-human")
+    other = await ctx.service.create_project(
+        "digital-human-framework", "feature", "one", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+
+    await handle_text_message(ctx, message("/use digital-human"))
+
+    opened = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert opened.id != other.id
+    assert opened.workspace_path == str(repository)
+
+
+@pytest.mark.asyncio
+async def test_use_search_is_not_limited_to_scanner_default_or_first_page(ctx, repository_root):
+    for index in range(14):
+        (repository_root / f"repo-{index:02}" / ".git").mkdir(parents=True)
+    target = initialize_repository(ctx, repository_root / "repo-14")
+
+    await handle_text_message(ctx, message("/use repo-14"))
+
+    opened = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert opened.workspace_path == str(target)
+    assert ctx.orchestrator.scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_use_same_name_repositories_require_explicit_path_choice(ctx, repository_root):
+    first = initialize_repository(ctx, repository_root / "first" / "shared")
+    second = initialize_repository(ctx, repository_root / "second" / "shared")
+
+    await handle_text_message(ctx, message("/use shared"))
+
+    card = ctx.bridge.cards[-1][2]
+    assert str(first) in str(card) and str(second) in str(card)
+    assert ctx.service.get_chat_user_selected_project("oc-chat", "ou-user") is None
+    assert ctx.service.list_projects_for_chat("oc-chat") == []
+
+    await handle_card_action(ctx, menu_action(f"bind_dir_select:{second}", "message-1"))
+
+    opened = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert opened.workspace_path == str(second)
+    assert ctx.orchestrator.scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_use_project_and_repository_prefix_ambiguity_does_not_switch(ctx, repository_root):
+    repository = initialize_repository(ctx, repository_root / "digital-human")
+    existing = await ctx.service.create_project(
+        "digital-site", "feature", "one", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+
+    await handle_text_message(ctx, message("/use digital"))
+
+    keys = menu_option_keys(ctx.bridge.cards[-1][2])
+    assert f"switch:{existing.id}" in keys
+    assert f"bind_dir_select:{repository}" in keys
+    assert ctx.service.get_chat_user_selected_project("oc-chat", "ou-user").id == existing.id
+    assert len(ctx.service.list_projects_for_chat("oc-chat")) == 1
+
+
+@pytest.mark.asyncio
+async def test_use_pagination_keeps_all_candidates_and_freezes_old_card(ctx, repository_root):
+    for index in range(14):
+        (repository_root / f"repo-{index:02}" / ".git").mkdir(parents=True)
+    await handle_text_message(ctx, message("/use"))
+    first_card = ctx.bridge.cards[-1][2]
+    assert "project_list_page:switch:1:" in menu_option_keys(first_card)
+    assert len([key for key in menu_option_keys(first_card) if key.startswith("bind_dir_select:")]) == 10
+    await handle_text_message(ctx, message("/ls"))
+
+    await handle_card_action(ctx, menu_action("project_list_page:switch:1:", "message-1"))
+
+    keys = menu_option_keys(ctx.bridge.cards[-1][2])
+    assert f"bind_dir_select:{repository_root / 'repo-13'}" in keys
+    assert "project_list_page:switch:0:" in keys
+    assert "第 2 / 2 页" in str(ctx.bridge.cards[-1][2])
+    assert all(message_id != "message-1" for message_id, _ in ctx.bridge.updates)
+    assert ctx.service.list_projects_for_chat("oc-chat") == []
+
+
+@pytest.mark.asyncio
+async def test_use_ambiguous_pagination_preserves_search_filter(ctx, repository_root):
+    for index in range(14):
+        (repository_root / f"matching-{index:02}" / ".git").mkdir(parents=True)
+    (repository_root / "unrelated" / ".git").mkdir(parents=True)
+    await handle_text_message(ctx, message("/use matching"))
+    assert "project_list_page:switch:1:matching" in menu_option_keys(ctx.bridge.cards[-1][2])
+
+    await handle_card_action(ctx, menu_action("project_list_page:switch:1:matching", "message-1"))
+
+    rendered = str(ctx.bridge.cards[-1][2])
+    assert "matching-13" in rendered
+    assert "unrelated" not in rendered
+    assert ctx.service.list_projects_for_chat("oc-chat") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("home_relative", [False, True])
+async def test_use_absolute_repository_beyond_discovery_depth(ctx, repository_root, monkeypatch, home_relative):
+    repository = initialize_repository(ctx, repository_root / "one" / "two" / "three")
+    monkeypatch.setenv("HOME", str(repository_root))
+    argument = "~/one/two/three" if home_relative else str(repository)
+
+    await handle_text_message(ctx, message(f"/use {argument}"))
+
+    opened = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    assert opened.workspace_path == str(repository)
+    assert ctx.orchestrator.scheduled == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_kind", ["missing", "non_git", "outside", "invalid_git", "subdirectory", "symlink"])
+async def test_use_invalid_paths_do_not_initialize_repository_or_project(ctx, repository_root, tmp_path, invalid_kind):
+    target = repository_root / "target"
+    if invalid_kind == "outside":
+        target = initialize_repository(ctx, tmp_path / "outside")
+    elif invalid_kind == "symlink":
+        outside = initialize_repository(ctx, tmp_path / "outside")
+        target.symlink_to(outside, target_is_directory=True)
+    elif invalid_kind == "subdirectory":
+        parent = initialize_repository(ctx, repository_root / "parent")
+        target = parent / "subdirectory"
+        target.mkdir()
+    elif invalid_kind == "non_git":
+        target.mkdir()
+    elif invalid_kind == "invalid_git":
+        (target / ".git").mkdir(parents=True)
+    before = sorted(tmp_path.rglob("*"))
+
+    await handle_text_message(ctx, message(f"/use {target}"))
+
+    assert ctx.bridge.cards[-1][2]["header"]["title"]["content"] == "打开失败"
+    assert ctx.service.list_projects_for_chat("oc-chat") == []
+    assert sorted(tmp_path.rglob("*")) == before
+    assert ctx.orchestrator.scheduled == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_bot", [False, True])
+async def test_use_shared_repository_never_imports_another_chat_or_bots_thread(ctx, repository_root, other_bot):
+    repository = initialize_repository(ctx, repository_root / "digital-human")
+    await handle_text_message(ctx, message("/use digital-human"))
+    original = ctx.service.get_chat_user_selected_project("oc-chat", "ou-user")
+    store = RootSessionStore(ctx.service.session)
+    store.set_native_thread(original.id, "must-not-leak")
+    if other_bot:
+        service = ProjectService(ctx.service.session, bot_account_id="other-bot")
+        service.settings = ctx.service.settings
+        ctx.service = service
+        ctx.bot_account_id = "other-bot"
+        target_chat = "oc-chat"
+    else:
+        target_chat = "oc-other"
+
+    await handle_text_message(ctx, message_in_chat("/ls", target_chat))
+    assert original.id not in str(ctx.bridge.cards[-1][2])
+    await handle_text_message(ctx, message_in_chat("/use digital-human", target_chat))
+
+    opened = ctx.service.get_chat_user_selected_project(target_chat, "ou-user")
+    assert opened.id != original.id
+    assert opened.workspace_path == str(repository)
+    assert store.ensure(opened.id).native_thread_id is None
+    assert store.ensure(original.id).native_thread_id == "must-not-leak"
+    assert ctx.orchestrator.scheduled == []
 
 
 @pytest.mark.asyncio

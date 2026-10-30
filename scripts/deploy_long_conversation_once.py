@@ -2,6 +2,7 @@
 
 import argparse
 from datetime import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -156,6 +157,7 @@ def restore_reviews(bind, snapshot, restored):
             ).order_by(NotificationOutbox.created_at, NotificationOutbox.id)).all()
             if not report_delivered(rows):
                 continue
+            rows = latest_delivered_report_rows(rows)
             project = service.require_project(project_id)
             reset_at = (project.context or {}).get("runtime_reset_at")
             if reset_at and datetime.fromisoformat(reset_at) >= rows[0].created_at:
@@ -246,8 +248,28 @@ def thread_identities(bind):
                 for row in session.exec(select(RootAgentSession)).all()}
 
 
-def report_delivered(rows):
+def latest_delivered_report_rows(rows):
     if not rows or any(row.status != "sent" or not row.provider_message_id for row in rows):
+        return []
+    messages = {}
+    pages = {}
+    for row in sorted(rows, key=lambda item: (item.updated_at, item.created_at, item.id)):
+        identity = (row.bot_account_id, row.recipient_type, row.recipient_id,
+                    row.provider_message_id)
+        page = re.search(r"（(\d+)/(\d+)）$", (row.payload.get("card") or {}).get(
+            "header", {}
+        ).get("title", {}).get("content", ""))
+        pagination = page.groups() if page else None
+        if identity in pages and pages[identity] != pagination:
+            return []
+        pages[identity] = pagination
+        messages[identity] = row
+    return list(messages.values())
+
+
+def report_delivered(rows):
+    rows = latest_delivered_report_rows(rows)
+    if not rows:
         return False
     pages = [re.search(r"（(\d+)/(\d+)）$", (row.payload.get("card") or {}).get(
         "header", {}
@@ -341,17 +363,27 @@ def wait_for_drain(bind, timeout, quiet_seconds=30, *, snapshot=None, snapshot_p
 def refresh_execution_witness(witness):
     if not witness or not witness.get("observers"):
         return witness
-    identities = {(item["pid"], item["created_at"]) for item in witness["processes"]}
-    groups = set(witness["groups"])
+    identities = set()
+    groups = set()
     processes = {}
     infrastructure = set()
     excluded = set()
     unverifiable = False
+    for group in witness["groups"]:
+        try:
+            os.killpg(group, 0)
+            groups.add(group)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            groups.add(group)
+            unverifiable = True
     for identity in [*witness["observers"], *witness["processes"]]:
         try:
             process = psutil.Process(identity["pid"])
             if process.create_time() != identity["created_at"]:
-                unverifiable = True
+                if identity in witness["observers"]:
+                    unverifiable = True
                 continue
             processes.update({child.pid: child for child in process.children(recursive=True)})
             if identity in witness["observers"]:
@@ -361,7 +393,9 @@ def refresh_execution_witness(witness):
         except psutil.NoSuchProcess:
             if identity in witness["observers"]:
                 unverifiable = True
-        except psutil.AccessDenied:
+        except (psutil.AccessDenied, PermissionError):
+            if identity not in witness["observers"]:
+                identities.add((identity["pid"], identity["created_at"]))
             unverifiable = True
     for process in list(processes.values()):
         try:
@@ -376,7 +410,7 @@ def refresh_execution_witness(witness):
                 infrastructure.add(process.pid)
         except psutil.NoSuchProcess:
             continue
-        except psutil.AccessDenied:
+        except (psutil.AccessDenied, PermissionError):
             unverifiable = True
     infrastructure_groups = {os.getpgrp()}
     for process_id in infrastructure | excluded:
@@ -408,17 +442,21 @@ def refresh_execution_witness(witness):
     }
 
 
-def wait_for_readiness(bind, status_path, readiness_path, execution_witness, quiet_seconds=30):
-    with Session(bind) as session:
-        readiness = {
-            "started_at": datetime.utcnow().isoformat(),
-            "active_turns": {
-                row.project_id: row.active_turn_id
-                for row in session.exec(select(RootAgentSession)).all()
-                if row.status not in {"idle", "failed"} and row.active_turn_id
-            },
-            "background_execution": execution_witness,
-        }
+def wait_for_readiness(bind, status_path, readiness_path, execution_witness, quiet_seconds=30,
+                       *, resume=False):
+    if resume:
+        readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+    else:
+        with Session(bind) as session:
+            readiness = {
+                "started_at": datetime.utcnow().isoformat(),
+                "active_turns": {
+                    row.project_id: row.active_turn_id
+                    for row in session.exec(select(RootAgentSession)).all()
+                    if row.status not in {"idle", "failed"} and row.active_turn_id
+                },
+                "background_execution": execution_witness,
+            }
     quiet_since = None
     previous = None
     while True:
@@ -484,10 +522,62 @@ def dispatch_acceptance(bind, project_id, notice_id, operation_id):
 
 
 def run(bind, root, operation_id, timeout, project_id=None, execution_witness=None,
-        *, wait_ready=False):
+        *, wait_ready=False, resume_passive=False):
     state_dir = root / ".mac" / "long_conversation_maintenance" / operation_id
-    state_dir.mkdir(parents=True, exist_ok=False)
+    if resume_passive:
+        if not wait_ready or not state_dir.is_dir():
+            raise RuntimeError("Passive resume requires the existing passive operation")
+    else:
+        state_dir.mkdir(parents=True, exist_ok=False)
     os.chmod(state_dir, 0o700)
+    with (state_dir / "operation.lock").open("a") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("Maintenance operation is already running") from error
+        if resume_passive:
+            validate_passive_resume(root, state_dir, operation_id, execution_witness)
+        run_claimed(bind, root, state_dir, operation_id, timeout, project_id,
+                    execution_witness, wait_ready=wait_ready, resume_passive=resume_passive)
+
+
+def validate_passive_resume(root, state_dir, operation_id, execution_witness):
+    if (root / ".mac" / "restart_operations" / operation_id).exists():
+        raise RuntimeError("Restart was already attempted; no retry permitted")
+    if (state_dir / "snapshot.json").exists():
+        raise RuntimeError("Maintenance already entered its window; passive resume refused")
+    status = json.loads((state_dir / "status.json").read_text(encoding="utf-8"))
+    if (status.get("stage") not in {"passive_initializing", "passive_waiting", "not_completed"}
+            or status.get("owners_deferred") or status.get("restart_attempted")
+            or status.get("restarted")):
+        raise RuntimeError("Operation is not a stopped passive wait")
+    previous_pid = int(status["pid"])
+    if previous_pid <= 0:
+        raise RuntimeError("Previous maintenance process identity is invalid")
+    try:
+        psutil.Process(previous_pid)
+    except psutil.NoSuchProcess:
+        pass
+    except (psutil.AccessDenied, PermissionError) as error:
+        raise RuntimeError("Previous maintenance process cannot be verified") from error
+    else:
+        raise RuntimeError("Previous maintenance process still exists; resume refused")
+    readiness = json.loads((state_dir / "readiness.json").read_text(encoding="utf-8"))
+    datetime.fromisoformat(readiness["started_at"])
+    if (not isinstance(readiness.get("active_turns"), dict)
+            or not execution_witness or not execution_witness.get("observers")
+            or readiness["background_execution"].get("observers") != execution_witness["observers"]):
+        raise RuntimeError("Original readiness and observer identities must be preserved")
+    resumes_path = state_dir / "passive_resumes.json"
+    resumes = json.loads(resumes_path.read_text(encoding="utf-8")) if resumes_path.exists() else []
+    resumes.append({"previous_status": status, "pid": os.getpid(),
+                    "resumed_at": datetime.utcnow().isoformat()})
+    write_state(resumes_path, resumes)
+
+
+def run_claimed(bind, root, state_dir, operation_id, timeout, project_id, execution_witness,
+                *, wait_ready, resume_passive):
     status_path = state_dir / "status.json"
     snapshot_path = state_dir / "snapshot.json"
     if (root / ".mac" / "restart_operations" / operation_id).exists():
@@ -503,8 +593,10 @@ def run(bind, root, operation_id, timeout, project_id=None, execution_witness=No
     error_type = None
     try:
         if wait_ready:
+            resume_options = {"resume": True} if resume_passive else {}
             execution_witness = wait_for_readiness(
-                bind, status_path, state_dir / "readiness.json", execution_witness
+                bind, status_path, state_dir / "readiness.json", execution_witness,
+                **resume_options,
             )
         snapshot = defer_owners(bind, snapshot_path)
         if execution_witness is not None:
@@ -574,7 +666,7 @@ def run(bind, root, operation_id, timeout, project_id=None, execution_witness=No
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["run", "restore"])
+    parser.add_argument("action", choices=["run", "resume-passive", "restore"])
     parser.add_argument("operation_id")
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--notify-project")
@@ -588,6 +680,8 @@ def main():
         parser.error("Timeout must be positive")
     if args.wait_ready and (not args.notify_project or not args.wait_execution):
         parser.error("Passive continuation requires a notification project and execution witness")
+    if args.action == "resume-passive" and not args.wait_ready:
+        parser.error("Passive resume requires --wait-ready")
     from mac_system.database import _engine
 
     root = Path(__file__).resolve().parents[1]
@@ -616,7 +710,7 @@ def main():
         if args.wait_execution is not None else None
     )
     run(_engine, root, args.operation_id, args.timeout, args.notify_project, execution_witness,
-        wait_ready=args.wait_ready)
+        wait_ready=args.wait_ready, resume_passive=args.action == "resume-passive")
 
 
 if __name__ == "__main__":

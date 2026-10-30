@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from math import ceil
 from time import monotonic
 from typing import Any
 
@@ -95,6 +96,8 @@ class _ProgressState:
     suspended_seconds: float = 0.0
     delivery_failures: int = 0
     next_delivery_attempt_monotonic: float = 0.0
+    continuation_retry: dict[str, Any] | None = None
+    continuation_retry_due_monotonic: float | None = None
 
 
 @dataclass
@@ -520,6 +523,30 @@ def _progress_card_body(
     return "\n\n".join(sections)
 
 
+def _continuation_retry_summary(payload: dict[str, Any]) -> str:
+    attempt = payload.get("attempt", 0)
+    maximum = payload.get("maxAttempts", 0)
+    phase = payload.get("phase")
+    if phase == "waiting":
+        delay = ceil(float(payload.get("delaySeconds", 0)))
+        return f"MAC 等待同模型续跑：第 {attempt}/{maximum} 次，本次计划退避约 {delay} 秒。"
+    if phase == "resuming":
+        return f"MAC 正在同模型续跑：第 {attempt}/{maximum} 次，沿用原会话，不重发原请求。"
+    if phase == "recovered":
+        return f"MAC 同模型续跑已恢复并完成本轮，共追加 {attempt} 次；未切换模型。"
+    if phase == "cancelled":
+        return f"MAC 自动续跑已中止，共追加 {attempt} 次；原会话仍保留。"
+    reasons = {
+        "disabled": "自动续跑已禁用",
+        "attempt_limit": "达到配置的次数上限",
+        "attempts_exhausted": "达到该错误类型的次数上限",
+        "wait_budget": "下一次退避超出额外等待预算",
+        "error_changed": "错误类型改变，不再沿用原重试计划",
+    }
+    reason = reasons.get(str(payload.get("stopReason")), "本次重试计划结束")
+    return f"MAC 自动续跑已停止：{reason}，共追加 {attempt} 次；任务未完成，未切换模型。"
+
+
 def _progress_card_view(
     state: _ProgressState,
     *,
@@ -536,7 +563,24 @@ def _progress_card_view(
     )
     since_event = max(0, int(current - state.last_event_monotonic))
     current_lines: list[str] = []
-    if state.status == "running" and since_event >= 30:
+    retry = state.continuation_retry
+    if retry is not None:
+        current_lines.append(_continuation_retry_summary(retry))
+        if retry.get("phase") == "waiting" and state.status == "running":
+            due = state.continuation_retry_due_monotonic
+            remaining = ceil(max(0, due - current)) if due is not None else None
+            if remaining is not None:
+                current_lines.append(
+                    f"预计还有 {remaining} 秒开始续跑（随进度卡刷新）；可发送 /stop 立即取消等待。"
+                )
+            current_lines.append(
+                f"本轮已安排额外退避 {float(retry.get('scheduledWaitSeconds', 0)):.0f} 秒"
+                f" / 预算 {float(retry.get('waitBudgetSeconds', 0)):.0f} 秒；"
+                "不包含 Codex 原生重试、模型生成和工具执行时间。"
+            )
+    if state.status == "running" and since_event >= 30 and not (
+        retry is not None and retry.get("phase") == "waiting"
+    ):
         current_lines.append(
             f"暂未收到新的 {state.root_provider_name} 事件；本轮仍在运行，通常表示正在等待模型或工具返回。"
         )

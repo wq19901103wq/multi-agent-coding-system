@@ -334,7 +334,7 @@ MAC_ALLOWED_BIND_ROOTS="/Users/yourname/workspace,/Users/yourname/another-repo"
 
 ```text
 /proj
-/use 项目名或ID前缀
+/use 项目名、仓库名、ID前缀或Git仓库绝对路径
 /info
 ```
 
@@ -348,12 +348,12 @@ MAC_ALLOWED_BIND_ROOTS="/Users/yourname/workspace,/Users/yourname/another-repo"
 | --- | --- | --- |
 | `/create [需求]` | `/c` | 新建并执行；不带需求时提示输入 |
 | `/open [绝对目录]` | `/o`、`/bind`、`/b` | 打开已有目录；不带路径时显示目录卡 |
-| `/proj` | `/ls` | 查看项目列表 |
-| `/use [项目名或ID前缀]` | `/s` | 切换项目；不带参数时显示选择卡 |
+| `/proj` | `/ls` | 查看当前聊天项目及允许范围内可打开的 Git 仓库 |
+| `/use [名称、ID前缀或绝对路径]` | `/s` | 切换当前聊天项目，或打开已有 Git 仓库；不带参数时显示分页选择卡 |
 | `/info` | `/i` | 查看当前项目、真实目录和状态 |
 | `/close` | `/unbind`、`/u` | 关闭当前项目选择，不删除文件；可用 `/use` 返回 |
 | `/agents` | `/a` | 查看外部 coding-agent 的配置、可用性和能力 |
-| `/agent [codex或kimi]` | — | 查看或切换项目执行助手；不是调用外部审阅任务 |
+| `/agent [codex或kimi或claude或dsh]` | — | 查看或切换项目执行助手；不是调用外部审阅任务 |
 | `/model [模型名]` | — | 查看 Codex 模型选项或设置模型；`/model default` 恢复默认 |
 | `/owner [on或off]` | `/ow` | 查看、开启或关闭当前项目 Owner |
 | `/new` | `/n` | 保留项目文件，开始新对话；不清空项目管理历史 |
@@ -391,15 +391,28 @@ Owner 是与执行 Agent 隔离的用户项目代理，不是 Coordinator、Revi
 
 ### 区分三种 provider 行为
 
-1. **项目执行助手**：默认 Codex；`/agent` 查看当前执行者，`/agent kimi` 或
-   `/agent codex` 显式切换后续消息。Claude 尚未接入项目主会话。
+1. **项目执行助手**：默认 Codex；`/agent` 查看当前执行者，`/agent kimi`、
+   `/agent claude`、`/agent dsh` 或 `/agent codex` 显式切换后续消息。运行中立即提示本次未切换，
+   不静默排队，当前任务与助手保持不变。Claude Code 使用官方 SDK 保留原生会话，
+   沿用本机 Claude 的认证、配置和模型；原生问题与审批通过 MAC 卡片答复。
 2. **外部 CLI 任务**：Root 按实际能力调用 Claude Code、Kimi、Pi 或外部 Codex；
    用 `/agents` 查看当前可用情况，不是所有配置项都默认启用或可用。
 3. **故障接管**：默认关闭。用户明确启用后，可进行一次公开的 Codex→Kimi 接管；
    先确认旧执行与子进程停止，再保存目标会话和公开进度并告知用户，不静默或循环换助手。
 
 不要假设切换 provider 会迁移完整原生对话或保证所有工具能力相同。
+Kimi 的公开阶段说明会显示在进度卡中，后续工具调用不会抹掉这段说明；
+内部思考、子 Agent 私有内容和原始工具输出不展示。
 外部 CLI 的安装、认证、费用、可用模型和许可均由对应 provider 决定。
+
+DeepSeek Harness 使用官方 ACP profile（`dsh --profile acp`），支持持久会话、
+原生取消和一次性审批；MAC 工具与用户提问通过私有 MCP 连接提供。ACP 暂无 steer，
+因此运行中追加的普通消息会由 MAC 保留，在当前轮结束后继续执行。
+CLI 安装：`npm install --prefix .mac/dsh-runtime @deepseek-ai/dsh@0.2.0-rc.2 node@22`，
+或通过 `DSH_BIN` 指定已安装的 CLI。认证和模型沿用 DSH 的原生 `acp` profile；
+`DSH_HOME` 可指定其配置与会话目录（默认 `~/.dsh`），原生登录/API 配置须先完成。
+MAC 也会向 DSH 传递显式配置的 `DEEPSEEK_API_KEY` 和 `DEEPSEEK_BASE_URL`。
+切换命令为 `/agent dsh`；已有项目不会被自动切换。
 
 ## 运行维护与安全
 

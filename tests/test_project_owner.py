@@ -597,8 +597,9 @@ def test_project_owner_question_answer_accepts_combined_multi_source_evidence():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reason_length", [300, 13_000])
+@pytest.mark.parametrize("first_failure", [None, "startup_timeout", "turn_timeout", "transport"])
 async def test_owner_treats_current_task_as_authority_for_ordinary_approval(
-    owner_context, monkeypatch, tmp_path, reason_length
+    owner_context, monkeypatch, tmp_path, reason_length, first_failure
 ):
     service, project, _workspace = owner_context
     store = RootSessionStore(service.session)
@@ -608,15 +609,38 @@ async def test_owner_treats_current_task_as_authority_for_ordinary_approval(
         request_origin="human",
     )
     captured = {}
+    runtimes = []
+    deadlines = []
+    original_wait_for = project_owner_module.asyncio.wait_for
+
+    async def record_deadline(coro, *, timeout):
+        deadlines.append(timeout)
+        effective_timeout = (
+            0.01 if first_failure == "turn_timeout" and len(deadlines) == 1 else timeout
+        )
+        return await original_wait_for(coro, timeout=effective_timeout)
+
+    monkeypatch.setattr(project_owner_module.asyncio, "wait_for", record_deadline)
 
     class ApprovalOwnerThread:
         def __init__(self, **_kwargs):
+            assert all(runtime.closed for runtime in runtimes)
+            self.attempt = len(runtimes) + 1
+            self.closed = False
+            runtimes.append(self)
             self.active_model = "owner-model"
 
         async def create_thread(self):
+            if self.attempt == 1 and first_failure == "startup_timeout":
+                raise TimeoutError()
             return "thread-owner-approval"
 
         async def run_turn(self, prompt, *, output_schema=None):
+            if self.attempt == 1:
+                if first_failure == "turn_timeout":
+                    await project_owner_module.asyncio.Event().wait()
+                if first_failure == "transport":
+                    raise OSError("temporary connection reset")
             payload = project_owner_module.json.loads(
                 prompt.split("数据：\n", 1)[1]
             )
@@ -645,7 +669,7 @@ async def test_owner_treats_current_task_as_authority_for_ordinary_approval(
             )
 
         async def close(self):
-            return None
+            self.closed = True
 
     monkeypatch.setattr(
         project_owner_module, "CodexAppServerThread", ApprovalOwnerThread
@@ -663,9 +687,16 @@ async def test_owner_treats_current_task_as_authority_for_ordinary_approval(
     }
 
     result = await ProjectOwner(
-        service, Settings(PROJECTS_DIR=tmp_path / "projects")
+        service, Settings(
+            PROJECTS_DIR=tmp_path / "projects",
+            AGENT_TIMEOUT_SECONDS=600,
+            PROJECT_LEAD_FAILOVER_PROVIDER="",
+        )
     ).decide(project, [question])
 
+    assert len(runtimes) == (2 if first_failure else 1)
+    assert all(runtime.closed for runtime in runtimes)
+    assert deadlines == [600] * len(runtimes)
     assert captured["task"]["kind"] == "answer_approval"
     owner_question = captured["task"]["current_questions"][0]
     assert len(owner_question["header"]) == 120
@@ -681,6 +712,66 @@ async def test_owner_treats_current_task_as_authority_for_ordinary_approval(
     assert result.outcome == "decide"
     assert result.answers == {"approval_decision": "允许本次"}
     assert result.answer_source_refs["approval_decision"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result_kind", ["defer", "exhausted", "close_failure", "cancelled"])
+async def test_owner_approval_retry_preserves_human_choice_and_stop_boundaries(
+    owner_context, monkeypatch, tmp_path, result_kind
+):
+    service, project, _workspace = owner_context
+    runtimes = []
+
+    class FailingOwnerThread:
+        def __init__(self, **_kwargs):
+            assert all(runtime.closed for runtime in runtimes)
+            self.closed = False
+            self.active_model = "owner-model"
+            runtimes.append(self)
+
+        async def create_thread(self):
+            return "thread-owner"
+
+        async def run_turn(self, _prompt, *, output_schema=None):
+            if result_kind == "cancelled":
+                raise project_owner_module.asyncio.CancelledError()
+            if len(runtimes) == 1 or result_kind == "exhausted":
+                raise project_owner_module.asyncio.TimeoutError()
+            return TurnResult(
+                thread_id="thread-owner",
+                turn_id="turn-owner",
+                status="completed",
+                final_message=project_owner_module.json.dumps(_submission(
+                    outcome="defer", decision="", confidence="low", answers=[],
+                    rationale="缺少这项外部操作的授权，需要用户选择。",
+                )),
+                events=(),
+            )
+
+        async def close(self):
+            if result_kind == "close_failure":
+                raise OSError("previous runtime has not stopped")
+            self.closed = True
+
+    monkeypatch.setattr(project_owner_module, "CodexAppServerThread", FailingOwnerThread)
+    owner = ProjectOwner(service, Settings(
+        PROJECTS_DIR=tmp_path / "projects", PROJECT_LEAD_FAILOVER_PROVIDER="",
+    ))
+    question = {**_question(), "request_kind": "approval"}
+    if result_kind == "defer":
+        result = await owner.decide(project, [question])
+        assert result.outcome == "defer"
+        assert result.answers == {}
+    else:
+        error_type = {
+            "exhausted": project_owner_module.asyncio.TimeoutError,
+            "close_failure": OSError,
+            "cancelled": project_owner_module.asyncio.CancelledError,
+        }[result_kind]
+        with pytest.raises(error_type):
+            await owner.decide(project, [question])
+    assert len(runtimes) == (2 if result_kind in {"defer", "exhausted"} else 1)
+    assert all(runtime.closed for runtime in runtimes) == (result_kind != "close_failure")
 
 
 @pytest.mark.asyncio
@@ -1306,6 +1397,22 @@ def test_project_owner_neutral_report_still_gives_non_executing_advice():
 
     assert result.outcome == "decide"
     assert result.continue_execution is False
+
+
+def test_owner_prompt_reuses_validation_evidence_and_stops_rechecking():
+    instructions = project_owner_module._OWNER_INSTRUCTIONS
+
+    assert "依据本轮可见结果和已有证据" in instructions
+    assert "技术结果没有独立验证时" not in instructions
+    assert "补足独立证据" not in instructions
+    assert "不得仅因缺少独立复核而要求 Root 重新核验" in instructions
+    assert "校验只在实质性代码变更之后进行" in instructions
+    assert "只验证本次修改相关的最小必要范围，不运行全量测试" in instructions
+    assert "单次问题最多重试校验一次" in instructions
+    assert "连续两次校验结果一致就停止" in instructions
+    assert "校验通过后立即停止，不追加新的核验工作" in instructions
+    assert "不再追加自检或代码审查" in instructions
+    assert "连续两轮没有实质性代码改动时，停止该修改任务的迭代" in instructions
 
 
 def test_owner_prompt_keeps_scope_boundary_while_proactively_advising():

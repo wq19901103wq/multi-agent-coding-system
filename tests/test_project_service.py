@@ -2081,6 +2081,25 @@ def test_scan_candidate_repositories_is_bounded(service, tmp_path):
     ]
 
 
+def test_scan_candidate_repositories_full_discovery_is_sorted_and_deduplicated(tmp_path):
+    root = tmp_path / "allowed"
+    for index in reversed(range(15)):
+        (root / f"repo-{index:02}" / ".git").mkdir(parents=True)
+    worktree = root / "worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /some/repository/worktrees/worktree\n")
+    (root / "symlink").symlink_to(worktree, target_is_directory=True)
+    for name in (".hidden", "node_modules", "__pycache__"):
+        (root / name / ".git").mkdir(parents=True)
+
+    repositories = ProjectService.scan_candidate_repositories([root, root], limit=None)
+
+    assert [item["name"] for item in repositories] == [
+        *(f"repo-{index:02}" for index in range(15)), "worktree"
+    ]
+    assert len(ProjectService.scan_candidate_repositories([root])) == 12
+
+
 def test_project_status_has_no_workflow_projection(service):
     project = Project(
         id="p",

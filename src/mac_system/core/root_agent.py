@@ -38,6 +38,8 @@ from mac_system.agents.root_runtime import (
     _turn_error_code,
 )
 from mac_system.agents.kimi_runtime import KimiWireThread
+from mac_system.agents.claude_runtime import ClaudeCodeThread
+from mac_system.agents.dsh_runtime import DshACPThread
 from mac_system.agents.process_lifecycle import snapshot_host_execution, host_execution_has_exited
 from mac_system.agents.runtime import AgentRuntime
 from mac_system.config import Settings, load_agent_config
@@ -47,6 +49,7 @@ from mac_system.core.notification_service import (
     is_retryable_delivery_error,
 )
 from mac_system.core.project_files import rewrite_project_file_links
+from mac_system.core.wechat_notifications import queue_wechat_reminder
 from mac_system.core.project_owner import (
     ProjectOwner,
     ProjectOwnerResult,
@@ -61,6 +64,7 @@ from mac_system.core.root_progress import (
     _agent_detail_lines as _agent_detail_lines,
     _agent_status_overview as _agent_status_overview,
     _complete_progress_big_step as _complete_progress_big_step,
+    _continuation_retry_summary,
     _duration_label as _duration_label,
     _execution_chain_summary as _execution_chain_summary,
     _execution_participants as _execution_participants,
@@ -340,6 +344,7 @@ def _native_approval_spec(
         used_labels: set[str] = set()
 
         def add_candidate(label: str, decision: Any, description: str) -> None:
+            label = label.strip()
             resolved = label
             suffix = 2
             while resolved in used_labels:
@@ -1073,7 +1078,7 @@ def _root_profile_key(tools: list[DynamicTool]) -> str:
 def _external_progress_label(provider: str, kind: str, detail: str) -> str | None:
     """Translate external CLI progress into concise user-facing activity."""
     display = {
-        "claude_code": "Claude Code",
+        "claude_code": "Claude Code", "dsh": "DeepSeek Harness",
         "kimi_code": "Kimi Code",
         "codex": "Codex",
         "pi": "Pi",
@@ -1383,6 +1388,10 @@ def _native_status_card(
 
     if event_kind == "turn/started":
         return f"{provider} 已开始处理本轮消息。", "purple", "running"
+    if event_kind == "mac/continuationRetry":
+        phase = payload.get("phase")
+        color = "green" if phase == "recovered" else "orange"
+        return _continuation_retry_summary(payload), color, "running"
     if event_kind != "error":
         return None
     error = payload.get("error")
@@ -1390,9 +1399,11 @@ def _native_status_card(
         isinstance(error, dict)
         and error.get("codexErrorInfo") == "serverOverloaded"
     ):
-        return "所选模型暂时容量不足，正在等待同模型自动续跑。", "orange", "running"
+        if payload.get("willRetry") is True:
+            return f"所选模型暂时容量不足，{provider} 正在原生自动重试。", "orange", "running"
+        return "所选模型暂时容量不足，本次原生执行正在结束。", "orange", "running"
     if payload.get("willRetry") is True:
-        return f"与 {provider} 的连接暂时中断，正在自动重连。", "orange", "running"
+        return f"{provider} 正在原生自动重试，尚未启动 MAC 追加续跑。", "orange", "running"
     return f"{provider} 本轮遇到错误，正在结束本轮。", "red", "running"
 
 
@@ -1466,7 +1477,9 @@ class RootAgentEngine:
         self._agent_config = load_agent_config(settings.agent_config_path)
         self.lead_runtime_registry = lead_runtime_registry or ProjectLeadRuntimeRegistry(
             {"codex": self._create_codex_lead_runtime,
-             "kimi_code": self._create_kimi_lead_runtime}
+             "kimi_code": self._create_kimi_lead_runtime,
+             "claude_code": self._create_claude_lead_runtime,
+             "dsh": self._create_dsh_lead_runtime}
         )
 
     async def set_lead_provider(
@@ -1474,14 +1487,19 @@ class RootAgentEngine:
     ) -> tuple[str, str]:
         """Apply an explicit provider switch only at an idle native boundary."""
 
-        if provider not in {"codex", "kimi_code"}:
+        if provider not in self.lead_runtime_registry.available_providers():
             raise RuntimeError("该助手尚未接入项目主会话，不能安全切换。")
-        lock = await get_default_lock_manager().acquire(project_id)
-        async with lock:
+        async with get_default_lock_manager().try_acquire(project_id) as acquired:
+            if not acquired:
+                raise RuntimeError(
+                    "当前项目仍在处理消息，本次未切换助手；请等本轮结束后再切换。"
+                )
             self.session.expire_all()
             durable = self.store.ensure(project_id)
             if durable.status != "idle" or durable.active_turn_id is not None:
-                raise RuntimeError("当前项目仍在处理消息，请等本轮结束后再切换助手。")
+                raise RuntimeError(
+                    "当前项目仍在处理消息，本次未切换助手；请等本轮结束后再切换。"
+                )
             if durable.provider == provider:
                 return provider, provider
             with _ROOT_THREADS_GUARD:
@@ -1690,11 +1708,12 @@ class RootAgentEngine:
                             exc_info=True,
                         )
                 else:
-                    self._recover_failed_turn(project_id, reported_exc)
+                    failed_turn_id = self._recover_failed_turn(project_id, reported_exc)
                     if isinstance(exc, Exception):
                         await self._publish_failure_safely(
                             project_id,
                             reported_exc,
+                            native_turn_id=failed_turn_id,
                             user_request=current_user_request,
                             request_origin=request_origin,
                             parent_decision_id=parent_decision_id,
@@ -1737,7 +1756,17 @@ class RootAgentEngine:
         ):
             return False
         current = asyncio.get_running_loop()
-        active_turn_id = row.active_turn_id
+        # Durable state can lag the native turn boundary in both directions:
+        # a finished turn may leave the row marked running with no turn id,
+        # or the row may not yet carry the newly started turn id.
+        active_turn_id = row.active_turn_id or getattr(
+            handle.runtime, "active_turn_id", None
+        )
+        if not active_turn_id:
+            # A native steer cannot be addressed without a turn id (Codex
+            # rejects a null expectedTurnId). Queue the input as a new turn
+            # instead of burning a round trip on a request that must fail.
+            return False
 
         async def apply_steer() -> None:
             await handle.runtime.steer(active_turn_id, text)
@@ -2064,8 +2093,9 @@ class RootAgentEngine:
         thread id that the next transport cannot resume.
         """
 
-        lock = await get_default_lock_manager().acquire(project_id)
-        async with lock:
+        async with get_default_lock_manager().try_acquire(project_id) as acquired:
+            if not acquired:
+                raise RuntimeError("当前项目仍在处理消息，请等本轮结束后再新建会话。")
             self.session.expire_all()
             project = self.service.require_project(project_id)
             durable = self.store.ensure(project_id)
@@ -2308,6 +2338,41 @@ class RootAgentEngine:
             silence_timeout_seconds=self.settings.project_lead_silence_timeout_seconds,
         )
 
+    def _create_dsh_lead_runtime(self, context):
+        env = {}
+        for field, key in (("deepseek_api_key", "DEEPSEEK_API_KEY"),
+                           ("deepseek_base_url", "DEEPSEEK_BASE_URL")):
+            value = getattr(self.settings, field)
+            if value:
+                env[key] = value
+        return DshACPThread(
+            dsh_bin=self.settings.dsh_bin, dsh_home=self.settings.dsh_home,
+            cwd=context.cwd, tools=list(context.tools), env=env,
+            event_handler=context.event_handler, server_request_handler=context.server_request_handler,
+            silence_timeout_seconds=self.settings.project_lead_silence_timeout_seconds,
+        )
+
+    def _create_claude_lead_runtime(self, context):
+        env = {}
+        for field, key in (
+            ("anthropic_api_key", "ANTHROPIC_API_KEY"),
+            ("anthropic_auth_token", "ANTHROPIC_AUTH_TOKEN"),
+            ("anthropic_base_url", "ANTHROPIC_BASE_URL"),
+            ("anthropic_default_opus_model", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            ("anthropic_default_sonnet_model", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            ("anthropic_default_haiku_model", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            ("claude_code_effort_level", "CLAUDE_CODE_EFFORT_LEVEL"),
+        ):
+            value = getattr(self.settings, field)
+            if value:
+                env[key] = value
+        return ClaudeCodeThread(
+            claude_bin=self.settings.claude_bin, cwd=context.cwd, tools=list(context.tools),
+            event_handler=context.event_handler, server_request_handler=context.server_request_handler,
+            model=self.settings.claude_model or None, env=env,
+            silence_timeout_seconds=self.settings.project_lead_silence_timeout_seconds,
+        )
+
     async def _root_thread(self, project: Project) -> ProjectLeadRuntime:
         current_loop = asyncio.get_running_loop()
         extension_tools = self._extension_tools(project)
@@ -2397,6 +2462,17 @@ class RootAgentEngine:
         return CodexAppServerThread(
             codex_bin=self.settings.codex_bin,
             silence_timeout_seconds=self.settings.project_lead_silence_timeout_seconds,
+            continuation_max_attempts=self.settings.codex_continuation_max_attempts,
+            continuation_wait_budget_seconds=(
+                self.settings.codex_continuation_wait_budget_seconds
+            ),
+            continuation_jitter_ratio=self.settings.codex_continuation_jitter_ratio,
+            provider_probe_enabled=self.settings.codex_provider_probe_enabled,
+            proxy_recovery_enabled=self.settings.codex_proxy_recovery_enabled,
+            proxy_recovery_socket=self.settings.codex_proxy_recovery_socket,
+            proxy_recovery_cooldown_seconds=(
+                self.settings.codex_proxy_recovery_cooldown_seconds
+            ),
             cwd=context.cwd,
             tools=list(context.tools),
             # Do not replace or augment Codex's native workflow prompt.
@@ -2738,7 +2814,7 @@ class RootAgentEngine:
                 selection_reason=selection_reason,
             )
             display = {
-                "claude_code": "Claude Code",
+                "claude_code": "Claude Code", "dsh": "DeepSeek Harness",
                 "kimi_code": "Kimi Code",
                 "codex": "Codex",
                 "pi": "Pi",
@@ -3344,7 +3420,7 @@ class RootAgentEngine:
         state = self._progress.get(project_id)
         if state is not None:
             display = {
-                "claude_code": "Claude Code",
+                "claude_code": "Claude Code", "dsh": "DeepSeek Harness",
                 "kimi_code": "Kimi Code",
                 "codex": "Codex CLI",
                 "pi": "Pi",
@@ -3597,6 +3673,10 @@ class RootAgentEngine:
             error = event.payload.get("error")
             message = error.get("message") if isinstance(error, dict) else "status"
             event_identity = f"{event.turn_id or 'turn'}:{message}"
+            if event.kind == "mac/continuationRetry":
+                event_identity += (
+                    f":{event.payload.get('phase')}:{event.payload.get('attempt')}"
+                )
         if activity is None:
             return
         label, color, _lifecycle = activity
@@ -3624,6 +3704,15 @@ class RootAgentEngine:
         )
         state = self._progress.get(project_id)
         if state is not None:
+            if event.kind == "mac/continuationRetry":
+                state.continuation_retry = dict(event.payload)
+                state.continuation_retry_due_monotonic = None
+                retry_at = event.payload.get("retryAt")
+                if event.payload.get("phase") == "waiting" and isinstance(retry_at, str):
+                    deadline = datetime.fromisoformat(retry_at)
+                    state.continuation_retry_due_monotonic = monotonic() + max(
+                        0, (deadline - datetime.now().astimezone()).total_seconds()
+                    )
             timing = self._turn_timings.get(project_id)
             event_from_child_thread = bool(
                 timing is not None
@@ -3707,7 +3796,13 @@ class RootAgentEngine:
                     state,
                     key=event_identity,
                     label=label,
-                    status="running",
+                    status=(
+                        "completed"
+                        if event.payload.get("phase") == "recovered"
+                        else "failed"
+                        if event.payload.get("phase") == "exhausted"
+                        else "running"
+                    ),
                 )
         self._queue_progress_snapshot(
             project_id,
@@ -3730,12 +3825,28 @@ class RootAgentEngine:
             _turn_failure_detail(result) if result.status == "failed" else None
         )
         failure_content = ""
+        retry_payload = next(
+            (
+                event.payload for event in reversed(result.events)
+                if event.kind == "mac/continuationRetry"
+            ),
+            None,
+        )
+        retry_summary = _continuation_retry_summary(retry_payload) if retry_payload else ""
+        if (
+            result.status == "failed"
+            and retry_payload is not None
+            and retry_payload.get("phase") == "exhausted"
+        ):
+            label = "本轮未完成，自动续跑已停止。"
         failure_report_title = ""
         failure_report_ref = ""
         if result.status == "failed":
             failure_content = label
             if failure_detail:
                 failure_content += f"\n\n**失败原因**：{failure_detail}"
+            if retry_summary:
+                failure_content += f"\n\n**自动续跑**：{retry_summary}"
             failure_content += (
                 "\n\n项目仍保持可继续状态；任务未标记为完成。"
             )
@@ -3766,6 +3877,8 @@ class RootAgentEngine:
         )
         state = self._progress.get(project.id)
         if state is not None:
+            if retry_payload is not None:
+                state.continuation_retry = dict(retry_payload)
             if state.projection_suspended:
                 self._resume_progress_after_interaction(project.id)
             state.status = lifecycle
@@ -3783,6 +3896,8 @@ class RootAgentEngine:
             body = None
         else:
             body = f"**当前进展**：{progress_label}"
+            if retry_summary:
+                body += f"\n\n{retry_summary}"
         projection_key = (
             _progress_projection_key(project.id, state)
             if state is not None
@@ -4198,6 +4313,7 @@ class RootAgentEngine:
                     if source_request
                     else {}
                 ),
+                "continue_execution": result.continue_execution,
             },
             context_refs=list(result.context_refs),
             authority_refs=list(result.authority_refs),
@@ -5389,6 +5505,11 @@ class RootAgentEngine:
                             "AI Project Owner 本次审阅未完成，请你确认后继续。"
                         ),
                     )
+            if not future.done():
+                queue_wechat_reminder(
+                    self.service, event_key=f"interaction:{interaction.id}",
+                    project_id=project.id, interaction_id=interaction.id,
+                )
             return await future
         finally:
             if progress_suspended:
@@ -5588,6 +5709,11 @@ class RootAgentEngine:
                         exc_info=True,
                     )
 
+            if not future.done():
+                queue_wechat_reminder(
+                    self.service, event_key=f"interaction:{interaction.id}",
+                    project_id=project.id, interaction_id=interaction.id,
+                )
             auto_resolution_ms = params.get("autoResolutionMs")
             if isinstance(auto_resolution_ms, (int, float)):
                 try:
@@ -5791,16 +5917,19 @@ class RootAgentEngine:
                 **review_context,
             )
 
-    def _recover_failed_turn(self, project_id: str, exc: BaseException) -> None:
+    def _recover_failed_turn(self, project_id: str, exc: BaseException) -> str | None:
         """Recover durable UI state without relying on the failed Session."""
 
+        native_turn_id = None
         try:
             self.session.rollback()
         except Exception:
             logger.warning("Failed to roll back Root Agent Session", exc_info=True)
         try:
             with Session(self.bind) as recovery_session:
-                RootSessionStore(recovery_session).set_turn(
+                recovery_store = RootSessionStore(recovery_session)
+                native_turn_id = recovery_store.ensure(project_id).active_turn_id
+                recovery_store.set_turn(
                     project_id,
                     turn_id=None,
                     status="idle",
@@ -5823,12 +5952,14 @@ class RootAgentEngine:
                 project_id,
                 exc_info=True,
             )
+        return native_turn_id
 
     async def _publish_failure_safely(
         self,
         project_id: str,
         exc: Exception,
         *,
+        native_turn_id: str | None = None,
         user_request: str,
         request_origin: str = "human",
         parent_decision_id: str | None = None,
@@ -5843,6 +5974,7 @@ class RootAgentEngine:
                     project,
                     exc,
                     service=service,
+                    native_turn_id=native_turn_id,
                     user_request=user_request,
                     request_origin=request_origin,
                     parent_decision_id=parent_decision_id,
@@ -5856,13 +5988,12 @@ class RootAgentEngine:
         exc: Exception,
         *,
         service: ProjectService | None = None,
+        native_turn_id: str | None = None,
         user_request: str,
         request_origin: str = "human",
         parent_decision_id: str | None = None,
     ) -> None:
         delivery_service = service or self.service
-        if self.feishu_bridge is None or not project.feishu_chat_id:
-            return
         failure_id = generate_id("root-failure")
         visible_error = _compact_text(redact_text(str(exc)), limit=1_200)
         failure_content = (
@@ -5876,6 +6007,22 @@ class RootAgentEngine:
             )
         )
         failure_projection_key = f"root-failure:{failure_id}:report"
+        # Close the durable round before attempting delivery. An exception is
+        # still a reportable failure when Feishu is unavailable; an empty turn
+        # id preserves any native id already attached to the history round.
+        delivery_service.record_project_history_report(
+            project.id,
+            native_turn_id=native_turn_id or "",
+            title=f"[{self._project_display_name(project)}] 本轮未完成",
+            content=failure_content,
+            report_ref=failure_projection_key,
+            report_status="failed",
+            fallback_user_request=user_request,
+            request_origin=request_origin,
+            parent_decision_id=parent_decision_id,
+        )
+        if self.feishu_bridge is None or not project.feishu_chat_id:
+            return
         try:
             self._update_progress(
                 project.id,
@@ -6009,7 +6156,10 @@ def resolve_root_user_input(
         answer = service.get_question_answer(question.id)
         if answer is None:
             continue
-        value = str(answer.answer_label or answer.answer or "").strip()
+        # Native option labels are opaque identities. In-flight approvals may
+        # contain whitespace at a display truncation boundary; preserve the
+        # exact durable human selection when returning it to that request.
+        value = str(answer.answer_label or answer.answer or "")
         selected[question.question_id] = value
     response = pending.response_builder(selected)
 

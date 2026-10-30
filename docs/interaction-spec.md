@@ -101,8 +101,8 @@ Project；不得继续显示或使用旧 Project 的目录、Thread、问题或�
 | 菜单 | `/menu` | `/m` | 展示常用项目操作 |
 | 创建 | `/create` | `/c` | 创建系统管理目录中的 Project，并设为当前 |
 | 打开 | `/open` | `/o`、`/bind`、`/b` | 打开已有 Git 目录对应的 Project，并设为当前 |
-| 项目 | `/proj` | `/ls`、`/projects` | 展示 Project 列表及当前项 |
-| 切换 | `/use` | `/s`、`/switch` | 切换当前 Project |
+| 项目 | `/proj` | `/ls`、`/projects` | 展示当前聊天 Project、当前项及可打开的本地 Git 仓库 |
+| 切换或打开 | `/use` | `/s`、`/switch` | 切换当前聊天 Project，或打开尚未登记的 Git 仓库 |
 | 当前 | `/info` | `/i`、`/current` | 展示当前 Project、真实目录和运行状态 |
 | Coding-Agent | `/agents` | `/agent`、`/a` | 展示实际可用后端、模型和近期运行数据 |
 | Project Owner | `/owner` | `/ow` | 查看状态；加 `on` / `off` 可按当前项目启用或关闭 |
@@ -118,6 +118,16 @@ Project；不得继续显示或使用旧 Project 的目录、Thread、问题或�
   再次打开同一目录时优先恢复原 Project。另一个聊天必须建立独立 Project 和 Thread，不能
   复用对话历史。
 - `/use <项目>` 成功后，目录、Thread、进度和待答问题全部切换到所选 Project。
+- `/ls` 和无参数 `/use` 同时发现 `MAC_ALLOWED_BIND_ROOTS` 内的 Git 仓库，默认扫描根目录
+  及其两层子目录，跳过隐藏目录、符号链接、`node_modules` 和 `__pycache__`。当前聊天已经
+  登记的目录不重复展示为未打开仓库；`/use` 选择卡分页展示全部候选，不受最近项目数量限制。
+- `/use <名称或 ID 前缀>` 优先精确匹配当前聊天 Project，其次精确匹配仓库名，最后匹配
+  Project 名称 / ID 或仓库名的前缀；多个候选时展示实际路径供用户选择，不自动猜测。
+  `/use <绝对路径>`（支持 `~/`）可打开扫描深度之外的已有 Git 仓库；不存在、非 Git 或不在
+  允许范围内的路径必须报错，不得因拼写错误创建目录或初始化仓库。
+- `/use` 打开未登记仓库时复用 `/open` 的目录打开语义：同一用户在同一机器人 / 聊天内
+  恢复原 Project，跨机器人 / 聊天则建立独立 Project 和 Thread，不导入其他聊天历史。
+  列表和切换命令本身不启动 coding Turn。
 - `/new` 不新建 Project、不改变目录，只清空当前对话绑定；由于 Codex 不持久化空 rollout，新的
   Root Thread 在下一条普通消息到达时创建。命令回执和 `/info` 必须显示“新对话待开始”，且不得
   继续展示旧 Thread 的最近用量。
