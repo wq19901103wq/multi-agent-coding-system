@@ -527,9 +527,14 @@ def _continuation_retry_summary(payload: dict[str, Any]) -> str:
     attempt = payload.get("attempt", 0)
     maximum = payload.get("maxAttempts", 0)
     phase = payload.get("phase")
+    if phase == "proxyRecovered":
+        return "MAC 已切换到通过连接检查的代理节点，继续使用原会话，等待模型响应；任务尚未完成。"
     if phase == "waiting":
         delay = ceil(float(payload.get("delaySeconds", 0)))
-        return f"MAC 等待同模型续跑：第 {attempt}/{maximum} 次，本次计划退避约 {delay} 秒。"
+        summary = f"MAC 等待同模型续跑：第 {attempt}/{maximum} 次，本次计划退避约 {delay} 秒。"
+        if payload.get("providerReachable") is False:
+            summary += "最近一次网络探测未连通；将按间隔自动重试。"
+        return summary
     if phase == "resuming":
         return f"MAC 正在同模型续跑：第 {attempt}/{maximum} 次，沿用原会话，不重发原请求。"
     if phase == "recovered":

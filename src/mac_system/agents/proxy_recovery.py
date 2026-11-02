@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Sequence
 from http.client import HTTPConnection
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -227,8 +228,54 @@ async def _test_group_members(
     return delays
 
 
-async def recover_dead_proxy_nodes(
+async def _group_delays_for_url(
+    controller: ProxyControllerClient,
+    info: dict[str, Any],
+    group: str,
+    current: str,
     target_url: str,
+) -> dict[str, Any]:
+    try:
+        return await controller.test_group_delays(
+            group, target_url, _GROUP_TEST_TIMEOUT_SECONDS
+        )
+    except ProxyRecoveryUnavailable as exc:
+        logger.warning(
+            "Proxy group %s delay test failed for %s: %s", group, target_url, exc
+        )
+    # The controller's group-wide test can time out exactly when the network
+    # is bad (HTTP 504), leaving no way to find an alternative node. Fall back
+    # to bounded per-node tests.
+    return await _test_group_members(
+        controller, info, current, target_url, _GROUP_TEST_TIMEOUT_SECONDS
+    )
+
+
+def _healthy_across_targets(
+    delay_maps: Sequence[dict[str, Any]],
+) -> dict[str, float]:
+    """Nodes with a numeric delay for every target, keyed by summed latency."""
+
+    combined: dict[str, float] | None = None
+    for delay_map in delay_maps:
+        numeric = {
+            name: delay
+            for name, delay in delay_map.items()
+            if isinstance(delay, (int, float)) and not isinstance(delay, bool)
+        }
+        if combined is None:
+            combined = numeric
+        else:
+            combined = {
+                name: total + numeric[name]
+                for name, total in combined.items()
+                if name in numeric
+            }
+    return combined or {}
+
+
+async def recover_dead_proxy_nodes(
+    target_urls: Sequence[str],
     *,
     socket_path: str = _DEFAULT_SOCKET_PATH,
     cooldown_seconds: float = 120.0,
@@ -237,12 +284,16 @@ async def recover_dead_proxy_nodes(
 ) -> list[tuple[str, str, str]]:
     """Health-check eligible selector groups and switch dead selections.
 
+    A node is healthy only when it reaches *every* target URL: Codex needs
+    both the chat endpoint and the auth host, and a node can pass short
+    probes for one while failing the other.
+
     Returns ``(group, old_node, new_node)`` tuples for every switch made.
     An empty list means no switch was needed or possible; concurrent calls
     within the cooldown window are coalesced into one no-op attempt.
 
     With ``force=True`` the current selection is re-evaluated even when it
-    passes the probe: a node can answer short health checks yet keep killing
+    passes the probes: a node can answer short health checks yet keep killing
     long-lived model streams, so the best *other* healthy node is picked.
     When the current node is the only healthy choice it is kept.
     """
@@ -266,31 +317,25 @@ async def recover_dead_proxy_nodes(
             info = proxies[group]
             current = info["now"]
             if not force:
-                healthy = await controller.test_proxy_delay(
-                    group, target_url, _GROUP_TEST_TIMEOUT_SECONDS
-                )
-                if healthy is not None:
+                healthy = True
+                for target_url in target_urls:
+                    if (
+                        await controller.test_proxy_delay(
+                            group, target_url, _GROUP_TEST_TIMEOUT_SECONDS
+                        )
+                        is None
+                    ):
+                        healthy = False
+                        break
+                if healthy:
                     continue
-            delays: dict[str, Any] | None
-            try:
-                delays = await controller.test_group_delays(
-                    group, target_url, _GROUP_TEST_TIMEOUT_SECONDS
+            delays = {}
+            for target_url in target_urls:
+                delays[target_url] = await _group_delays_for_url(
+                    controller, info, group, current, target_url
                 )
-            except ProxyRecoveryUnavailable as exc:
-                logger.warning("Proxy group %s delay test failed: %s", group, exc)
-                delays = None
-            if delays is None:
-                # The controller's group-wide test can time out exactly when
-                # the network is bad (HTTP 504), leaving no way to find an
-                # alternative node. Fall back to bounded per-node tests.
-                delays = await _test_group_members(
-                    controller,
-                    info,
-                    current,
-                    target_url,
-                    _GROUP_TEST_TIMEOUT_SECONDS,
-                )
-            best = pick_best_node(delays, exclude=current if force else None)
+            combined = _healthy_across_targets(list(delays.values()))
+            best = pick_best_node(combined, exclude=current if force else None)
             if best is None or (best == current and not force):
                 continue
             try:
@@ -299,12 +344,12 @@ async def recover_dead_proxy_nodes(
                 logger.warning("Proxy switch %s -> %s failed: %s", group, best, exc)
                 continue
             logger.warning(
-                "Proxy recovery: switched group %r from %r to %r (%.0fms to %s)",
+                "Proxy recovery: switched group %r from %r to %r (%.0fms across %s)",
                 group,
                 current,
                 best,
-                delays[best],
-                target_url,
+                combined[best],
+                ", ".join(target_urls),
             )
             switches.append((group, current, best))
         return switches

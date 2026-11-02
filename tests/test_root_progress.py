@@ -64,6 +64,35 @@ def test_progress_projection_rotates_without_mutating_previous_key():
     assert original.endswith(":0")
 
 
+def test_network_outage_progress_keeps_retry_countdown_visible():
+    state = progress_state()
+    state.continuation_retry = {
+        "phase": "waiting", "attempt": 6, "maxAttempts": 8,
+        "delaySeconds": 300, "providerReachable": False,
+        "scheduledWaitSeconds": 530, "waitBudgetSeconds": 2030,
+    }
+    state.continuation_retry_due_monotonic = 400
+    text = _progress_card_view(state, now_monotonic=130).current
+    assert "第 6/8 次" in text
+    assert "最近一次网络探测未连通" in text
+    assert "按间隔自动重试" in text
+    assert "还有 270 秒" in text and "/stop" in text
+    assert "自动续跑已停止" not in text
+    for reachable in (True, None):
+        state.continuation_retry["providerReachable"] = reachable
+        assert "网络探测未连通" not in _progress_card_view(state, now_monotonic=130).current
+
+
+def test_proxy_switch_is_visible_without_claiming_task_completion():
+    state = progress_state()
+    state.continuation_retry = {"phase": "proxyRecovered", "nativeRetry": True}
+    text = _progress_card_view(state, now_monotonic=130).current
+    assert "已切换" in text and "原会话" in text
+    assert "等待模型响应" in text and "任务尚未完成" in text
+    assert "自动续跑已停止" not in text
+    assert "恢复并完成本轮" not in text
+
+
 def test_progress_view_does_not_mutate_the_state():
     state = progress_state()
     _start_progress_big_step(state, "核对边界")

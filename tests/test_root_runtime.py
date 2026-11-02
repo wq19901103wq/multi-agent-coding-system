@@ -20,6 +20,8 @@ from mac_system.agents.root_runtime import (
     _turn_error_code,
 )
 
+_ORIGINAL_PROVIDER_PROBE = CodexAppServerThread.probe_provider_reachable
+
 
 @pytest.fixture(autouse=True)
 def _reachable_provider_probe(monkeypatch):
@@ -257,12 +259,19 @@ async def test_model_watchdog_respects_tools_and_user_waits(monkeypatch, tmp_pat
 class _ReconnectingProcess(_FakeProcess):
     """A live app-server whose network retries never end the turn."""
 
-    def __init__(self, failures=1, *, acknowledge_only=False):
+    def __init__(self, failures=1, *, acknowledge_only=False, progress=False,
+                 retry_error=None, retry_interval=0.005):
         super().__init__()
         self.failures = failures
         self.acknowledge_only = acknowledge_only
         self.turn_attempts = 0
         self.retry_task = None
+        self.progress = progress
+        self.retry_error = retry_error or {
+            "message": "Reconnecting... waiting for network",
+            "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": None}},
+        }
+        self.retry_interval = retry_interval
 
     async def receive(self, message):
         method = message.get("method")
@@ -294,14 +303,18 @@ class _ReconnectingProcess(_FakeProcess):
         while True:
             self._feed({"method": "error", "params": {
                 "threadId": "thread-1", "turnId": turn_id, "willRetry": True,
-                "error": {"message": "Reconnecting... waiting for network",
-                          "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": None}}},
+                "error": self.retry_error,
             }})
             # Incidental usage notifications must not postpone recovery.
             self._feed({"method": "thread/tokenUsage/updated", "params": {
                 "threadId": "thread-1", "turnId": turn_id,
             }})
-            await asyncio.sleep(0.005)
+            if self.progress:
+                self._feed({"method": "item/agentMessage/delta", "params": {
+                    "threadId": "thread-1", "turnId": turn_id,
+                    "itemId": "partial", "delta": ".",
+                }})
+            await asyncio.sleep(self.retry_interval)
 
     def complete(self, turn_id="reconnect-1"):
         if self.retry_task:
@@ -318,6 +331,171 @@ class _ReconnectingProcess(_FakeProcess):
         if self.retry_task:
             self.retry_task.cancel()
         super().terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,reachable", [
+    ("responseStreamDisconnected", True),
+    ("responseStreamDisconnected", False),
+    ("responseStreamDisconnected", None),
+    ("httpConnectionFailed", True),
+    ("responseStreamConnectionFailed", True),
+])
+async def test_native_reconnect_repairs_proxy_without_replaying_turn(monkeypatch, tmp_path, code, reachable):
+    process = _ReconnectingProcess(progress=True, retry_error={"codexErrorInfo": code})
+    async def spawn(*args, **kwargs):
+        return process
+    calls = []
+    async def recover(urls, **kwargs):
+        calls.append((urls, kwargs))
+        return [("selector", "old", "healthy")]
+    async def probe(self):
+        return reachable
+    recovered = asyncio.Event()
+    async def on_event(event):
+        if event.kind == "mac/continuationRetry" and event.payload["phase"] == "proxyRecovered":
+            recovered.set()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(CodexAppServerThread, "probe_provider_reachable", probe)
+    monkeypatch.setattr("mac_system.agents.root_runtime.recover_dead_proxy_nodes", recover)
+    monkeypatch.setattr("mac_system.agents.root_runtime._NATIVE_RECONNECT_PROXY_GRACE_SECONDS", 0.02)
+    runtime = CodexAppServerThread(
+        codex_bin="codex", cwd=tmp_path, tools=[], silence_timeout_seconds=0.04,
+        proxy_recovery_enabled=True, event_handler=on_event,
+    )
+    task = asyncio.create_task(runtime.run_turn("original request"))
+    try:
+        await asyncio.wait_for(recovered.wait(), 0.5)
+        # Intermittent model progress must not defer recovery forever, and
+        # more retry errors inside the cooldown must not switch again.
+        await asyncio.sleep(0.06)
+        process.complete()
+        result = await asyncio.wait_for(task, 0.5)
+        assert result.status == "completed" and result.final_message == "done"
+        assert len(calls) == 1
+        assert calls[0][0] == ("https://chatgpt.com", "https://auth.openai.com")
+        assert calls[0][1]["force"] is (reachable is not False)
+        starts = [m["params"] for m in process.messages if m.get("method") == "turn/start"]
+        assert len(starts) == 1
+        assert starts[0]["input"][0]["text"] == "original request"
+        assert result.turn_id == "reconnect-1"
+        assert not any(m.get("method") in {"turn/interrupt", "thread/resume"} for m in process.messages)
+        assert any(e.payload.get("nativeRetry") is True for e in result.events)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["single", "stale", "overload", "auth", "generic", "disabled"])
+async def test_native_reconnect_proxy_recovery_requires_repeated_recent_transport_errors(monkeypatch, tmp_path, case):
+    errors = {
+        "overload": {"codexErrorInfo": "serverOverloaded"},
+        "auth": {"codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": 403}}},
+        "generic": {"message": "Reconnecting... waiting for network", "codexErrorInfo": "other"},
+    }
+    process = _ReconnectingProcess(
+        retry_error=errors.get(case),
+        retry_interval=1 if case == "single" else 0.03 if case == "stale" else 0.005,
+    )
+    async def spawn(*args, **kwargs):
+        return process
+    calls = []
+    async def recover(*args, **kwargs):
+        calls.append(kwargs)
+        return []
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr("mac_system.agents.root_runtime.recover_dead_proxy_nodes", recover)
+    monkeypatch.setattr("mac_system.agents.root_runtime._NATIVE_RECONNECT_PROXY_GRACE_SECONDS", 0)
+    monkeypatch.setattr("mac_system.agents.root_runtime._NATIVE_RECONNECT_PROXY_WINDOW_SECONDS", 0.02)
+    runtime = CodexAppServerThread(
+        codex_bin="codex", cwd=tmp_path, tools=[], silence_timeout_seconds=2,
+        proxy_recovery_enabled=case != "disabled",
+    )
+    task = asyncio.create_task(runtime.run_turn("original request"))
+    try:
+        while process.turn_attempts == 0:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.1)
+        process.complete()
+        result = await asyncio.wait_for(task, 0.5)
+        assert result.status == "completed"
+        assert calls == []
+        assert process.turn_attempts == 1
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["stop", "steer", "tool", "approval", "complete", "failure"])
+async def test_native_proxy_recovery_does_not_block_turn_or_user_actions(monkeypatch, tmp_path, action):
+    class Process(_ReconnectingProcess):
+        async def receive(self, message):
+            if message.get("method") == "turn/steer":
+                self.messages.append(message)
+                self._feed({"id": message["id"], "result": {"turnId": "reconnect-1"}})
+            else:
+                await super().receive(message)
+    process = Process()
+    async def spawn(*args, **kwargs):
+        return process
+    recovering, cancelled, waiting, release = (asyncio.Event() for _ in range(4))
+    calls = []
+    async def recover(*args, **kwargs):
+        calls.append(kwargs)
+        recovering.set()
+        if action == "failure":
+            raise RuntimeError("controller unavailable")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    async def handler(*args):
+        waiting.set()
+        await release.wait()
+        return {"decision": "decline"}
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr("mac_system.agents.root_runtime.recover_dead_proxy_nodes", recover)
+    monkeypatch.setattr("mac_system.agents.root_runtime._NATIVE_RECONNECT_PROXY_GRACE_SECONDS", 0)
+    runtime = CodexAppServerThread(
+        codex_bin="codex", cwd=tmp_path, tools=[], silence_timeout_seconds=2,
+        proxy_recovery_enabled=True, server_request_handler=handler,
+    )
+    task = asyncio.create_task(runtime.run_turn("original request"))
+    try:
+        await asyncio.wait_for(recovering.wait(), 0.5)
+        params = {"threadId": "thread-1", "turnId": "reconnect-1"}
+        if action == "stop":
+            await asyncio.wait_for(runtime.interrupt(), 0.5)
+        elif action == "steer":
+            await asyncio.wait_for(runtime.steer(None, "additional request"), 0.5)
+            steer = next(m for m in process.messages if m.get("method") == "turn/steer")
+            assert steer["params"]["expectedTurnId"] == "reconnect-1"
+        elif action == "tool":
+            process._feed({"method": "item/started", "params": {
+                **params, "item": {"id": "long", "type": "commandExecution"},
+            }})
+            await asyncio.wait_for(cancelled.wait(), 0.5)
+        elif action == "approval":
+            process._feed({"id": 990, "method": "item/commandExecution/requestApproval", "params": params})
+            await asyncio.wait_for(waiting.wait(), 0.5)
+            await asyncio.wait_for(cancelled.wait(), 0.5)
+        if action != "stop":
+            process.complete()
+        result = await asyncio.wait_for(task, 0.5)
+        assert result.status == ("interrupted" if action == "stop" else "completed")
+        assert process.turn_attempts == 1 and len(calls) == 1
+        if action != "failure":
+            assert cancelled.is_set()
+        assert runtime._native_proxy_recovery_task is None
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -619,9 +797,14 @@ class _CapacityProcess(_FakeProcess):
             }
         )
         if self.turn_attempts <= self.failures:
+            error_info = (
+                self.codex_error_info[self.turn_attempts - 1]
+                if isinstance(self.codex_error_info, list)
+                else self.codex_error_info
+            )
             error = {
                 "message": self.error_message,
-                "codexErrorInfo": self.codex_error_info,
+                "codexErrorInfo": error_info,
             }
             self._feed(
                 {
@@ -1601,6 +1784,7 @@ async def test_stream_disconnect_retry_forces_proxy_recovery_when_probe_passes(
     )
     waits: list[float] = []
     recovery_forces: list[bool] = []
+    recovery_targets: list[tuple[str, ...]] = []
 
     async def fake_subprocess(*_args, **_kwargs):
         return process
@@ -1612,8 +1796,9 @@ async def test_stream_disconnect_retry_forces_proxy_recovery_when_probe_passes(
         return True
 
     async def fake_recovery(
-        target_url, *, socket_path, cooldown_seconds, force=False
+        target_urls, *, socket_path, cooldown_seconds, force=False
     ):
+        recovery_targets.append(tuple(target_urls))
         recovery_forces.append(force)
         return [("节点选择", "旧节点", "新节点")]
 
@@ -1639,9 +1824,175 @@ async def test_stream_disconnect_retry_forces_proxy_recovery_when_probe_passes(
         await runtime.close()
 
     assert result.status == "completed"
-    # Recovery is only forced once a continuation attempt already failed with
-    # a stream-class error, even though the probe keeps succeeding.
+    # Recovery is only forced once two consecutive attempts failed with a
+    # transport-class error, even though the probe keeps succeeding, and it
+    # must validate nodes against every Codex provider endpoint.
     assert recovery_forces == [True]
+    assert recovery_targets == [
+        ("https://chatgpt.com", "https://auth.openai.com")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_single_stream_failure_after_overload_does_not_force_proxy_recovery(
+    monkeypatch, tmp_path
+):
+    process = _CapacityProcess(
+        failures=2,
+        codex_error_info=[
+            "serverOverloaded",
+            {"responseStreamDisconnected": {"httpStatusCode": None}},
+        ],
+    )
+    waits: list[float] = []
+    recovery_forces: list[bool] = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay_seconds):
+        waits.append(delay_seconds)
+
+    async def fake_recovery(
+        target_urls, *, socket_path, cooldown_seconds, force=False
+    ):
+        recovery_forces.append(force)
+        return []
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime._wait_for_server_capacity", no_wait
+    )
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime.recover_dead_proxy_nodes", fake_recovery
+    )
+    runtime = CodexAppServerThread(
+        codex_bin="codex",
+        cwd=tmp_path,
+        tools=[],
+        proxy_recovery_enabled=True,
+    )
+    try:
+        result = await runtime.run_turn("继续当前实验")
+    finally:
+        await runtime.close()
+
+    assert result.status == "completed"
+    # One upstream stream disconnect after an overload retry is not proxy
+    # evidence; a single occurrence must not repoint the selected node.
+    assert recovery_forces == []
+
+
+@pytest.mark.asyncio
+async def test_stream_watchdog_silence_does_not_force_proxy_recovery(
+    monkeypatch, tmp_path
+):
+    class SilentTwiceProcess(_FakeProcess):
+        def __init__(self):
+            super().__init__()
+            self.turn_attempts = 0
+
+        async def receive(self, message):
+            if message.get("method") == "turn/start":
+                self.messages.append(message)
+                self.turn_attempts += 1
+                turn_id = f"turn-{self.turn_attempts}"
+                self._feed({"id": message["id"], "result": {"turn": {"id": turn_id}}})
+                self._feed({"method": "turn/started", "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": turn_id, "status": "inProgress"},
+                }})
+                if self.turn_attempts == 3:
+                    self._feed({"method": "item/completed", "params": {
+                        "threadId": "thread-1",
+                        "turnId": turn_id,
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "answer",
+                            "text": "done",
+                        },
+                    }})
+                    self._feed({"method": "turn/completed", "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": turn_id, "status": "completed"},
+                    }})
+                return
+            await super().receive(message)
+
+    process = SilentTwiceProcess()
+    waits: list[float] = []
+    recovery_forces: list[bool] = []
+
+    async def fake_subprocess(*_args, **_kwargs):
+        return process
+
+    async def no_wait(delay_seconds):
+        waits.append(delay_seconds)
+
+    async def fake_recovery(
+        target_urls, *, socket_path, cooldown_seconds, force=False
+    ):
+        recovery_forces.append(force)
+        return []
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime._wait_for_server_capacity", no_wait
+    )
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime.recover_dead_proxy_nodes", fake_recovery
+    )
+    runtime = CodexAppServerThread(
+        codex_bin="codex",
+        cwd=tmp_path,
+        tools=[],
+        silence_timeout_seconds=0.02,
+        proxy_recovery_enabled=True,
+    )
+    try:
+        result = await asyncio.wait_for(runtime.run_turn("original request"), 2)
+    finally:
+        await runtime.close()
+
+    assert result.status == "completed"
+    assert waits == [5.0, 15.0]
+    # A slow or stalled local stream is ambiguous, not proxy evidence; only a
+    # positively broken probe may repoint the node.
+    assert recovery_forces == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_result", "auth_result", "expected"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (True, OSError("probe timeout"), None),
+    ],
+)
+async def test_provider_probe_requires_chat_and_auth_hosts(
+    monkeypatch, tmp_path, chat_result, auth_result, expected
+):
+    probed: list[str] = []
+    results = {"chatgpt.com": chat_result, "auth.openai.com": auth_result}
+
+    async def fake_probe(host, port, timeout_seconds):
+        probed.append(host)
+        assert port == 443
+        result = results[host]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(
+        CodexAppServerThread, "probe_provider_reachable", _ORIGINAL_PROVIDER_PROBE
+    )
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime._probe_https_reachable", fake_probe
+    )
+    runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
+    assert await runtime.probe_provider_reachable() is expected
+    assert sorted(probed) == ["auth.openai.com", "chatgpt.com"]
 
 
 @pytest.mark.asyncio
@@ -1692,9 +2043,15 @@ async def test_overloaded_retry_never_forces_proxy_recovery(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_provider_unreachable_stops_continuation_early(monkeypatch, tmp_path):
+@pytest.mark.parametrize("failures, expected_waits, final_phase", [
+    (6, [5.0, 15.0, 30.0, 60.0, 120.0, 300.0], "recovered"),
+    (99, [5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0], "exhausted"),
+])
+async def test_provider_outage_keeps_bounded_continuation(
+    monkeypatch, tmp_path, failures, expected_waits, final_phase
+):
     process = _CapacityProcess(
-        failures=99,
+        failures=failures,
         codex_error_info={
             "responseStreamDisconnected": {"httpStatusCode": None},
         },
@@ -1707,35 +2064,58 @@ async def test_provider_unreachable_stops_continuation_early(monkeypatch, tmp_pa
     async def no_wait(delay_seconds):
         waits.append(delay_seconds)
 
-    async def unreachable_probe(self, timeout_seconds: float = 5.0):
-        return False
+    async def outage_probe(self, timeout_seconds: float = 5.0):
+        return failures == 6 and process.turn_attempts >= 6
+
+    async def no_proxy_recovery(*_args, **_kwargs):
+        return []
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
     monkeypatch.setattr(
         "mac_system.agents.root_runtime._wait_for_server_capacity", no_wait
     )
     monkeypatch.setattr(
-        CodexAppServerThread, "probe_provider_reachable", unreachable_probe
+        CodexAppServerThread, "probe_provider_reachable", outage_probe
+    )
+    monkeypatch.setattr(
+        "mac_system.agents.root_runtime.recover_dead_proxy_nodes", no_proxy_recovery
     )
     runtime = CodexAppServerThread(codex_bin="codex", cwd=tmp_path, tools=[])
     try:
-        with pytest.raises(AppServerProtocolError, match="网络不可达"):
-            await runtime.run_turn("继续当前实验")
+        result = await runtime.run_turn("继续当前实验")
     finally:
         await runtime.close()
 
     starts = [
         message for message in process.messages if message.get("method") == "turn/start"
     ]
-    # One original attempt plus two failed continuations: the third probe
-    # failure stops the backoff long before the 8-attempt budget.
-    assert len(starts) == 3
-    assert waits == [5.0, 15.0]
+    assert waits == expected_waits
+    assert len(starts) == len(waits) + 1
+    assert starts[0]["params"]["input"][0]["text"] == "继续当前实验"
+    assert all(message["params"]["input"] == [] for message in starts[1:])
+    assert all(message["params"]["threadId"] == "capacity-thread" for message in starts)
+    assert all("model" not in message["params"] for message in starts)
+    retries = [event.payload for event in result.events if event.kind == "mac/continuationRetry"]
+    waiting = [payload for payload in retries if payload["phase"] == "waiting"]
+    assert waiting[0]["providerReachable"] is None
+    assert all(payload["providerReachable"] is False for payload in waiting[1:5])
+    assert retries[-1]["phase"] == final_phase
+    assert retries[-1]["attempt"] == len(waits)
+    assert retries[-1]["scheduledWaitSeconds"] == sum(waits)
+    if final_phase == "recovered":
+        assert waiting[-1]["providerReachable"] is True
+        assert result.status == "completed"
+        assert result.final_message == "done"
+    else:
+        assert all(payload["providerReachable"] is False for payload in waiting[1:])
+        assert result.status == "failed"
+        assert retries[-1]["stopReason"] == "attempts_exhausted"
+        assert _turn_error_code(result) == "responseStreamDisconnected"
 
 
 def test_https_probe_treats_refused_local_proxy_as_unreachable():
     # A stopped local proxy (e.g. Clash Verge quit) is a definitive outage,
-    # not probe uncertainty; otherwise the bounded retry plan burns ~30 min.
+    # not probe uncertainty; progress should report the observed outage.
     probe = socket.socket()
     probe.bind(("127.0.0.1", 0))
     port = probe.getsockname()[1]

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import tempfile
 from uuid import uuid4
 
 import jsonschema
@@ -180,6 +181,7 @@ class DshACPThread(ProjectLeadRuntime):
         self.update_bindings(tools=tools, event_handler=event_handler,
                              server_request_handler=server_request_handler)
         self._process = self._reader = self._stderr = self._mcp = None
+        self._launch_dir = None
         self._pending = {}
         self._sequence = 0
         self._inbound = asyncio.Queue()
@@ -209,14 +211,20 @@ class DshACPThread(ProjectLeadRuntime):
         try:
             declaration = await self._mcp.start()
             env = {**_isolated_project_process_env(os.environ), **self.env}
-            binary_dir = Path(self.dsh_bin).parent
+            dsh_bin = self.dsh_bin
+            if os.path.dirname(dsh_bin) and not Path(dsh_bin).is_absolute():
+                dsh_bin = str(self.cwd / dsh_bin)
+            binary_dir = Path(dsh_bin).parent
             if binary_dir.is_absolute():
                 # Honor the Node installed beside a project-local DSH CLI.
                 env["PATH"] = str(binary_dir) + os.pathsep + env.get("PATH", "")
             if self.dsh_home:
                 env["DSH_HOME"] = str(self.dsh_home)
+            # DSH discovers startup .env here; workspace .env may contain values
+            # forbidden at bootstrap. ACP sessions still use the actual project cwd.
+            self._launch_dir = tempfile.TemporaryDirectory(prefix="mac-dsh-")
             self._process = await asyncio.create_subprocess_exec(
-                self.dsh_bin, "--profile", "acp", cwd=str(self.cwd), env=env,
+                dsh_bin, "--profile", "acp", cwd=self._launch_dir.name, env=env,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, start_new_session=True, limit=16 * 1024 * 1024,
             )
@@ -478,6 +486,9 @@ class DshACPThread(ProjectLeadRuntime):
                             pass
                     await stop_process_tree(process, isolated_group=True)
                     self._process = None
+                if self._launch_dir:
+                    self._launch_dir.cleanup()
+                    self._launch_dir = None
             finally:
                 for task in (self._reader, self._stderr):
                     if task:

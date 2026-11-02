@@ -16,6 +16,8 @@ from mac_system.agents.proxy_recovery import (
 )
 from mac_system.agents.root_runtime import _probe_https_reachable
 
+_TARGETS = ("https://chatgpt.com", "https://auth.openai.com")
+
 
 @pytest.fixture(autouse=True)
 def _reset_recovery_state(monkeypatch):
@@ -29,15 +31,17 @@ class FakeController:
     def __init__(
         self,
         proxies: dict,
-        group_delays: dict[str, dict] | None = None,
+        group_delays: dict | None = None,
         unavailable: bool = False,
         member_delays: dict[str, float] | None = None,
+        member_delays_by_url: dict[tuple[str, str], float | None] | None = None,
         group_test_unavailable: bool = False,
     ) -> None:
         self.proxies = proxies
         self.group_delays = group_delays or {}
         self.unavailable = unavailable
         self.member_delays = member_delays
+        self.member_delays_by_url = member_delays_by_url
         self.group_test_unavailable = group_test_unavailable
         self.dead_groups: set[str] = set()
         self.selected: dict[str, str] = {}
@@ -50,6 +54,11 @@ class FakeController:
 
     async def test_proxy_delay(self, name, url, timeout):
         self.delay_calls.append(name)
+        if (
+            self.member_delays_by_url is not None
+            and (name, url) in self.member_delays_by_url
+        ):
+            return self.member_delays_by_url[(name, url)]
         if self.member_delays is not None and name in self.member_delays:
             return self.member_delays[name]
         if name in self.dead_groups:
@@ -59,7 +68,7 @@ class FakeController:
     async def test_group_delays(self, group, url, timeout):
         if self.group_test_unavailable:
             raise ProxyRecoveryUnavailable(f"controller HTTP 504 for {group}")
-        return self.group_delays.get(group, {})
+        return self.group_delays.get((group, url), self.group_delays.get(group, {}))
 
     async def select_proxy(self, group, name):
         self.selected[group] = name
@@ -100,7 +109,7 @@ async def test_recovery_switches_only_dead_concrete_groups():
     )
     client.dead_groups.add("节点选择")
     switches = await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=client, cooldown_seconds=0
+        _TARGETS, client=client, cooldown_seconds=0
     )
     assert switches == [("节点选择", "节点A", "节点C")]
     assert client.selected == {"节点选择": "节点C"}
@@ -110,7 +119,7 @@ async def test_recovery_switches_only_dead_concrete_groups():
 async def test_recovery_leaves_healthy_groups_untouched():
     client = FakeController(_proxies_payload())
     switches = await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=client, cooldown_seconds=0
+        _TARGETS, client=client, cooldown_seconds=0
     )
     assert switches == []
     assert client.selected == {}
@@ -125,7 +134,52 @@ async def test_force_recovery_switches_probe_healthy_stream_broken_node():
         group_delays={"节点选择": {"节点A": 42, "节点B": 880, "节点C": 130}},
     )
     switches = await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=client, cooldown_seconds=0, force=True
+        _TARGETS, client=client, cooldown_seconds=0, force=True
+    )
+    assert switches == [("节点选择", "节点A", "节点C")]
+    assert client.selected == {"节点选择": "节点C"}
+
+
+@pytest.mark.asyncio
+async def test_switch_requires_node_healthy_on_every_target():
+    # 节点A answers the chat host but cannot reach the auth host: it must not
+    # stay selected, and 节点B is the only candidate healthy on both.
+    client = FakeController(
+        _proxies_payload(),
+        group_delays={
+            ("节点选择", "https://chatgpt.com"): {
+                "节点A": 42, "节点B": 100, "节点C": 300,
+            },
+            ("节点选择", "https://auth.openai.com"): {
+                "节点A": "timeout", "节点B": 110, "节点C": 150,
+            },
+        },
+        member_delays_by_url={("节点选择", "https://auth.openai.com"): None},
+    )
+    switches = await recover_dead_proxy_nodes(
+        _TARGETS, client=client, cooldown_seconds=0
+    )
+    assert switches == [("节点选择", "节点A", "节点B")]
+    assert client.selected == {"节点选择": "节点B"}
+
+
+@pytest.mark.asyncio
+async def test_force_recovery_ignores_node_dead_on_secondary_target():
+    # 节点B is fastest for the chat host but dead for the auth host; forcing
+    # must land on 节点C, which passes both, not on the partial node.
+    client = FakeController(
+        _proxies_payload(),
+        group_delays={
+            ("节点选择", "https://chatgpt.com"): {
+                "节点A": 42, "节点B": 100, "节点C": 130,
+            },
+            ("节点选择", "https://auth.openai.com"): {
+                "节点A": 40, "节点B": "timeout", "节点C": 150,
+            },
+        },
+    )
+    switches = await recover_dead_proxy_nodes(
+        _TARGETS, client=client, cooldown_seconds=0, force=True
     )
     assert switches == [("节点选择", "节点A", "节点C")]
     assert client.selected == {"节点选择": "节点C"}
@@ -138,7 +192,7 @@ async def test_force_recovery_keeps_current_when_only_healthy_choice():
         group_delays={"节点选择": {"节点A": 42, "节点B": "timeout"}},
     )
     switches = await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=client, cooldown_seconds=0, force=True
+        _TARGETS, client=client, cooldown_seconds=0, force=True
     )
     assert switches == []
     assert client.selected == {}
@@ -155,7 +209,7 @@ async def test_recovery_falls_back_to_member_tests_when_group_test_504():
     )
     client.dead_groups.add("节点选择")
     switches = await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=client, cooldown_seconds=0
+        _TARGETS, client=client, cooldown_seconds=0
     )
     assert switches == [("节点选择", "节点A", "节点C")]
     assert client.selected == {"节点选择": "节点C"}
@@ -170,7 +224,7 @@ async def test_recovery_group_504_without_healthy_member_keeps_current():
     )
     client.dead_groups.add("节点选择")
     switches = await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=client, cooldown_seconds=0
+        _TARGETS, client=client, cooldown_seconds=0
     )
     assert switches == []
     assert client.selected == {}
@@ -183,14 +237,14 @@ async def test_recovery_coalesced_by_cooldown():
     )
     first.dead_groups.add("节点选择")
     switches = await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=first, cooldown_seconds=3600
+        _TARGETS, client=first, cooldown_seconds=3600
     )
     assert len(switches) == 1
 
     second = FakeController(_proxies_payload())
     second.dead_groups.add("节点选择")
     assert await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=second, cooldown_seconds=3600
+        _TARGETS, client=second, cooldown_seconds=3600
     ) == []
     # Cooldown means the second caller never even queried the controller.
     assert second.delay_calls == []
@@ -200,7 +254,7 @@ async def test_recovery_coalesced_by_cooldown():
 async def test_recovery_unavailable_controller_is_silent_noop():
     client = FakeController({}, unavailable=True)
     assert await recover_dead_proxy_nodes(
-        "https://chatgpt.com", client=client, cooldown_seconds=0
+        _TARGETS, client=client, cooldown_seconds=0
     ) == []
 
 

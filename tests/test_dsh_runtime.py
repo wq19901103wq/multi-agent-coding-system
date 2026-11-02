@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -118,6 +119,48 @@ async def test_native_persistence_and_failed_resume_never_creates_replacement(ru
         await runtime.resume_thread('missing')
     assert not any(m.get('method') == 'session/new' for m in runtime.processes[-1].writes)
     assert runtime._process is None
+    assert runtime._launch_dir is None
+
+
+async def test_launch_isolates_workspace_dotenv_and_preserves_session_cwd(runtime):
+    dotenv = runtime.cwd / '.env'
+    dotenv.write_text('HTTPS_PROXY=http://proxy.invalid:8080\n')
+    initial_dir = Path(runtime.launches[0][1]['cwd'])
+    initial_session = runtime._process.writes[-1]
+    assert initial_session['params']['cwd'] == str(runtime.cwd)
+    await runtime.resume_thread(runtime.thread_id)
+    launch_dir = Path(runtime.launches[-1][1]['cwd'])
+    assert launch_dir != runtime.cwd and launch_dir != initial_dir
+    assert not initial_dir.exists()
+    assert launch_dir.is_dir() and not list(launch_dir.iterdir())
+    assert runtime._process.writes[-1]['params']['cwd'] == str(runtime.cwd)
+    assert dotenv.read_text() == 'HTTPS_PROXY=http://proxy.invalid:8080\n'
+    await runtime.close()
+    assert not launch_dir.exists() and runtime._launch_dir is None
+
+
+@pytest.mark.parametrize('binary', ['tools/dsh', './dsh', 'dsh'])
+async def test_launch_preserves_relative_executable_resolution(runtime, binary):
+    runtime.dsh_bin = binary
+    await runtime.resume_thread(runtime.thread_id)
+    args, kwargs = runtime.launches[-1]
+    expected = str(runtime.cwd / binary) if '/' in binary else binary
+    assert args == (expected, '--profile', 'acp')
+    if '/' in binary:
+        assert kwargs['env']['PATH'].split(dsh_runtime.os.pathsep)[0] == str(Path(expected).parent)
+
+
+async def test_spawn_failure_cleans_launch_directory_and_bridge(runtime, monkeypatch):
+    launches = []
+    async def fail_spawn(*args, **kwargs):
+        launches.append(Path(kwargs['cwd']))
+        assert launches[-1].is_dir()
+        raise FileNotFoundError('missing DSH binary')
+    monkeypatch.setattr(dsh_runtime.asyncio, 'create_subprocess_exec', fail_spawn)
+    with pytest.raises(FileNotFoundError, match='missing DSH binary'):
+        await runtime.resume_thread(runtime.thread_id)
+    assert not launches[-1].exists()
+    assert runtime._launch_dir is None and runtime._mcp is None and runtime._process is None
 
 
 async def test_ordered_public_output_terminal_and_privacy(runtime):
@@ -222,6 +265,7 @@ async def test_failed_prompt_stops_native_writer(runtime, failure):
 
 async def test_stop_failure_still_closes_bridge_without_forgetting_writer(runtime, monkeypatch):
     process, bridge = runtime._process, runtime._mcp
+    launch_dir = runtime._launch_dir
     stop = dsh_runtime.stop_process_tree
     closed = []
     async def fail_stop(*args, **kwargs):
@@ -236,6 +280,7 @@ async def test_stop_failure_still_closes_bridge_without_forgetting_writer(runtim
         assert closed == [True] and runtime._mcp is None
         assert runtime._reader is None and runtime._stderr is None
         assert runtime._process is process and process.returncode is None
+        assert runtime._launch_dir is launch_dir and Path(launch_dir.name).is_dir()
     finally:
         monkeypatch.setattr(dsh_runtime, 'stop_process_tree', stop)
 

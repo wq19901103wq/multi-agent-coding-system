@@ -36,10 +36,26 @@ logger = logging.getLogger(__name__)
 _APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 _PROCESS_CLOSED_METHOD = "mac/process/closed"
 # Every Codex runtime MAC builds selects the built-in OpenAI provider
-# (``requires_openai_auth``), whose HTTPS traffic goes to this host. The
-# reachability probe only decides whether bounded continuation retries can
-# still succeed; it never changes the native turn/steer protocol.
+# (``requires_openai_auth``), whose HTTPS traffic goes to these hosts. Both
+# must be reachable: a proxy node can pass short probes for one and still
+# fail the other. Reachability probes inform recovery and progress; a
+# temporary outage does not cancel the bounded continuation plan or change
+# the native turn/steer protocol.
 _CODEX_BUILTIN_PROVIDER_HOST = "chatgpt.com"
+_CODEX_AUTH_PROVIDER_HOST = "auth.openai.com"
+_PROXY_RECOVERY_TARGET_URLS = (
+    f"https://{_CODEX_BUILTIN_PROVIDER_HOST}",
+    f"https://{_CODEX_AUTH_PROVIDER_HOST}",
+)
+_STREAM_TRANSPORT_ERROR_CODES = frozenset(
+    {
+        "responseStreamDisconnected",
+        "responseStreamConnectionFailed",
+        "httpConnectionFailed",
+    }
+)
+_NATIVE_RECONNECT_PROXY_GRACE_SECONDS = 30.0
+_NATIVE_RECONNECT_PROXY_WINDOW_SECONDS = 120.0
 _HOST_RUNTIME_ENV_KEYS = {
     "CONDA_DEFAULT_ENV",
     "CONDA_PREFIX",
@@ -260,7 +276,7 @@ def _error_retry_delays(error_code: str | None) -> tuple[float, ...]:
     match error_code:
         case "serverOverloaded" | "concurrentRequestLimit":
             return _SERVER_OVERLOADED_RETRY_DELAYS_SECONDS
-        case "responseStreamDisconnected" | "responseStreamConnectionFailed" | "httpConnectionFailed":
+        case code if code in _STREAM_TRANSPORT_ERROR_CODES:
             return _RESPONSE_STREAM_DISCONNECTED_RETRY_DELAYS_SECONDS
         case _:
             return ()
@@ -633,6 +649,7 @@ class CodexAppServerThread(ProjectLeadRuntime):
         self._continuation_interrupt = asyncio.Event()
         self._continuation_waiting = False
         self._stream_watchdog_turn_id: str | None = None
+        self._native_proxy_recovery_task: asyncio.Task[None] | None = None
 
     def update_bindings(
         self,
@@ -755,6 +772,8 @@ class CodexAppServerThread(ProjectLeadRuntime):
             await self._close()
 
     async def _close(self) -> None:
+        if self._native_proxy_recovery_task is not None:
+            self._native_proxy_recovery_task.cancel()
         process = self._process
         if process is not None:
             await stop_process_tree(process, isolated_group=True)
@@ -857,19 +876,24 @@ class CodexAppServerThread(ProjectLeadRuntime):
         """Probe the built-in ChatGPT provider's network path.
 
         All MAC-built Codex runtimes authenticate against the built-in OpenAI
-        provider, so the probe target is its fixed HTTPS host. Any probe-side
-        uncertainty stays ``None``: only a positive refusal short-circuits
-        the bounded continuation retries.
+        provider, so both its chat and auth hosts must answer: a proxy node
+        that only reaches one leaves real turns failing. Any probe-side
+        uncertainty stays ``None``. Results inform recovery and progress,
+        without ending the bounded continuation plan early.
         """
 
         if not self.provider_probe_enabled:
             return None
-        try:
-            return await _probe_https_reachable(
-                _CODEX_BUILTIN_PROVIDER_HOST, 443, timeout_seconds
-            )
-        except Exception:
+        results = await asyncio.gather(
+            _probe_https_reachable(_CODEX_BUILTIN_PROVIDER_HOST, 443, timeout_seconds),
+            _probe_https_reachable(_CODEX_AUTH_PROVIDER_HOST, 443, timeout_seconds),
+            return_exceptions=True,
+        )
+        if any(result is False for result in results):
+            return False
+        if any(isinstance(result, BaseException) for result in results):
             return None
+        return True
 
     async def run_turn(
         self, text: str, *, output_schema: JsonObject | None = None
@@ -892,6 +916,14 @@ class CodexAppServerThread(ProjectLeadRuntime):
             result = await self._run_turn_locked(text, output_schema=output_schema)
             events = list(result.events)
             retry_error_code = retry_code(result)
+            # Only transport-reported stream failures count as proxy evidence;
+            # a local stream-watchdog silence is ambiguous and must not force
+            # a node switch on its own.
+            stream_failure_streak = (
+                1
+                if _turn_error_code(result) in _STREAM_TRANSPORT_ERROR_CODES
+                else 0
+            )
             delays = _error_retry_delays(retry_error_code)
             if not delays:
                 return result
@@ -930,36 +962,34 @@ class CodexAppServerThread(ProjectLeadRuntime):
                 except Exception:
                     logger.warning("Continuation retry projection failed", exc_info=True)
 
-            provider_unreachable = False
-            probe_failures = 0
             for attempt, delay_seconds in enumerate(plan, start=1):
-                # After the first continuation already failed, a positively
-                # broken network path makes every remaining attempt futile.
-                # Two consecutive probe failures stop the backoff early;
-                # probe uncertainty keeps the native retry plan unchanged.
+                # Probe after a failed continuation to inform recovery and
+                # progress. A failed probe is only a point-in-time observation:
+                # the network can recover during the remaining backoff.
+                reachable: bool | None = None
                 if attempts >= 1:
                     reachable = await self.probe_provider_reachable()
+                    if _turn_error_code(result) in _STREAM_TRANSPORT_ERROR_CODES:
+                        stream_failure_streak += 1
+                    else:
+                        stream_failure_streak = 0
                     # A proxy node can pass short probes yet keep killing the
                     # long-lived model stream, in which case every attempt
                     # dies with the same stream-class error and probing alone
-                    # never triggers a node switch. Treat repeated stream
-                    # failures as node evidence too and force a group
-                    # re-evaluation that lands on a different healthy node.
+                    # never triggers a node switch. Require two consecutive
+                    # transport failures before forcing a re-evaluation: one
+                    # upstream disconnect is not node evidence.
                     stream_path_broken = (
                         self._proxy_recovery_enabled
-                        and retry_code(result)
-                        in {
-                            "responseStreamDisconnected",
-                            "responseStreamConnectionFailed",
-                            "httpConnectionFailed",
-                        }
+                        and stream_failure_streak >= 2
                     )
                     if reachable is False or stream_path_broken:
                         # A dead local proxy node surfaces as transport-level
-                        # failures that bounded turn retries cannot outwait.
-                        # Ask the mihomo controller for a healthy node first.
+                        # failures. Try the existing recovery path before waiting.
+                        # Ask the mihomo controller for a healthy node first,
+                        # validated against every Codex provider endpoint.
                         switches = await recover_dead_proxy_nodes(
-                            f"https://{_CODEX_BUILTIN_PROVIDER_HOST}",
+                            _PROXY_RECOVERY_TARGET_URLS,
                             socket_path=self._proxy_recovery_socket,
                             cooldown_seconds=self._proxy_recovery_cooldown_seconds,
                             force=stream_path_broken and reachable is not False,
@@ -971,16 +1001,6 @@ class CodexAppServerThread(ProjectLeadRuntime):
                                     "proxyRecovered",
                                     switches=[list(s) for s in switches],
                                 )
-                    if reachable is False:
-                        probe_failures += 1
-                        if probe_failures >= 2:
-                            provider_unreachable = True
-                            await emit_retry(
-                                "exhausted", stopReason="provider_unreachable"
-                            )
-                            break
-                    else:
-                        probe_failures = 0
                 logger.warning(
                     "Codex native continuation retry %s after %s; waiting %.0fs",
                     attempt,
@@ -994,6 +1014,7 @@ class CodexAppServerThread(ProjectLeadRuntime):
                         "waiting",
                         attempt=attempt,
                         delaySeconds=delay_seconds,
+                        providerReachable=reachable,
                         retryAt=(
                             datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
                         ).isoformat(),
@@ -1044,11 +1065,6 @@ class CodexAppServerThread(ProjectLeadRuntime):
                     break
             else:
                 await emit_retry("exhausted", stopReason=stop_reason)
-            if provider_unreachable:
-                raise AppServerProtocolError(
-                    "Codex 服务网络不可达（探测 chatgpt.com 失败），已提前停止重试；"
-                    "恢复网络/代理后重新发送「继续」即可续跑本轮。"
-                )
             if (
                 result.status == "interrupted"
                 and retry_code(result) == "responseStreamDisconnected"
@@ -1116,7 +1132,47 @@ class CodexAppServerThread(ProjectLeadRuntime):
         running_tools: set[str] = set()
         self._stream_watchdog_turn_id = None
         reconnect_started: float | None = None
+        reconnect_errors: deque[float] = deque()
+        last_proxy_attempt: float | None = None
         loop = asyncio.get_running_loop()
+
+        def can_recover_proxy(turn_id: str) -> bool:
+            return (
+                self.active_turn_id == turn_id
+                and reconnect_started is not None
+                and not self._continuation_interrupt.is_set()
+                and not running_tools
+                and not any(not task.done() for task in request_tasks)
+            )
+
+        async def recover_native_proxy(turn_id: str, error_code: str) -> None:
+            # Repair the network underneath Codex's native retry loop. Never
+            # interrupt/restart the turn or replay its input to do so.
+            try:
+                if not can_recover_proxy(turn_id):
+                    return
+                reachable = await self.probe_provider_reachable()
+                if not can_recover_proxy(turn_id):
+                    return
+                switches = await recover_dead_proxy_nodes(
+                    _PROXY_RECOVERY_TARGET_URLS,
+                    socket_path=self._proxy_recovery_socket,
+                    cooldown_seconds=self._proxy_recovery_cooldown_seconds,
+                    force=reachable is not False,
+                )
+                if switches and can_recover_proxy(turn_id):
+                    event = AgentEvent(
+                        "mac/continuationRetry", self.thread_id, turn_id,
+                        {"phase": "proxyRecovered", "nativeRetry": True,
+                         "errorCode": error_code,
+                         "switches": [list(s) for s in switches]},
+                    )
+                    events.append(event)
+                    await self._emit(event)
+            except Exception:
+                # A controller/projection failure must not end a live native
+                # turn or hide the original provider error.
+                logger.warning("Native reconnect proxy recovery failed", exc_info=True)
 
         try:
             while True:
@@ -1125,6 +1181,8 @@ class CodexAppServerThread(ProjectLeadRuntime):
                 )
                 if waiting_for_work:
                     reconnect_started = None
+                    if self._native_proxy_recovery_task is not None:
+                        self._native_proxy_recovery_task.cancel()
                 timeout = self.silence_timeout_seconds
                 if reconnect_started is not None:
                     timeout = min(timeout, max(
@@ -1174,6 +1232,8 @@ class CodexAppServerThread(ProjectLeadRuntime):
                 params = params if isinstance(params, dict) else {}
 
                 if "id" in message:
+                    if self._native_proxy_recovery_task is not None:
+                        self._native_proxy_recovery_task.cancel()
                     request_thread_id = str(
                         params.get("threadId") or self.thread_id or ""
                     )
@@ -1216,12 +1276,36 @@ class CodexAppServerThread(ProjectLeadRuntime):
                 )
                 if is_current and method == "error" and params.get("willRetry") is True:
                     error = params.get("error") or {}
-                    code = error.get("codexErrorInfo") if isinstance(error, dict) else None
-                    if code == "responseStreamDisconnected" or (
-                        isinstance(code, dict) and "responseStreamDisconnected" in code
-                    ):
+                    code = _continuation_error_code(error) if isinstance(error, dict) else None
+                    if code in _STREAM_TRANSPORT_ERROR_CODES:
+                        now = loop.time()
                         if reconnect_started is None:
-                            reconnect_started = loop.time()
+                            reconnect_started = now
+                        # Short-lived progress resets the silence watchdog,
+                        # but not evidence of repeated transport failures.
+                        while (
+                            reconnect_errors
+                            and now - reconnect_errors[0] > _NATIVE_RECONNECT_PROXY_WINDOW_SECONDS
+                        ):
+                            reconnect_errors.popleft()
+                        reconnect_errors.append(now)
+                        recovery = self._native_proxy_recovery_task
+                        if (
+                            self._proxy_recovery_enabled
+                            and len(reconnect_errors) >= 2
+                            and now - reconnect_errors[0] >= _NATIVE_RECONNECT_PROXY_GRACE_SECONDS
+                            and (
+                                last_proxy_attempt is None
+                                or now - last_proxy_attempt >= self._proxy_recovery_cooldown_seconds
+                            )
+                            and (recovery is None or recovery.done())
+                            and can_recover_proxy(current_turn_id)
+                        ):
+                            last_proxy_attempt = now
+                            self._native_proxy_recovery_task = asyncio.create_task(
+                                recover_native_proxy(current_turn_id, code),
+                                name=f"mac-codex-native-proxy-recovery-{current_turn_id}",
+                            )
                 elif is_current and (
                     method.startswith(("item/agentMessage/", "item/reasoning/"))
                     or (method in {"item/started", "item/completed"} and item.get("type") in {
@@ -1235,6 +1319,8 @@ class CodexAppServerThread(ProjectLeadRuntime):
                     "mcpToolCall", "collabAgentToolCall", "webSearch",
                 }:
                     running_tools.add(str(item.get("id")))
+                    if self._native_proxy_recovery_task is not None:
+                        self._native_proxy_recovery_task.cancel()
                 elif is_current and method == "item/completed":
                     running_tools.discard(str(item.get("id")))
                 if method == "turn/started" and params.get("threadId") == self.thread_id:
@@ -1247,6 +1333,9 @@ class CodexAppServerThread(ProjectLeadRuntime):
                         # of remaining pinned to the response's stale id.
                         if started_turn_id != current_turn_id:
                             reconnect_started = None
+                            reconnect_errors.clear()
+                            if self._native_proxy_recovery_task is not None:
+                                self._native_proxy_recovery_task.cancel()
                             running_tools.clear()
                         current_turn_id = started_turn_id
                 if method == "item/completed":
@@ -1280,6 +1369,10 @@ class CodexAppServerThread(ProjectLeadRuntime):
                         events=tuple(events),
                     )
         finally:
+            if self._native_proxy_recovery_task is not None:
+                self._native_proxy_recovery_task.cancel()
+                await asyncio.gather(self._native_proxy_recovery_task, return_exceptions=True)
+                self._native_proxy_recovery_task = None
             pending_requests = [task for task in request_tasks if not task.done()]
             for task in pending_requests:
                 task.cancel()
@@ -1355,6 +1448,8 @@ class CodexAppServerThread(ProjectLeadRuntime):
 
         self._interrupt_generation += 1
         self._continuation_interrupt.set()
+        if self._native_proxy_recovery_task is not None:
+            self._native_proxy_recovery_task.cancel()
         if self._continuation_waiting:
             return True
         return await self._interrupt_active_turn(turn_id)

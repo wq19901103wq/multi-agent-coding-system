@@ -41,7 +41,7 @@ class WireProcess(_FakeProcess):
 async def wire(monkeypatch, tmp_path):
     process = WireProcess()
     async def spawn(*args, **kwargs):
-        assert '--wire' in args and '--yolo' not in args
+        assert '--wire' in args and '--yolo' in args
         assert kwargs['start_new_session'] is True
         process.command = args
         return process

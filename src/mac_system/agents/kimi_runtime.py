@@ -68,7 +68,12 @@ class KimiWireThread(ProjectLeadRuntime):
             await self.close()
         self.thread_id = thread_id
         self._inbound = asyncio.Queue()
-        command = [self.kimi_bin, "--work-dir", str(self.cwd), "--session", thread_id, "--wire"]
+        # --yolo keeps parity with the Codex (approval_policy="never") and
+        # Claude (--dangerously-skip-permissions) links: MAC centrally owns
+        # approval surfacing, so the Kimi process must not emit an
+        # ApprovalRequest per sensitive tool call.
+        command = [self.kimi_bin, "--work-dir", str(self.cwd), "--session",
+                   thread_id, "--wire", "--yolo"]
         if self.agent_file is not None:
             command += ["--agent-file", str(self.agent_file)]
         if self.mcp_config_file is not None:
