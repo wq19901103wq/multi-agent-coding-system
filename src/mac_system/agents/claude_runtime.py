@@ -28,18 +28,47 @@ from mac_system.agents.root_runtime import (
 )
 
 
+def claude_runtime_env(settings) -> dict[str, str]:
+    """Provider credentials/models the Claude CLI needs, from MAC settings."""
+
+    env = {}
+    for field, key in (
+        ("anthropic_api_key", "ANTHROPIC_API_KEY"),
+        ("anthropic_auth_token", "ANTHROPIC_AUTH_TOKEN"),
+        ("anthropic_base_url", "ANTHROPIC_BASE_URL"),
+        ("anthropic_default_opus_model", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+        ("anthropic_default_sonnet_model", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+        ("anthropic_default_haiku_model", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+        ("claude_code_effort_level", "CLAUDE_CODE_EFFORT_LEVEL"),
+    ):
+        value = getattr(settings, field, None)
+        if value:
+            env[key] = value
+    return env
+
+
 class ClaudeCodeThread(ProjectLeadRuntime):
     provider_id = "claude_code"
     display_name = "Claude Code"
 
     def __init__(self, *, claude_bin, cwd: Path, tools, event_handler=None,
                  server_request_handler=None, model=None, env=None,
-                 silence_timeout_seconds=300):
+                 silence_timeout_seconds=300, append_system_prompt=None,
+                 builtin_tools=None, strict_mcp_config=False,
+                 setting_sources=None):
         self.claude_bin, self.cwd = str(claude_bin), Path(cwd)
         self.thread_id = self.active_turn_id = None
         self.active_model = model
         self.env = dict(env or {})
         self.silence_timeout_seconds = silence_timeout_seconds
+        self.append_system_prompt = append_system_prompt
+        self.builtin_tools = builtin_tools
+        self.strict_mcp_config = strict_mcp_config
+        self.setting_sources = (
+            ["user", "project", "local"]
+            if setting_sources is None
+            else list(setting_sources)
+        )
         self.update_bindings(tools=tools, event_handler=event_handler,
                              server_request_handler=server_request_handler)
         self._client = self._reader = None
@@ -88,15 +117,20 @@ class ClaudeCodeThread(ProjectLeadRuntime):
         env.update(isolated)
         env.update(self.env)
         env["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"] = "1"
+        system_prompt = {"type": "preset", "preset": "claude_code"}
+        if self.append_system_prompt:
+            system_prompt["append"] = self.append_system_prompt
         options = ClaudeAgentOptions(
             cli_path=self.claude_bin, cwd=self.cwd, model=self.active_model,
             resume=self.thread_id if resume else None,
             session_id=None if resume else self.thread_id,
-            system_prompt={"type": "preset", "preset": "claude_code"},
-            setting_sources=["user", "project", "local"],
+            system_prompt=system_prompt,
+            setting_sources=self.setting_sources,
             permission_mode="default", can_use_tool=self._permission,
             mcp_servers={"mac": create_sdk_mcp_server(
                 "mac", tools=[self._mcp_tool(item) for item in self.tools.values()])},
+            tools=self.builtin_tools,
+            strict_mcp_config=self.strict_mcp_config,
             extra_args={"replay-user-messages": None}, env=env,
             # Provider stderr may contain tool output; it is not a public event.
             stderr=lambda _line: None,

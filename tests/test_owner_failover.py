@@ -63,15 +63,55 @@ def owner_takeover(owner_context):
     return ProjectOwner(service, settings, runtime_registry=registry), project, calls, control
 
 
+@pytest.fixture
+def owner_multi_provider(owner_context):
+    service, project, _ = owner_context
+    project.feishu_chat_id = 'oc-owner-test'
+    service.session.add(project)
+    service.session.commit()
+    calls = []
+    failing = {'codex', 'claude_code'}
+    decision = dict(outcome='defer', decision='', rationale='缺少用户依据',
+                    impact='保留原问题', reversible=False, confidence='low', answers=[])
+
+    class Runtime:
+        def __init__(self, provider, context):
+            self.provider = self.active_model = provider
+            self.thread_id = provider + '-owner'
+            calls.append((provider, 'build'))
+
+        async def create_thread(self):
+            calls.append((self.provider, 'create'))
+
+        async def run_turn(self, text, *, output_schema=None):
+            calls.append((self.provider, 'run'))
+            if self.provider in failing:
+                raise AppServerProtocolError(f'{self.provider} unavailable')
+            return TurnResult(self.thread_id, 'turn', 'completed',
+                              json.dumps(decision), ())
+
+        async def close(self):
+            calls.append((self.provider, 'close'))
+
+    registry = ProjectOwnerRuntimeRegistry({
+        provider: (lambda ctx, provider=provider: Runtime(provider, ctx))
+        for provider in ('codex', 'kimi_code', 'claude_code')
+    })
+    settings = Settings(PROJECT_LEAD_FAILOVER_PROVIDER='kimi_code',
+                        PROJECT_OWNER_PROVIDER='codex')
+    return ProjectOwner(service, settings, runtime_registry=registry), project, calls, failing
+
+
 @pytest.mark.asyncio
-async def test_project_provider_pin_keeps_owner_on_codex_after_outage(owner_takeover):
+async def test_project_provider_pin_fails_over_after_outage(owner_takeover):
     owner, project, calls, _ = owner_takeover
     project.context = {**(project.context or {}), 'execution_provider': 'codex'}
-    with pytest.raises(RuntimeError):
-        await owner.decide(project, [_question()])
+    result = await owner.decide(project, [_question()])
+    assert result.outcome == 'defer'
     assert ('codex', 'build') in calls
-    assert not any(provider == 'kimi_code' for provider, _ in calls)
-    assert owner.service.session.exec(select(NotificationOutbox)).all() == []
+    assert calls.count(('kimi_code', 'run')) == 1
+    notices = owner.service.session.exec(select(NotificationOutbox)).all()
+    assert len(notices) == 1 and notices[0].status == 'pending'
 
 
 @pytest.mark.asyncio
@@ -142,6 +182,50 @@ async def test_owner_task_error_does_not_change_provider(owner_takeover):
     with pytest.raises(RuntimeError, match='未返回可用'):
         await owner.decide(project, [_question()])
     assert not any(p == 'kimi_code' for p, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_pinned_claude_owner_hands_off_through_all_registered_providers(
+        owner_multi_provider):
+    owner, project, calls, failing = owner_multi_provider
+    failing.clear()
+    failing.update({'claude_code', 'kimi_code'})
+    project.context = {**(project.context or {}), 'execution_provider': 'claude_code'}
+    result = await owner.decide(project, [_question()])
+    assert result.outcome == 'defer'
+    assert [provider for provider, action in calls if action == 'build'] == [
+        'claude_code', 'kimi_code', 'codex']
+    assert calls.index(('claude_code', 'close')) < calls.index(('kimi_code', 'build'))
+    assert calls.index(('kimi_code', 'close')) < calls.index(('codex', 'build'))
+    events = owner.service.session.exec(select(EventLog).where(
+        EventLog.message == 'Project Owner provider handoff')).all()
+    assert [(event.meta['from_provider'], event.meta['to_provider'])
+            for event in events] == [
+        ('claude_code', 'kimi_code'), ('kimi_code', 'codex')]
+    assert len(owner.service.session.exec(select(NotificationOutbox)).all()) == 2
+
+
+@pytest.mark.asyncio
+async def test_owner_failover_requires_explicit_switch(owner_multi_provider):
+    owner, project, calls, failing = owner_multi_provider
+    failing.add('claude_code')
+    owner.settings.project_lead_failover_provider = ''
+    project.context = {**(project.context or {}), 'execution_provider': 'claude_code'}
+    with pytest.raises(RuntimeError):
+        await owner.decide(project, [_question()])
+    assert not any(provider == 'kimi_code' for provider, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_owner_unregistered_preferred_provider_uses_registered_fallback(
+        owner_multi_provider):
+    owner, project, calls, failing = owner_multi_provider
+    failing.clear()
+    project.context = {**(project.context or {}), 'execution_provider': 'retired_provider'}
+    result = await owner.decide(project, [_question()])
+    assert result.outcome == 'defer'
+    assert ('kimi_code', 'run') in calls
+    assert not any(provider == 'retired_provider' for provider, _ in calls)
 
 
 @pytest.mark.asyncio

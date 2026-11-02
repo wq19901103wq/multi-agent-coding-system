@@ -38,7 +38,7 @@ from mac_system.agents.root_runtime import (
     _turn_error_code,
 )
 from mac_system.agents.kimi_runtime import KimiWireThread
-from mac_system.agents.claude_runtime import ClaudeCodeThread
+from mac_system.agents.claude_runtime import ClaudeCodeThread, claude_runtime_env
 from mac_system.agents.dsh_runtime import DshACPThread
 from mac_system.agents.process_lifecycle import snapshot_host_execution, host_execution_has_exited
 from mac_system.agents.runtime import AgentRuntime
@@ -2353,23 +2353,11 @@ class RootAgentEngine:
         )
 
     def _create_claude_lead_runtime(self, context):
-        env = {}
-        for field, key in (
-            ("anthropic_api_key", "ANTHROPIC_API_KEY"),
-            ("anthropic_auth_token", "ANTHROPIC_AUTH_TOKEN"),
-            ("anthropic_base_url", "ANTHROPIC_BASE_URL"),
-            ("anthropic_default_opus_model", "ANTHROPIC_DEFAULT_OPUS_MODEL"),
-            ("anthropic_default_sonnet_model", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
-            ("anthropic_default_haiku_model", "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-            ("claude_code_effort_level", "CLAUDE_CODE_EFFORT_LEVEL"),
-        ):
-            value = getattr(self.settings, field)
-            if value:
-                env[key] = value
         return ClaudeCodeThread(
             claude_bin=self.settings.claude_bin, cwd=context.cwd, tools=list(context.tools),
             event_handler=context.event_handler, server_request_handler=context.server_request_handler,
-            model=self.settings.claude_model or None, env=env,
+            model=self.settings.claude_model or None,
+            env=claude_runtime_env(self.settings),
             silence_timeout_seconds=self.settings.project_lead_silence_timeout_seconds,
         )
 

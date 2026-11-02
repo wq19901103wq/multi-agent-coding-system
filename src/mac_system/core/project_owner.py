@@ -22,6 +22,7 @@ from typing import Any, Callable
 import httpx
 import jsonschema
 
+from mac_system.agents.claude_runtime import ClaudeCodeThread, claude_runtime_env
 from mac_system.agents.kimi_runtime import KimiWireThread
 from mac_system.agents.root_runtime import (
     AgentEvent,
@@ -330,6 +331,9 @@ class ProjectOwnerRuntimeRegistry:
             raise ValueError(f"Project Owner provider already registered: {key}")
         self._builders[key] = builder
 
+    def providers(self) -> tuple[str, ...]:
+        return tuple(self._builders)
+
     def create(
         self, provider: str, context: ProjectOwnerRuntimeContext
     ) -> ProjectLeadRuntime:
@@ -342,6 +346,13 @@ class ProjectOwnerRuntimeRegistry:
                 f"available: {available}"
             ) from exc
         return builder(context)
+
+
+_OWNER_PROVIDER_DISPLAY_NAMES = {
+    "codex": "Codex",
+    "kimi_code": "Kimi",
+    "claude_code": "Claude Code",
+}
 
 
 def _build_codex_owner_runtime(
@@ -413,9 +424,46 @@ class _KimiOwnerThread(KimiWireThread):
         self._spec_dir.cleanup()
 
 
+class _ClaudeOwnerThread(ClaudeCodeThread):
+    """Owner turn with the JSON contract appended to the user text.
+
+    Claude sessions cannot change an output schema per turn. Keep the
+    Owner-only translation explicit; the caller validates the same schema.
+    """
+
+    async def run_turn(self, text, *, output_schema=None):
+        if output_schema is None:
+            return await super().run_turn(text)
+        return await super().run_turn(
+            text + "\n只返回一个符合以下 JSON Schema 的 JSON 对象，不要 Markdown 围栏：\n"
+            + json.dumps(output_schema, ensure_ascii=False)
+        )
+
+
+def _build_claude_owner_runtime(
+    context: ProjectOwnerRuntimeContext,
+) -> ProjectLeadRuntime:
+    # Built-in tools and user/project settings stay off: the Owner may only use
+    # its explicit read-only MAC tools, from a directory outside the workspace.
+    return _ClaudeOwnerThread(
+        claude_bin=context.settings.claude_bin,
+        cwd=context.owner_dir,
+        tools=list(context.tools),
+        event_handler=context.event_handler,
+        env=claude_runtime_env(context.settings),
+        silence_timeout_seconds=context.settings.project_lead_silence_timeout_seconds,
+        append_system_prompt=_OWNER_INSTRUCTIONS,
+        builtin_tools=[],
+        strict_mcp_config=True,
+        setting_sources=[],
+    )
+
+
 def default_project_owner_runtime_registry() -> ProjectOwnerRuntimeRegistry:
     return ProjectOwnerRuntimeRegistry({
-        "codex": _build_codex_owner_runtime, "kimi_code": _KimiOwnerThread,
+        "codex": _build_codex_owner_runtime,
+        "kimi_code": _KimiOwnerThread,
+        "claude_code": _build_claude_owner_runtime,
     })
 
 
@@ -798,6 +846,43 @@ def public_project_context(
 _OWNER_RECENT_ROUNDS = 5
 
 
+_OWNER_VISIBLE_REF_KEYS = {
+    "source_ref",
+    "memory_ref",
+    "round_ref",
+    "turn_ref",
+    "parent_decision_id",
+}
+
+
+def _visible_refs_from_snapshot(snapshot: Any) -> set[str]:
+    """Collect every authority ref the Owner can literally see in its input.
+
+    Boundary validation must match the documented rule: refs may only point at
+    human words, user choices, policies or preferences that are traceable in
+    the input. The curated evidence map covers only a subset of the refs shown
+    in the payload (history reports, prior decisions, memory contexts), so refs
+    faithfully quoted from visible context were wrongly rejected as
+    untraceable and whole reviews failed. Anything present in the snapshot is
+    traceable by construction; only hallucinated refs stay rejectable.
+    """
+
+    refs: set[str] = set()
+    stack = [snapshot]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in _OWNER_VISIBLE_REF_KEYS and isinstance(value, str):
+                    ref = value.strip()
+                    if ref:
+                        refs.add(ref)
+                stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(node)
+    return refs
+
+
 def _project_history_round_payload(
     row: ProjectHistoryRound,
     *,
@@ -1001,6 +1086,23 @@ class ProjectOwner:
         # Used only by offline holdout evaluation to reproduce what the Owner
         # could have known before a historical user decision.
         self.evidence_before = evidence_before
+
+    def _owner_provider_candidates(self, preferred: str) -> tuple[str, ...]:
+        """Order the registered providers for one bounded Owner review.
+
+        The project's execution provider stays first. The explicit failover
+        switch, when set, names the next provider and also enables using any
+        other registered Owner provider as a last resort.
+        """
+
+        registered = self.runtime_registry.providers()
+        failover = self.settings.project_lead_failover_provider.strip()
+        if not failover:
+            return (preferred,) if preferred in registered else ()
+        ordered = (preferred, failover, *registered)
+        return tuple(dict.fromkeys(
+            provider for provider in ordered if provider in registered
+        ))
 
     async def decide(
         self,
@@ -2009,7 +2111,19 @@ class ProjectOwner:
         # Owner context and violate the public-context-only contract.
         owner_dir = _owner_runtime_dir(project.id)
         owner_dir.mkdir(parents=True, exist_ok=True)
-        provider = (project.context or {}).get("execution_provider") or self.settings.project_owner_provider
+        preferred_provider = (
+            (project.context or {}).get("execution_provider")
+            or self.settings.project_owner_provider
+        )
+        candidates = self._owner_provider_candidates(preferred_provider)
+        if not candidates:
+            available = ", ".join(sorted(self.runtime_registry.providers())) or "none"
+            raise RuntimeError(
+                f"Project Owner provider is not registered: {preferred_provider}; "
+                f"available: {available}"
+            )
+        provider = candidates[0]
+        next_candidate = 1
 
         def create_runtime() -> ProjectLeadRuntime:
             return self.runtime_registry.create(
@@ -2238,17 +2352,19 @@ class ProjectOwner:
         # Neither case becomes an approval without a validated Owner result.
         max_attempts = 2
         is_native_approval = prompt_payload["task"]["kind"] == "answer_approval"
-        # The old 180s cap cancelled approval reviews before Codex's 300s
-        # stream watchdog could recover. Allow the configured execution budget
-        # (capped at 600s) for approvals, including startup and native recovery.
+        # The old 180s cap cancelled reviews before Codex's 300s stream
+        # watchdog could recover. Report reviews hit the same long-context
+        # latency and native retry storms as approvals (most background review
+        # failures were exactly ~180s timeouts), so both share the configured
+        # execution budget (capped at 600s), including startup and recovery.
         turn_timeout = min(
-            600 if is_native_approval else 180,
+            600,
             max(30, self.settings.agent_timeout_seconds),
         )
         output_schema = _owner_output_schema(report_review=report_review is not None)
         for attempt in range(max_attempts):
             while True:
-                runtime = create_runtime()
+                runtime = None
                 turn_result: TurnResult | None = None
                 transport_error = None
 
@@ -2267,14 +2383,16 @@ class ProjectOwner:
                     )
 
                 try:
-                    # Include process initialization and thread creation in
-                    # the deadline, not only the model response.
+                    # Include runtime construction, process initialization and
+                    # thread creation in the deadline, not only the response.
+                    runtime = create_runtime()
                     turn_result = await asyncio.wait_for(run_attempt(), timeout=turn_timeout)
                 except (ProjectLeadRuntimeError, OSError, asyncio.TimeoutError) as exc:
                     transport_error = exc
                 finally:
                     # A failed close must propagate, never start two runtimes.
-                    await runtime.close()
+                    if runtime is not None:
+                        await runtime.close()
                 infrastructure_failure = transport_error is not None or (
                     turn_result is not None and _turn_error_code(turn_result) in {
                         "serverOverloaded", "responseStreamDisconnected", "responseStreamConnectionFailed",
@@ -2282,18 +2400,20 @@ class ProjectOwner:
                         "responseTooManyFailedAttempts",
                     }
                 )
-                if (infrastructure_failure and provider == "codex"
-                        and not (project.context or {}).get("execution_provider")
-                        and self.settings.project_lead_failover_provider == "kimi_code"):
+                if infrastructure_failure and next_candidate < len(candidates):
+                    handoff_provider = candidates[next_candidate]
+                    next_candidate += 1
                     reason = redact_text(
                         (str(transport_error) or "Owner runtime timed out")
                         if transport_error is not None else _turn_failure_message(turn_result)
                     )
                     handoff_id = generate_id("owner-handoff")
                     await self.service.log_event(project.id, "WARNING", "Project Owner provider handoff", {
-                        "id": handoff_id, "from_provider": provider, "to_provider": "kimi_code",
+                        "id": handoff_id, "from_provider": provider,
+                        "to_provider": handoff_provider,
                         "reason": reason[:1200], "context": prompt_payload,
-                        "previous_model": runtime.active_model, "previous_usage": latest_usage,
+                        "previous_model": getattr(runtime, "active_model", None),
+                        "previous_usage": latest_usage,
                     })
                     self.service.session.commit()
                     if project.feishu_chat_id:
@@ -2303,14 +2423,17 @@ class ProjectOwner:
                             intent_type="progress", payload={
                                 "card": build_content_card(
                                     "Project Owner 助手接管",
-                                    "Codex 暂时不可用，原审阅已停止；本次由 Kimi 继续只读审阅。\n原因：" + reason[:1200],
+                                    f"{_OWNER_PROVIDER_DISPLAY_NAMES.get(provider, provider)} 暂时不可用，"
+                                    "原审阅已停止；本次由 "
+                                    f"{_OWNER_PROVIDER_DISPLAY_NAMES.get(handoff_provider, handoff_provider)} "
+                                    "继续只读审阅。\n原因：" + reason[:1200],
                                     color="orange",
                                 ),
                                 "projection_key": handoff_id, "subject_type": "owner_handoff",
                                 "subject_id": handoff_id, "lifecycle_status": "published",
                             },
                         )
-                    provider = "kimi_code"
+                    provider = handoff_provider
                     latest_usage = {}
                     continue
                 if transport_error is not None:
@@ -2326,11 +2449,18 @@ class ProjectOwner:
             if transport_error is not None:
                 continue
             if turn_result is None or not turn_result.final_message:
-                failed_attempts.append(
+                failure = (
                     _turn_failure_message(turn_result)
                     if turn_result is not None
                     else "Owner turn did not start"
                 )
+                failed_attempts.append(failure)
+                if attempt + 1 < max_attempts:
+                    validation_feedback = (
+                        "上次输出没有产生可用的结构化结果："
+                        + failure
+                        + "。请确保最终只输出符合 schema 的 JSON 对象。\n"
+                    )
                 continue
             try:
                 decoded = json.loads(turn_result.final_message)
@@ -2553,8 +2683,14 @@ class ProjectOwner:
         submitted_authority_refs = tuple(
             dict.fromkeys(_compact(value, 800) for value in raw_authority_refs)
         )
+        visible_refs = set(decision_evidence_by_ref)
+        visible_refs.update(current_human_source_refs)
+        visible_refs.update(user_choice_refs)
+        visible_refs.update(context_refs)
+        if context_snapshot:
+            visible_refs.update(_visible_refs_from_snapshot(context_snapshot))
         invalid_authority_refs = [
-            ref for ref in submitted_authority_refs if ref not in decision_evidence_by_ref
+            ref for ref in submitted_authority_refs if ref not in visible_refs
         ]
         if invalid_authority_refs:
             errors.append(
@@ -2573,8 +2709,9 @@ class ProjectOwner:
                 evidence = " ".join(_compact(item.get("evidence"), 500).split())
                 if not source_refs or not evidence:
                     errors.append(f"问题 {question_id} 缺少 source_refs 或 evidence")
+                answer_visible_refs = visible_refs | set(answer_evidence_by_ref)
                 invalid_refs = [
-                    ref for ref in source_refs if ref not in answer_evidence_by_ref
+                    ref for ref in source_refs if ref not in answer_visible_refs
                 ]
                 if invalid_refs:
                     errors.append(

@@ -330,6 +330,265 @@ async def test_owner_retries_one_fresh_ephemeral_turn_after_empty_failure(
 
 
 @pytest.mark.asyncio
+async def test_owner_report_review_uses_full_execution_budget_not_180s_cap(
+    owner_context, monkeypatch, tmp_path
+):
+    service, project, _workspace = owner_context
+    deadlines = []
+    original_wait_for = project_owner_module.asyncio.wait_for
+
+    async def record_deadline(coro, *, timeout):
+        deadlines.append(timeout)
+        return await original_wait_for(coro, timeout=timeout)
+
+    monkeypatch.setattr(project_owner_module.asyncio, "wait_for", record_deadline)
+
+    class DeadlineOwnerThread:
+        def __init__(self, **_kwargs):
+            self.active_model = "owner-model"
+
+        async def create_thread(self):
+            return "thread-owner-deadline"
+
+        async def run_turn(self, _prompt, *, output_schema=None):
+            return TurnResult(
+                thread_id="thread-owner-deadline",
+                turn_id="turn-owner-deadline",
+                status="completed",
+                final_message=project_owner_module.json.dumps({
+                    **_submission(),
+                    "outcome": "decide",
+                    "decision": "保持当前结论",
+                    "rationale": "本轮结果已经满足用户要求。",
+                    "impact": "无需继续执行。",
+                    "answers": [],
+                    "continue_execution": False,
+                }),
+                events=(),
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        project_owner_module, "CodexAppServerThread", DeadlineOwnerThread
+    )
+    await ProjectOwner(
+        service,
+        Settings(PROJECTS_DIR=tmp_path / "projects", AGENT_TIMEOUT_SECONDS=600),
+    ).review_report(
+        project,
+        title="本轮结果",
+        content="结果内容",
+        user_request="完成结果",
+    )
+
+    # Report reviews used to be capped at 180s while approvals got 600s;
+    # nearly every background review failure was exactly a ~180s timeout.
+    assert deadlines
+    assert all(deadline == 600 for deadline in deadlines)
+
+
+@pytest.mark.asyncio
+async def test_owner_review_accepts_authority_refs_visible_in_history_snapshot(
+    owner_context, monkeypatch, tmp_path
+):
+    service, project, _workspace = owner_context
+    store = RootSessionStore(service.session)
+    store.begin_turn(project.id, user_request="第一轮请求", request_origin="human")
+    service.record_project_history_report(
+        project.id,
+        native_turn_id="turn-prior",
+        title="上一轮结果",
+        content="上一轮已经验证通过。",
+        report_ref="report:turn-prior",
+        request_origin="human",
+    )
+    store.begin_turn(project.id, user_request="第二轮请求", request_origin="human")
+    service.record_project_history_report(
+        project.id,
+        native_turn_id="turn-current",
+        title="本轮结果",
+        content="本轮结果已交付。",
+        report_ref="report:turn-current",
+        request_origin="human",
+    )
+    submissions = []
+
+    class QuotingOwnerThread:
+        def __init__(self, **_kwargs):
+            self.active_model = "owner-model"
+
+        async def create_thread(self):
+            return "thread-owner-quote"
+
+        async def run_turn(self, _prompt, *, output_schema=None):
+            submissions.append(authority_refs := list(_visible_report_refs()))
+            return TurnResult(
+                thread_id="thread-owner-quote",
+                turn_id="turn-owner-quote",
+                status="completed",
+                final_message=project_owner_module.json.dumps({
+                    **_submission(),
+                    "outcome": "decide",
+                    "decision": "沿用上一轮已验证结论",
+                    "rationale": "上一轮结果已在输入中可见且支持本轮决定。",
+                    "impact": "保持方向一致。",
+                    "answers": [],
+                    "continue_execution": False,
+                    "authority_refs": authority_refs,
+                }),
+                events=(),
+            )
+
+        async def close(self):
+            return None
+
+    def _visible_report_refs():
+        # The Owner faithfully quotes the prior report ref it sees in its
+        # input instead of inventing one.
+        return ["report:turn-prior"]
+
+    monkeypatch.setattr(
+        project_owner_module, "CodexAppServerThread", QuotingOwnerThread
+    )
+    result = await ProjectOwner(
+        service, Settings(PROJECTS_DIR=tmp_path / "projects")
+    ).review_report(
+        project,
+        title="本轮结果",
+        content="本轮结果已交付。",
+        user_request="完成结果",
+        native_turn_id="turn-current",
+    )
+
+    assert result.outcome == "decide"
+
+
+@pytest.mark.asyncio
+async def test_owner_review_still_rejects_hallucinated_authority_refs(
+    owner_context, monkeypatch, tmp_path
+):
+    service, project, _workspace = owner_context
+    store = RootSessionStore(service.session)
+    store.begin_turn(project.id, user_request="第一轮请求", request_origin="human")
+    service.record_project_history_report(
+        project.id,
+        native_turn_id="turn-current",
+        title="本轮结果",
+        content="本轮结果已交付。",
+        report_ref="report:turn-current",
+        request_origin="human",
+    )
+
+    class HallucinatingOwnerThread:
+        def __init__(self, **_kwargs):
+            self.active_model = "owner-model"
+
+        async def create_thread(self):
+            return "thread-owner-hallucinate"
+
+        async def run_turn(self, _prompt, *, output_schema=None):
+            return TurnResult(
+                thread_id="thread-owner-hallucinate",
+                turn_id="turn-owner-hallucinate",
+                status="completed",
+                final_message=project_owner_module.json.dumps({
+                    **_submission(),
+                    "outcome": "decide",
+                    "decision": "凭空决定",
+                    "rationale": "引用了一个输入里不存在的来源。",
+                    "impact": "不应通过校验。",
+                    "answers": [],
+                    "continue_execution": False,
+                    "authority_refs": ["report:forged-turn"],
+                }),
+                events=(),
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        project_owner_module, "CodexAppServerThread", HallucinatingOwnerThread
+    )
+    with pytest.raises(RuntimeError, match="不可回查"):
+        await ProjectOwner(
+            service, Settings(PROJECTS_DIR=tmp_path / "projects")
+        ).review_report(
+            project,
+            title="本轮结果",
+            content="本轮结果已交付。",
+            user_request="完成结果",
+            native_turn_id="turn-current",
+        )
+
+
+@pytest.mark.asyncio
+async def test_owner_empty_structured_output_gets_feedback_and_retries(
+    owner_context, monkeypatch, tmp_path
+):
+    service, project, _workspace = owner_context
+    prompts = []
+    attempts = 0
+
+    class EmptyThenValidOwnerThread:
+        def __init__(self, **_kwargs):
+            self.active_model = "owner-model"
+
+        async def create_thread(self):
+            return "thread-owner-empty"
+
+        async def run_turn(self, prompt, *, output_schema=None):
+            nonlocal attempts
+            attempts += 1
+            prompts.append(prompt)
+            if attempts == 1:
+                return TurnResult(
+                    thread_id="thread-owner-empty-1",
+                    turn_id="turn-owner-empty-1",
+                    status="completed",
+                    final_message="",
+                    events=(),
+                )
+            return TurnResult(
+                thread_id="thread-owner-empty-2",
+                turn_id="turn-owner-empty-2",
+                status="completed",
+                final_message=project_owner_module.json.dumps({
+                    **_submission(),
+                    "outcome": "decide",
+                    "decision": "保持当前结论",
+                    "rationale": "本轮结果已经满足用户要求。",
+                    "impact": "无需继续执行。",
+                    "answers": [],
+                    "continue_execution": False,
+                }),
+                events=(),
+            )
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(
+        project_owner_module, "CodexAppServerThread", EmptyThenValidOwnerThread
+    )
+    result = await ProjectOwner(
+        service, Settings(PROJECTS_DIR=tmp_path / "projects")
+    ).review_report(
+        project,
+        title="本轮结果",
+        content="结果内容",
+        user_request="完成结果",
+    )
+
+    assert result.outcome == "decide"
+    assert attempts == 2
+    assert len(prompts) == 2
+    assert "上次输出没有产生可用的结构化结果" in prompts[1]
+
+
+@pytest.mark.asyncio
 async def test_owner_retries_invalid_semantics_without_rewriting_the_outcome(
     owner_context, monkeypatch, tmp_path
 ):
@@ -1537,6 +1796,42 @@ def test_owner_runtime_registry_is_provider_neutral(tmp_path):
     assert registry.create("test-provider", context) is sentinel
     with pytest.raises(RuntimeError, match="not registered"):
         registry.create("missing-provider", context)
+
+
+def test_default_owner_registry_supports_claude_code_projects(tmp_path):
+    registry = project_owner_module.default_project_owner_runtime_registry()
+    context = ProjectOwnerRuntimeContext(
+        settings=Settings(PROJECTS_DIR=tmp_path / "projects"),
+        owner_dir=tmp_path,
+        tools=[],
+        event_handler=lambda _event: None,
+    )
+    runtime = registry.create("claude_code", context)
+    assert runtime.provider_id == "claude_code"
+    assert runtime.cwd == tmp_path
+    assert runtime.builtin_tools == []
+    assert runtime.append_system_prompt == project_owner_module._OWNER_INSTRUCTIONS
+    assert runtime.strict_mcp_config is True
+    assert runtime.setting_sources == []
+
+
+async def test_claude_owner_appends_structured_output_contract(tmp_path, monkeypatch):
+    captured = {}
+
+    async def fake_run(runtime, text, *, output_schema=None):
+        captured["text"] = text
+        captured["schema"] = output_schema
+        return "ok"
+
+    monkeypatch.setattr(project_owner_module.ClaudeCodeThread, "run_turn", fake_run)
+    owner = project_owner_module._ClaudeOwnerThread(
+        claude_bin="claude", cwd=tmp_path, tools=[],
+    )
+    result = await owner.run_turn("PROMPT", output_schema={"type": "object"})
+    assert result == "ok"
+    assert "PROMPT" in captured["text"]
+    assert '"type": "object"' in captured["text"]
+    assert captured["schema"] is None
 
 
 def test_project_owner_only_keeps_preferences_with_evidence_in_current_user_request():

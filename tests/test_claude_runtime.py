@@ -104,6 +104,27 @@ async def test_native_session_options_resume_and_binding(runtime, tmp_path, monk
         await restored.close()
 
 
+async def test_owner_isolated_options_disable_builtins_and_append_instructions(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(claude_runtime, 'ClaudeSDKClient', FakeClient)
+    adapter = ClaudeCodeThread(
+        claude_bin='claude', cwd=tmp_path, tools=[],
+        append_system_prompt='OWNER RULES', builtin_tools=[],
+        strict_mcp_config=True, setting_sources=[],
+    )
+    await adapter.create_thread()
+    try:
+        options = adapter._client.options
+        assert options.tools == []
+        assert options.strict_mcp_config is True
+        assert options.setting_sources == []
+        assert options.system_prompt == {
+            'type': 'preset', 'preset': 'claude_code', 'append': 'OWNER RULES'}
+    finally:
+        await adapter.close()
+
+
 async def test_public_progress_tools_final_and_hidden_content(runtime):
     task, client = await start(runtime)
     client.feed(

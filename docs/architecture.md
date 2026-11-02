@@ -115,19 +115,24 @@ Root 通过 Codex 原生 `request_user_input` 表达执行中发现的实质疑�
   关键词路由或在 adapter 内静默 fallback。provider 的原生事件与审批必须由 adapter 映射到 MAC 的
   公共事件和交互边界。
 - 用户明确固定项目执行助手时，可在项目 context 设置 `execution_provider`。该项目的
-  新 Lead 会话、独立 Owner 和外部 CLI 目录/调用均限制到这一 provider，且禁用自动跨 provider
-  故障接管；未设置的项目仍沿用现有配置。已有会话必须先确认旧 runtime 及写入子进程停止，
-  显式归档接管记录并清除旧 provider 的 native thread ID，不能把旧 ID 交给另一 provider 续接。
+  新 Lead 会话、独立 Owner 和外部 CLI 目录/调用均以这一 provider 为首选，且 Lead 仍禁用
+  自动跨 provider 故障接管；未设置的项目仍沿用现有配置。独立 Owner 是例外：它在本次只读
+  审阅的通道故障时仍可按故障接管顺序换道并公开通知，但不会把固定项写回项目，也不改变
+  Root/CLI 的 provider。已有会话必须先确认旧 runtime 及写入子进程停止，显式归档接管记录并
+  清除旧 provider 的 native thread ID，不能把旧 ID 交给另一 provider 续接。
 
 ### 用户授权的故障接管
 
 - `PROJECT_LEAD_FAILOVER_PROVIDER=kimi_code` 显式启用一次 Codex → Kimi 接管，默认留空。
   一次指每个 Codex 执行周期；用户明确切回 Codex 后，旧接管记录归档，不阻挡新的故障接管。
-  同一开关也覆盖独立 Owner 审阅：初始化或模型调用超时、连接失败、原生重试耗尽时，
-  确认旧进程停止后，由 Kimi 在独立临时会话接续本次审阅，并通过 outbox 公开通知。
-  Kimi Owner 禁用内置编码工具、子 Agent 和全局 MCP，仅开放同一组只读管理工具；
-  输出仍须通过同一 JSON Schema 和人类来源/授权校验。格式或业务校验失败不触发换助手。
-  Codex 原生重试耗尽、进程/协议故障、明确的上游不可用错误或模型连续静默才触发；
+  同一开关也覆盖独立 Owner 审阅：runtime 构造、模型调用超时、连接失败或原生重试耗尽时，
+  确认旧进程停止后，按「项目 `execution_provider`（或 `PROJECT_OWNER_PROVIDER`）→
+  `PROJECT_LEAD_FAILOVER_PROVIDER` → 其余已注册 Owner provider」的顺序换道，每个 provider
+  最多尝试一次，并通过 outbox 为每次接管公开通知。固定 `execution_provider` 的项目同样适用，
+  但只影响本次 Owner 审阅，不改 Root/CLI 的 provider；固定 provider 未注册时直接使用下一个
+  已注册 provider。所有 Owner provider 都禁用内置编码工具、子 Agent 和全局 MCP，仅开放
+  同一组只读管理工具；输出仍须通过同一 JSON Schema 和人类来源/授权校验。格式或业务校验
+  失败不触发换道。原生重试耗尽、进程/协议故障、明确的上游不可用错误或模型连续静默才触发；
   取消、一般任务失败、等待审批和仍在执行的工具不触发。静默阈值由
   `PROJECT_LEAD_SILENCE_TIMEOUT_SECONDS` 配置，默认 300 秒。
 - 宿主先关闭旧 provider 及其进程树，无法确认停止则中止接管，避免两个助手同时写入。
