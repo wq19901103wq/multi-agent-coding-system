@@ -119,10 +119,11 @@ pip install -e .
 ## 运行注意事项
 
 - 服务端口：18080。
-- 外部看门狗：`com.mac-system.watchdog`（独立 LaunchAgent，每 60s 检查 `/health`，服务 down 时自动执行 `start_server.sh` 并按 300s 冷却限频，宕机/恢复/恢复失败经微信 iLink 通知）。安装：`./scripts/install_watchdog.sh`，卸载：`./scripts/install_watchdog.sh --uninstall`，日志：`server_watchdog.log`。launchd 的 KeepAlive 只管已加载的 job，bootstrap 失败类故障由看门狗兜底。
+- 磁盘定期清理：`com.mac-system.disk-cleanup`（**LaunchDaemon**，system 域，注销/未登录也运行，每小时检查一次；磁盘使用率 ≥90% 时删除 `~/digital-human/instances/*/data/.cache/disk-history` 下 mtime 超过 14 天的 `*.sqlite3` 缓存）。安装：`./scripts/install_disk_cleanup.sh`（需 sudo，自动移除 GUI 版），改回 GUI 会话版加 `--gui`，卸载：`./scripts/install_disk_cleanup.sh --uninstall`，日志：`disk_cleanup.log`。阈值和保留天数可用环境变量 `DISK_CLEANUP_THRESHOLD` / `DISK_CLEANUP_RETENTION_DAYS` 覆盖。
+- 外部看门狗：`com.mac-system.watchdog`（**system 域 LaunchDaemon**，每 60s 检查 `/health`，服务 down 时自动执行 `start_server_daemon.sh` 并按 300s 冷却限频，宕机/恢复/恢复失败经微信 iLink 通知；root 运行，可恢复 system 域服务）。看门狗本体由 launchd 加载，不存在 bootstrap 遗漏问题。回滚 GUI 版：`sudo ./scripts/deploy_daemon_stack.sh --rollback`。日志：`server_watchdog.log`。
 - 数据库：SQLite `mac_system.db`。
 - 项目目录：`projects/`，或用户通过 `/bind` 绑定的 Git 目录。
-- 服务启动：`./scripts/start_server.sh`，停止：`./scripts/stop_server.sh`。
+- 服务本体与看门狗均以 **system 域 LaunchDaemon** 运行（`sudo ./scripts/deploy_daemon_stack.sh` 部署，`--rollback` 回滚 GUI 版），注销/会话崩溃不影响服务；server 进程经 plist `UserName` 以仓库属主身份运行。服务启动：`./scripts/start_server_daemon.sh`（root，系统域），停止：`./scripts/stop_server.sh`（自动识别 gui/system 域，system 域需 root）；旧的 `./scripts/start_server.sh` 仅用于 GUI 版回滚后。
 - Agent 写项目文件时不得让 uvicorn 监听项目目录，否则会造成反复重启和 SQLite 锁冲突。
 - 源码修改后必须 editable reinstall 并重启，避免旧 `.pyc`/进程造成“代码已改、运行仍旧”的假象。
 - `.gitignore` 必须覆盖 `.env.bak*`、`*.db-shm`、`*.db-wal`。

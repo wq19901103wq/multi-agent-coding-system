@@ -3,7 +3,25 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_LABEL="com.mac-system.dev"
-SERVICE_TARGET="gui/$(id -u)/$SERVICE_LABEL"
+# Identify the service user from the repo owner instead of the invoking user:
+# this script is also reached via sudo/sudo -u, where SUDO_USER/USER point at
+# the wrong account.
+TARGET_USER="$(stat -f %Su "$PROJECT_ROOT")"
+TARGET_UID="$(id -u "$TARGET_USER")"
+GUI_TARGET="gui/$TARGET_UID/$SERVICE_LABEL"
+SYSTEM_TARGET="system/$SERVICE_LABEL"
+
+# Domain selection: a loaded system daemon takes precedence and requires root.
+if launchctl print "$SYSTEM_TARGET" >/dev/null 2>&1; then
+    if [ "$(id -u)" -ne 0 ]; then
+        exec sudo "$0" "$@"
+    fi
+    SERVICE_TARGET="$SYSTEM_TARGET"
+    DOMAIN="system"
+else
+    SERVICE_TARGET="$GUI_TARGET"
+    DOMAIN="gui/$TARGET_UID"
+fi
 
 cd "$PROJECT_ROOT"
 if [ -f .env ]; then
@@ -60,7 +78,7 @@ restore_launchd_state() {
         launchctl enable "$SERVICE_TARGET"
         # Surface a stale disabled state: otherwise the next start_server.sh
         # bootstrap fails with an opaque "Input/output error".
-        if launchctl print-disabled "gui/$(id -u)" 2>/dev/null \
+        if launchctl print-disabled "$DOMAIN" 2>/dev/null \
             | awk -v label="\"$SERVICE_LABEL\"" '$1 == label && ($3 == "true" || $3 == "disabled") {found=1} END {exit !found}'; then
             echo "WARNING: $SERVICE_LABEL is still disabled in launchd; start_server.sh cannot load it" >&2
         fi
@@ -68,7 +86,7 @@ restore_launchd_state() {
 }
 trap restore_launchd_state EXIT
 if [ "$SERVICE_LOADED" = true ]; then
-    DISABLED_SERVICES="$(launchctl print-disabled "gui/$(id -u)")"
+    DISABLED_SERVICES="$(launchctl print-disabled "$DOMAIN")"
     if ! awk -v label="\"$SERVICE_LABEL\"" '$1 == label && ($3 == "true" || $3 == "disabled") {found=1} END {exit !found}' <<<"$DISABLED_SERVICES"; then
         launchctl disable "$SERVICE_TARGET"
         RESTORE_ENABLED=true

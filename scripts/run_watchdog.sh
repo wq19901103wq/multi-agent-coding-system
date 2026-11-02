@@ -3,4 +3,4 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-exec /usr/bin/env python3 "$PROJECT_ROOT/scripts/service_watchdog.py" --root "$PROJECT_ROOT"
+exec /usr/bin/env python3 "$PROJECT_ROOT/scripts/service_watchdog.py" --root "$PROJECT_ROOT" "$@"

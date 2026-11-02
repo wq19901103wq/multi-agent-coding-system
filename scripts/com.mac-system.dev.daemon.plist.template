@@ -8,12 +8,17 @@
     <array>
         <string>/bin/zsh</string>
         <string>-lc</string>
-        <string>exec "/Users/yihanwang/multi-agent-coding-system/scripts/run_server.sh"</string>
+        <string>exec "__PROJECT_ROOT__/scripts/run_server.sh"</string>
     </array>
     <key>UserName</key>
-    <string>yihanwang</string>
+    <string>__USERNAME__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__USER_HOME__</string>
+    </dict>
     <key>WorkingDirectory</key>
-    <string>/Users/yihanwang/multi-agent-coding-system</string>
+    <string>__PROJECT_ROOT__</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -23,8 +28,8 @@
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>
-    <string>/Users/yihanwang/multi-agent-coding-system/server_launchctl.log</string>
+    <string>__PROJECT_ROOT__/server_launchctl.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/yihanwang/multi-agent-coding-system/server_launchctl.log</string>
+    <string>__PROJECT_ROOT__/server_launchctl.log</string>
 </dict>
 </plist>
