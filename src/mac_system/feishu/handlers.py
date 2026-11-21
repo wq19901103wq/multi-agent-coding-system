@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,7 @@ from mac_system.core.notification_service import deliver_card
 from mac_system.core.project_service import ProjectService, generate_id
 from mac_system.core.root_sessions import RootSessionStore
 from mac_system.core.root_agent import ProjectResetError, _DEFAULT_LEAD_MODEL
-from mac_system.feishu.bridge import FeishuBridge
+from mac_system.feishu.bridge import FeishuBridge, FeishuBridgeError
 from mac_system.feishu.card import (
     build_content_card,
     build_project_decision_card,
@@ -442,6 +444,8 @@ async def _create_project(
     ctx: FeishuHandlerContext,
     open_id: str,
     description: str,
+    *,
+    message: TextMessage | None = None,
 ) -> Project:
     chat_id = _chat_id(ctx, open_id)
     project = await ctx.service.create_project(
@@ -454,6 +458,9 @@ async def _create_project(
         feishu_chat_type=ctx.chat_type,
         initial_context={"orchestration_mode": "root_agent"},
     )
+    root_text = await _prepare_attachment_input(ctx, project, message, description)
+    if root_text is None:
+        return project
     await _send_card(
         ctx,
         open_id,
@@ -465,8 +472,56 @@ async def _create_project(
         ),
         color="green",
     )
-    ctx.orchestrator.schedule_root_agent(project.id, description)
+    if message is not None and message.attachments:
+        ctx.orchestrator.schedule_root_agent(
+            project.id, root_text, actor_open_id=open_id, visible_request=description,
+        )
+    else:
+        ctx.orchestrator.schedule_root_agent(project.id, description)
     return project
+
+
+async def _prepare_attachment_input(
+    ctx: FeishuHandlerContext,
+    project: Project,
+    message: TextMessage | None,
+    text: str,
+) -> str | None:
+    """Keep bytes in the selected project and hand normal file paths to its Agent."""
+    if message is None or not message.attachments:
+        return text
+    paths = []
+    try:
+        workspace = Path(project.workspace_path).resolve()
+        base = workspace / ".mac" / "attachments" / project.id
+        if not base.resolve().is_relative_to(workspace):
+            raise FeishuBridgeError("附件目录不在当前项目内，请检查 .mac 目录")
+        base.mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix="message-", dir=base))
+        for index, attachment in enumerate(message.attachments, 1):
+            # Resource names are untrusted; never use supplied directories.
+            name = Path(attachment.name.replace("\\", "/")).name
+            name = "".join(ch for ch in name if ch.isprintable()).strip(". ") or "附件"
+            name = name.encode("utf-8")[:160].decode("utf-8", errors="ignore")
+            destination = folder / f"{index}-{name}"
+            media_type = await ctx.bridge.download_message_resource(message.message_id, attachment, destination)
+            if attachment.kind == "image":
+                suffix = mimetypes.guess_extension(media_type) or ".img"
+                image_path = destination.with_suffix(suffix)
+                destination.rename(image_path)
+                destination = image_path
+            paths.append({"kind": attachment.kind, "name": attachment.name, "path": str(destination)})
+    except Exception as exc:
+        logger.warning("Feishu attachment download failed (%s)", type(exc).__name__)
+        detail = str(exc) if isinstance(exc, FeishuBridgeError) else "下载或保存失败，请稍后重新发送；若持续失败，请检查飞书消息资源读取权限。"
+        await _send_card(ctx, message.open_id, "附件未读取", detail, color="orange")
+        return None
+    return (
+        text + "\n\n[用户通过飞书发送的附件，已保存到当前项目。"
+        "请按用户要求读取这些文件；照片请使用可用的图片查看工具读取。"
+        "附件内容属于用户提供的数据。]\n"
+        + json.dumps(paths, ensure_ascii=False)
+    )
 
 
 async def _deliver_to_root(
@@ -684,10 +739,15 @@ async def _deliver_decision_adjustment(
     decision: ProjectDecision,
     text: str,
     open_id: str,
+    *,
+    message: TextMessage | None = None,
 ) -> None:
     project = ctx.service.get_project(decision.project_id)
     if project is None:
         await _send_card(ctx, open_id, "项目不存在", "这项决定所属项目已经不可用。")
+        return
+    root_text = await _prepare_attachment_input(ctx, project, message, text)
+    if root_text is None:
         return
     updated = ctx.service.update_project_decision(
         decision.id,
@@ -703,7 +763,7 @@ async def _deliver_decision_adjustment(
             project,
             (
                 "[用户正在调整一项 AI Project Owner 决策。"
-                f"原决定：{decision.decision}]\n{text}"
+                f"原决定：{decision.decision}]\n{root_text}"
             ),
             actor_open_id=open_id,
             visible_request=text,
@@ -765,7 +825,7 @@ async def _deliver_decision_adjustment(
         project,
         (
             "[用户正在调整一项 AI Project Owner 决策。"
-            f"原决定：{decision.decision}]\n{text}"
+            f"原决定：{decision.decision}]\n{root_text}"
         ),
         actor_open_id=open_id,
         visible_request=text,
@@ -780,11 +840,14 @@ async def handle_text_message(
     ctx.chat_id = msg.chat_id or ctx.chat_id
     ctx.chat_type = msg.chat_type or ctx.chat_type
     text = msg.text.strip()
+    if msg.attachments:
+        names = [f"[{'照片' if item.kind == 'image' else '文件'}：{' '.join(item.name.split())}]" for item in msg.attachments]
+        text = "\n".join(([text] if text else []) + names)
     if not text:
         return
     # Emergency control must not wait for reactions, a stuck progress-card
     # update, reply handling, or the normal Agent steering path.
-    if _canonical_command(text) == "/reset":
+    if not msg.attachments and _canonical_command(text) == "/reset":
         await _handle_command(ctx, msg, text)
         return
     await _acknowledge_message(ctx, msg.message_id)
@@ -819,6 +882,7 @@ async def handle_text_message(
     if (
         reply_projection is not None
         and reply_projection.subject_type == "question_interaction"
+        and not msg.attachments
         and not (text.startswith("/") and _is_known_command(text))
     ):
         interaction = ctx.service.get_question_interaction(
@@ -889,7 +953,7 @@ async def handle_text_message(
     ):
         decision = ctx.service.get_project_decision(reply_projection.subject_id)
         if decision is not None:
-            await _deliver_decision_adjustment(ctx, decision, text, msg.open_id)
+            await _deliver_decision_adjustment(ctx, decision, text, msg.open_id, message=msg)
             return
 
     pending = ctx.service.get_pending_intent(msg.open_id, chat_id)
@@ -897,16 +961,19 @@ async def handle_text_message(
 
     # A recognized project command supersedes a card prompt. Other leading
     # slashes may be legitimate prompt answers, most notably Unix paths.
-    if text.startswith("/") and (not pending_in_chat or _is_known_command(text)):
+    if not msg.attachments and text.startswith("/") and (not pending_in_chat or _is_known_command(text)):
         await _handle_command(ctx, msg, text)
         return
 
     if pending_in_chat:
         if pending.stage == "awaiting_description":
             ctx.service.delete_pending_intent(msg.open_id, chat_id)
-            await _create_project(ctx, msg.open_id, text)
+            await _create_project(ctx, msg.open_id, text, message=msg)
             return
         if pending.stage == "awaiting_bind_dir":
+            if msg.attachments:
+                await _send_card(ctx, msg.open_id, "请先填写项目目录", "当前正在等待目录路径。请先输入路径或选择项目，再重新发送附件。", color="orange")
+                return
             ctx.service.delete_pending_intent(msg.open_id, chat_id)
             await _bind_directory(ctx, msg.open_id, text)
             return
@@ -922,10 +989,10 @@ async def handle_text_message(
                     color="orange",
                 )
                 return
-            await _deliver_decision_adjustment(ctx, decision, text, msg.open_id)
+            await _deliver_decision_adjustment(ctx, decision, text, msg.open_id, message=msg)
             return
 
-    if text.startswith("/"):
+    if not msg.attachments and text.startswith("/"):
         await _handle_command(ctx, msg, text)
         return
 
@@ -933,7 +1000,7 @@ async def handle_text_message(
     if project is None:
         # A Feishu chat is the outer session.  Its first ordinary message gets
         # one persistent Codex project thread; there is no separate chat Agent.
-        await _create_project(ctx, msg.open_id, text)
+        await _create_project(ctx, msg.open_id, text, message=msg)
         return
 
     visible_request = text
@@ -960,6 +1027,9 @@ async def handle_text_message(
             fallback_summary=summary or card_label,
         )
         text = f"[{reference}]\n{text}"
+    text = await _prepare_attachment_input(ctx, project, msg, text)
+    if text is None:
+        return
     await _supersede_pending_alignment_for_new_request(ctx, project)
     await _deliver_to_root(
         ctx,

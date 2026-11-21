@@ -33,8 +33,17 @@ class ButtonAction:
 
 
 @dataclass
+class MessageAttachment:
+    """A resource belonging to the original incoming Feishu message."""
+
+    key: str
+    kind: str
+    name: str
+
+
+@dataclass
 class TextMessage:
-    """Parsed text message event."""
+    """Parsed incoming message, including files and images."""
 
     open_id: str
     message_id: str
@@ -49,3 +58,4 @@ class TextMessage:
     created_at: datetime | None = None
     user_id: str | None = None
     union_id: str | None = None
+    attachments: list[MessageAttachment] = field(default_factory=list)

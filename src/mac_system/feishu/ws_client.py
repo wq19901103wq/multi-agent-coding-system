@@ -41,6 +41,7 @@ from mac_system.feishu.handlers import (
 )
 from mac_system.feishu import ws_status
 from mac_system.feishu.models import ButtonAction, TextMessage
+from mac_system.feishu.bridge import parse_message_content
 from mac_system.models import ProjectOwnerReview
 
 logger = logging.getLogger(__name__)
@@ -1043,9 +1044,10 @@ def _parse_text_message(event: Any) -> TextMessage:
     """Convert a P2ImMessageReceiveV1 event to TextMessage."""
     msg = event.event.message
     content = json.loads(msg.content or "{}")
-    text = _strip_mention_placeholders(content.get("text", "").strip())
+    text, attachments = parse_message_content(getattr(msg, "message_type", "text"), content)
     sender = event.event.sender
     open_id = ""
+    user_id = union_id = None
     sender_type = "user"
     if sender:
         if sender.sender_id:
@@ -1092,6 +1094,7 @@ def _parse_text_message(event: Any) -> TextMessage:
         created_at=_parse_feishu_create_time(getattr(msg, "create_time", None)),
         user_id=user_id,
         union_id=union_id,
+        attachments=attachments,
     )
 
 

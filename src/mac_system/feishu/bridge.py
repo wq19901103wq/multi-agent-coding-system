@@ -4,7 +4,9 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -14,7 +16,7 @@ from mac_system.utils.formatting import (
     split_markdown_sections,
     split_text,
 )
-from mac_system.feishu.models import ButtonAction, FeishuEvent, TextMessage
+from mac_system.feishu.models import ButtonAction, FeishuEvent, MessageAttachment, TextMessage
 
 
 _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
@@ -28,6 +30,32 @@ def _strip_mention_placeholders(text: str) -> str:
     text = _MENTION_PLACEHOLDER_RE.sub("", text)
     text = _MENTION_AT_TAG_RE.sub("", text)
     return text.strip()
+
+
+def parse_message_content(message_type: str, content: dict[str, Any]) -> tuple[str, list[MessageAttachment]]:
+    """Share content decoding between HTTP events and the SDK WebSocket."""
+    attachments: list[MessageAttachment] = []
+    text = str(content.get("text") or "")
+    if message_type == "image" and content.get("image_key"):
+        attachments.append(MessageAttachment(str(content["image_key"]), "image", "照片"))
+    elif message_type == "file" and content.get("file_key"):
+        attachments.append(MessageAttachment(str(content["file_key"]), "file", str(content.get("file_name") or "文件")))
+    elif message_type == "post":
+        # Events normally contain a single post; tolerate localized payloads.
+        post = content if "content" in content else next(
+            (value for value in content.values() if isinstance(value, dict) and "content" in value), {}
+        )
+        lines = [str(post.get("title") or "")]
+        for row in post.get("content", []):
+            parts = []
+            for item in row:
+                if item.get("tag") in {"text", "a"}:
+                    parts.append(str(item.get("text") or item.get("href") or ""))
+                elif item.get("tag") == "img" and item.get("image_key"):
+                    attachments.append(MessageAttachment(str(item["image_key"]), "image", "照片"))
+            lines.append("".join(parts))
+        text = "\n".join(line for line in lines if line)
+    return _strip_mention_placeholders(text), attachments
 
 
 class FeishuBridgeError(Exception):
@@ -202,6 +230,68 @@ class FeishuBridge:
         bot = data.get("bot") or data.get("data", {}).get("bot", {})
         self._bot_open_id = bot.get("open_id")
         return self._bot_open_id
+
+    async def download_message_resource(
+        self,
+        message_id: str,
+        attachment: MessageAttachment,
+        destination: Path,
+        *,
+        max_bytes: int = 30 * 1024 * 1024,
+    ) -> str:
+        """Stream the received message's resource to a new file; return its MIME type."""
+        if not message_id or not attachment.key or attachment.kind not in {"image", "file"}:
+            raise FeishuBridgeError("附件缺少有效的消息或资源标识")
+        client = self._client
+        self._client_requests[client] = self._client_requests.get(client, 0) + 1
+        created = completed = False
+        try:
+            token = await self._get_tenant_token(client)
+            path = f"/open-apis/im/v1/messages/{quote(message_id, safe='')}/resources/{quote(attachment.key, safe='')}"
+            async with client.stream(
+                "GET", f"{self.base_url}{path}",
+                params={"type": attachment.kind},
+                headers={"Authorization": f"Bearer {token}"},
+            ) as response:
+                if response.is_error:
+                    # Do not include response bodies, resource keys or credentials in cards.
+                    raise FeishuBridgeError(f"飞书附件下载失败（HTTP {response.status_code}），请检查消息资源读取权限")
+                length = response.headers.get("content-length", "")
+                if length.isdigit() and int(length) > max_bytes:
+                    raise FeishuBridgeError("附件超过 30 MB，请缩小后重新发送")
+                size = 0
+                with destination.open("xb") as output:
+                    created = True
+                    async for chunk in response.aiter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise FeishuBridgeError("附件超过 30 MB，请缩小后重新发送")
+                        output.write(chunk)
+                if not size:
+                    raise FeishuBridgeError("飞书返回了空附件，请重新发送")
+                if (
+                    response.headers.get("content-type", "").startswith("application/json")
+                    and not response.headers.get("content-disposition")
+                    and size <= 8192
+                ):
+                    try:
+                        error = json.loads(destination.read_bytes())
+                    except (ValueError, UnicodeDecodeError):
+                        error = None
+                    if isinstance(error, dict) and error.get("code") and "msg" in error:
+                        raise FeishuBridgeError(f"飞书附件下载失败（错误码 {error['code']}），请检查消息资源读取权限")
+                completed = True
+                return response.headers.get("content-type", "application/octet-stream").split(";", 1)[0]
+        finally:
+            if created and not completed:
+                destination.unlink(missing_ok=True)
+            remaining = self._client_requests[client] - 1
+            if remaining:
+                self._client_requests[client] = remaining
+            else:
+                del self._client_requests[client]
+                if client is not self._client:
+                    await client.aclose()
 
     async def send_text(
         self,
@@ -393,15 +483,15 @@ class FeishuBridge:
         )
 
     def parse_text_message(self, payload: dict[str, Any]) -> TextMessage:
-        """Parse a text message event."""
+        """Parse text, file, image or rich-text message events."""
         event = self._extract_event(payload)
         message = event.get("message", {})
-        sender = message.get("sender", {})
+        sender = event.get("sender") or message.get("sender", {})
         sender_id = sender.get("sender_id", {})
         open_id = sender_id.get("open_id", "")
         message_id = message.get("message_id", "")
         content = json.loads(message.get("content", "{}"))
-        text = _strip_mention_placeholders(content.get("text", "").strip())
+        text, attachments = parse_message_content(message.get("message_type", "text"), content)
         mentions = message.get("mentions", []) or []
         chat_id = message.get("chat_id")
         chat_type = message.get("chat_type", "p2p") or "p2p"
@@ -430,6 +520,7 @@ class FeishuBridge:
             created_at=created_at,
             user_id=sender_id.get("user_id"),
             union_id=sender_id.get("union_id"),
+            attachments=attachments,
         )
 
     def verify_request(

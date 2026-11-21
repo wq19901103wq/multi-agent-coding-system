@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -17,7 +20,7 @@ from mac_system.feishu.handlers import (
     handle_card_action,
     handle_text_message,
 )
-from mac_system.feishu.models import ButtonAction, TextMessage
+from mac_system.feishu.models import ButtonAction, MessageAttachment, TextMessage
 from mac_system.feishu.accounts import FeishuBotAccount
 from mac_system.feishu.ws_client import FeishuWebSocketClient, _run_account_process
 from mac_system.models import Approval, Project, ProjectDecision, QuestionInteraction
@@ -875,6 +878,158 @@ async def test_first_ordinary_message_creates_one_root_project(ctx):
     assert ctx.orchestrator.scheduled == [(project.id, "做一个个人网站")]
     assert len(ctx.bridge.cards) == 1
     assert ctx.bridge.reactions == [("om-1", "OnIt")]
+
+
+@pytest.fixture
+def attachment_download(ctx, monkeypatch):
+    calls = []
+
+    async def download(message_id, attachment, destination):
+        calls.append((message_id, attachment, destination))
+        destination.write_bytes(attachment.key.encode())
+        return "image/png" if attachment.kind == "image" else "text/plain"
+
+    monkeypatch.setattr(ctx.bridge, "download_message_resource", download, raising=False)
+    return calls
+
+
+def attachment_paths(root_text):
+    return [Path(item["path"]) for item in json.loads(root_text.rsplit("\n", 1)[1])]
+
+
+@pytest.mark.asyncio
+async def test_attachment_only_first_message_creates_project(ctx, attachment_download):
+    incoming = message("")
+    incoming.attachments = [MessageAttachment("document-data", "file", "需求.txt")]
+
+    await handle_text_message(ctx, incoming)
+
+    project = ctx.service.session.exec(select(Project)).one()
+    project_id, root_text = ctx.orchestrator.scheduled[0]
+    saved = attachment_paths(root_text)[0]
+    assert project_id == project.id
+    assert saved.is_relative_to(Path(project.workspace_path) / ".mac" / "attachments" / project.id)
+    assert saved.read_bytes() == b"document-data"
+    assert ctx.orchestrator.visible_requests == ["[文件：需求.txt]"]
+    assert ctx.orchestrator.actor_open_ids == ["ou-user"]
+    assert attachment_download[0][0] == incoming.message_id
+    assert "项目已创建" in str(ctx.bridge.cards[-1][2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["idle", "running", "waiting_user", "owner_reviewing"])
+async def test_attachment_delivery_preserves_turn_routing(ctx, attachment_download, status):
+    project = await ctx.service.create_project(
+        "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+    ctx.service.set_execution_status(project.id, status)
+    incoming = message("按照片调整页面")
+    incoming.attachments = [MessageAttachment("photo-data", "image", "照片")]
+
+    await handle_text_message(ctx, incoming)
+
+    delivery = ctx.orchestrator.scheduled if status == "idle" else ctx.orchestrator.steered
+    assert len(delivery) == 1
+    assert delivery[0][0] == project.id
+    saved = attachment_paths(delivery[0][1])[0]
+    assert saved.suffix == ".png"
+    assert saved.read_bytes() == b"photo-data"
+    visible = ctx.orchestrator.visible_requests if status == "idle" else ctx.orchestrator.steer_visible_requests
+    assert visible == ["按照片调整页面\n[照片：照片]"]
+    assert ctx.bridge.cards == []
+
+
+@pytest.mark.asyncio
+async def test_attachment_names_cannot_escape_or_overwrite(ctx, attachment_download):
+    incoming = message("读取文件")
+    incoming.attachments = [
+        MessageAttachment("first", "file", "../../same.txt"),
+        MessageAttachment("second", "file", "..\\same.txt"),
+    ]
+    await handle_text_message(ctx, incoming)
+    project = ctx.service.session.exec(select(Project)).one()
+    first_paths = attachment_paths(ctx.orchestrator.scheduled[-1][1])
+    incoming.message_id = "om-2"
+    await handle_text_message(ctx, incoming)
+    second_paths = attachment_paths(ctx.orchestrator.scheduled[-1][1])
+
+    assert len(set(first_paths + second_paths)) == 4
+    assert [path.read_bytes() for path in first_paths + second_paths] == [b"first", b"second"] * 2
+    for path in first_paths + second_paths:
+        assert path.resolve().is_relative_to(Path(project.workspace_path).resolve())
+        assert path.name.endswith("same.txt")
+
+
+@pytest.mark.asyncio
+async def test_attachments_stay_in_their_chat_projects(ctx, attachment_download):
+    for chat_id, key in [("oc-chat", "first"), ("oc-other", "second")]:
+        incoming = message_in_chat("", chat_id)
+        incoming.attachments = [MessageAttachment(key, "file", "same.txt")]
+        await handle_text_message(ctx, incoming)
+
+    deliveries = ctx.orchestrator.scheduled
+    assert len(deliveries) == 2
+    assert deliveries[0][0] != deliveries[1][0]
+    for (project_id, text), expected in zip(deliveries, [b"first", b"second"]):
+        saved = attachment_paths(text)[0]
+        project = ctx.service.get_project(project_id)
+        assert saved.is_relative_to(Path(project.workspace_path) / ".mac" / "attachments" / project_id)
+        assert saved.read_bytes() == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_project", [False, True])
+async def test_attachment_failure_shows_card_without_starting_task(ctx, monkeypatch, existing_project):
+    from mac_system.feishu.bridge import FeishuBridgeError
+
+    if existing_project:
+        await ctx.service.create_project(
+            "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+        )
+
+    async def download(*args):
+        raise FeishuBridgeError("飞书附件下载失败，请检查消息资源读取权限")
+
+    monkeypatch.setattr(ctx.bridge, "download_message_resource", download, raising=False)
+    incoming = message("")
+    incoming.attachments = [MessageAttachment("file-key", "file", "需求.txt")]
+    await handle_text_message(ctx, incoming)
+
+    assert ctx.orchestrator.scheduled == []
+    assert ctx.orchestrator.steered == []
+    assert len(ctx.bridge.cards) == 1
+    assert "附件未读取" in str(ctx.bridge.cards[0][2])
+    assert "权限" in str(ctx.bridge.cards[0][2])
+    assert "已开始处理" not in str(ctx.bridge.cards[0][2])
+
+
+@pytest.mark.asyncio
+async def test_attachment_reply_keeps_native_question_pending(ctx, attachment_download):
+    project = await ctx.service.create_project(
+        "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+    interaction = await ctx.service.create_question_interaction(
+        project.id, None, 1, "ACTIVE", "root_agent", "conversation", "single-question",
+        [{"question_id": "style", "kind": "decision", "question": "风格？", "allow_free_text": True, "options": []}],
+        request_item_id="request-style-text",
+    )
+    ctx.service.upsert_card_projection(
+        projection_key=f"question:{interaction.id}", subject_type="question_interaction",
+        subject_id=interaction.id, card_kind="question", provider_message_id="om-question",
+        project_id=project.id, lifecycle_status="pending", resulting_state="waiting_user",
+    )
+    ctx.service.set_execution_status(project.id, "waiting_user")
+    incoming = message("参考这个")
+    incoming.parent_id = "om-question"
+    incoming.attachments = [MessageAttachment("photo", "image", "照片")]
+    await handle_text_message(ctx, incoming)
+
+    assert ctx.service.get_question_interaction(interaction.id).status == "pending"
+    question = ctx.service.get_questions_for_interaction(interaction.id)[0]
+    assert ctx.service.get_question_answer(question.id) is None
+    assert ctx.orchestrator.scheduled == []
+    assert ctx.orchestrator.steered[0][0] == project.id
+    assert attachment_paths(ctx.orchestrator.steered[0][1])[0].read_bytes() == b"photo"
 
 
 @pytest.mark.asyncio
