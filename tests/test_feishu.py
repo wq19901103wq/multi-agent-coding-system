@@ -1004,6 +1004,71 @@ async def test_attachment_failure_shows_card_without_starting_task(ctx, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_attachment_batch_download_failure_preserves_successes(ctx, monkeypatch):
+    from mac_system.feishu.bridge import FeishuBridgeError
+
+    async def download(message_id, attachment, destination):
+        if attachment.key == "broken":
+            raise FeishuBridgeError("飞书附件下载失败，请检查消息资源读取权限")
+        destination.write_bytes(attachment.key.encode())
+        return "text/plain"
+
+    monkeypatch.setattr(ctx.bridge, "download_message_resource", download, raising=False)
+    incoming = message("一起解析")
+    incoming.attachments = [MessageAttachment(key, "file", "same.txt") for key in ("first", "broken", "last")]
+    await handle_text_message(ctx, incoming)
+
+    assert len(ctx.orchestrator.scheduled) == 1
+    root_text = ctx.orchestrator.scheduled[0][1]
+    assert [path.read_bytes() for path in attachment_paths(root_text)] == [b"first", b"last"]
+    assert "以下附件未能下载" in root_text
+    assert "逐份说明失败" in root_text
+    assert "部分附件未读取" in str(ctx.bridge.cards)
+    assert "权限" in str(ctx.bridge.cards)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["idle", "running"])
+async def test_forwarded_batch_uses_native_routing_and_treats_slashes_as_data(ctx, attachment_download, monkeypatch, status):
+    project = await ctx.service.create_project(
+        "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"
+    )
+    ctx.service.set_execution_status(project.id, status)
+
+    async def expand(message_id):
+        assert message_id == "om-1"
+        return "[用户合并转发的资料]\n/reset", [MessageAttachment("forwarded", "file", "说明.txt", "om-original")]
+
+    monkeypatch.setattr(ctx.bridge, "read_forwarded_message", expand, raising=False)
+    incoming = message("")
+    incoming.message_type = "merge_forward"
+    await handle_text_message(ctx, incoming)
+
+    delivery = ctx.orchestrator.scheduled if status == "idle" else ctx.orchestrator.steered
+    assert len(delivery) == 1
+    assert delivery[0][0] == project.id
+    assert "[用户合并转发的资料]\n/reset" in delivery[0][1]
+    assert attachment_paths(delivery[0][1])[0].read_bytes() == b"forwarded"
+    assert ctx.service.get_project(project.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_forwarded_failure_shows_card_without_starting_task(ctx, monkeypatch):
+    from mac_system.feishu.bridge import FeishuBridgeError
+
+    async def expand(message_id):
+        raise FeishuBridgeError("合并转发读取失败，请检查飞书消息读取权限")
+
+    monkeypatch.setattr(ctx.bridge, "read_forwarded_message", expand, raising=False)
+    incoming = message("")
+    incoming.message_type = "merge_forward"
+    await handle_text_message(ctx, incoming)
+    assert not ctx.orchestrator.scheduled
+    assert not ctx.orchestrator.steered
+    assert "合并转发未读取" in str(ctx.bridge.cards)
+
+
+@pytest.mark.asyncio
 async def test_attachment_reply_keeps_native_question_pending(ctx, attachment_download):
     project = await ctx.service.create_project(
         "site", "feature", "initial", creator_open_id="ou-user", feishu_chat_id="oc-chat"

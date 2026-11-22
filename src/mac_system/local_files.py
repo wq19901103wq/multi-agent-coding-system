@@ -212,24 +212,41 @@ def read_local_file(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="只读提取 PDF、Word、Excel 和常见文本文件，输出带位置的 JSON。")
-    parser.add_argument("path", help="本地文件路径（含空格时请加引号）")
+    parser.add_argument("path", nargs="+", help="一个或多个本地文件路径（各自加引号），一次最多 50 个")
     parser.add_argument("--start", type=int, default=1, help="起始页/正文块/行，默认 1")
     parser.add_argument("--limit", type=int, default=50, help="最多读取多少页/正文块/行，默认 50")
-    parser.add_argument("--max-chars", type=int, default=24000, help="正文输出字符上限，默认 24000")
+    parser.add_argument("--max-chars", type=int, default=24000, help="正文总字符上限，默认 24000；批量读取时均分给各文件")
     parser.add_argument("--sheet", help="Excel 工作表名称，默认首个工作表")
     args = parser.parse_args(argv)
-    try:
-        result = read_local_file(args.path, start=args.start, limit=args.limit, max_chars=args.max_chars, sheet=args.sheet)
-    except Exception as exc:
-        # Parser errors can contain document data. Keep unknown failures useful
-        # without printing internal traces or file contents.
-        message = str(exc) if isinstance(exc, LocalFileError) else (
-            f"文件读取失败（{type(exc).__name__}）；请检查权限、文件格式、损坏或加密情况。"
-        )
-        print(json.dumps({"error": message}, ensure_ascii=False), file=sys.stderr)
-        return 1
+    if len(args.path) > 50:
+        parser.error("一次最多读取 50 个文件，请分批读取。")
+    if args.max_chars < len(args.path):
+        parser.error("--max-chars 必须至少等于文件数。")
+    results = []
+    failed = 0
+    for path in args.path:
+        try:
+            result = read_local_file(
+                path, start=args.start, limit=args.limit,
+                max_chars=args.max_chars // len(args.path), sheet=args.sheet,
+            )
+        except Exception as exc:
+            # Parser errors can contain document data. Do not print unknown
+            # failures or let one damaged file prevent reading the others.
+            message = str(exc) if isinstance(exc, LocalFileError) else (
+                f"文件读取失败（{type(exc).__name__}）；请检查权限、文件格式、损坏或加密情况。"
+            )
+            if len(args.path) == 1:
+                print(json.dumps({"error": message}, ensure_ascii=False), file=sys.stderr)
+                return 1
+            result = {"path": path, "error": message}
+            failed += 1
+        results.append(result)
+    result = results[0] if len(args.path) == 1 else {
+        "files": results, "succeeded": len(results) - failed, "failed": failed,
+    }
     print(json.dumps(result, ensure_ascii=False))
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

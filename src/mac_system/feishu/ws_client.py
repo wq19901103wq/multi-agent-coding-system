@@ -1044,7 +1044,8 @@ def _parse_text_message(event: Any) -> TextMessage:
     """Convert a P2ImMessageReceiveV1 event to TextMessage."""
     msg = event.event.message
     content = json.loads(msg.content or "{}")
-    text, attachments = parse_message_content(getattr(msg, "message_type", "text"), content)
+    message_type = getattr(msg, "message_type", "text")
+    text, attachments = parse_message_content(message_type, content)
     sender = event.event.sender
     open_id = ""
     user_id = union_id = None
@@ -1095,6 +1096,7 @@ def _parse_text_message(event: Any) -> TextMessage:
         user_id=user_id,
         union_id=union_id,
         attachments=attachments,
+        message_type=message_type,
     )
 
 

@@ -203,3 +203,67 @@ def test_invalid_read_range_and_sheet_are_rejected(tmp_path):
         read_local_file(path, start=0)
     with pytest.raises(LocalFileError, match="仅适用于 Excel"):
         read_local_file(path, sheet="Sheet1")
+
+
+def test_batch_cli_parses_mixed_documents_and_isolates_damaged_files(tmp_path, capsys):
+    pdf = tmp_path / "报告.pdf"
+    write_pdf(pdf, ["PDF batch content"])
+    word = tmp_path / "说明.docx"
+    document = Document()
+    document.add_paragraph("Word 批量正文")
+    document.save(word)
+    excel = tmp_path / "表格.xlsx"
+    workbook = Workbook()
+    workbook.active.append(["Excel 批量数据", 42])
+    workbook.save(excel)
+    damaged = tmp_path / "损坏.pdf"
+    damaged.write_bytes(b"not a pdf")
+    missing = tmp_path / "missing.docx"
+
+    # A failure in the middle must not hide the later Excel result.
+    assert main([str(pdf), str(word), str(damaged), str(excel), str(missing)]) == 1
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert (result["succeeded"], result["failed"]) == (3, 2)
+    assert "PDF batch content" in result["files"][0]["sections"][0]["text"]
+    assert "Word 批量正文" in result["files"][1]["sections"][0]["text"]
+    assert "Excel 批量数据" in result["files"][3]["sections"][0]["text"]
+    assert result["files"][2]["path"] == str(damaged)
+    assert "error" in result["files"][2]
+    assert "error" in result["files"][4]
+    assert "Traceback" not in captured.err
+
+
+def test_batch_cli_bounds_total_text_and_preserves_per_file_pagination(tmp_path, capsys):
+    paths = [tmp_path / f"{index}.txt" for index in range(3)]
+    for path in paths:
+        path.write_text("abcdef\nsecond line\n")
+    assert main([*(str(path) for path in paths), "--max-chars", "9"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["failed"] == 0
+    assert sum(len(section["text"]) for file in result["files"] for section in file["sections"]) == 9
+    for file in result["files"]:
+        assert file["truncated"] is True
+        assert file["next_start"] == 1
+        assert file["warnings"]
+
+
+def test_batch_cli_sanitizes_parser_failures_and_continues(tmp_path, capsys, monkeypatch):
+    from mac_system import local_files
+
+    actual_read = local_files.read_local_file
+    valid = tmp_path / "valid.txt"
+    valid.write_text("still parsed")
+
+    def read(path, **kwargs):
+        if path == "broken.pdf":
+            raise RuntimeError("private document contents")
+        return actual_read(path, **kwargs)
+
+    monkeypatch.setattr(local_files, "read_local_file", read)
+    assert main(["broken.pdf", str(valid)]) == 1
+    captured = capsys.readouterr()
+    assert "private document contents" not in captured.out + captured.err
+    result = json.loads(captured.out)
+    assert "RuntimeError" in result["files"][0]["error"]
+    assert result["files"][1]["sections"][0]["text"] == "still parsed"

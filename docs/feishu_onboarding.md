@@ -34,6 +34,9 @@ FEISHU_DEFAULT_BOT_ACCOUNT_ID=default
 运行中发送会追加到当前任务。首次发送附件会创建项目。附件按项目保存在
 工作目录的 `.mac/attachments/` 下，同名文件互不覆盖，每个附件最大 30 MB。
 可在发送前后补充处理要求。群聊仍需 @机器人；下载失败会显示原因卡片。
+可以多选文件发送（客户端可能拆成多条消息），或将多份文件合并转发给机器人。
+合并转发按原消息读取文件，最多展开 3 层、50 条消息；超限或不支持的内容会提示。
+PDF、Word、Excel 可以混合发送；同一批中下载失败的文件会逐份提示，其余文件继续处理。
 支持读取 PDF、Word（DOCX/DOC/RTF）、Excel（XLSX/XLSM/XLS）和常见文本文件
 （TXT、CSV、TSV、Markdown、JSON 等）。附件上下文会附上本机读取命令，
 助手通过普通命令工具按需读取，不会预先把整个文件塞进对话。
@@ -43,9 +46,15 @@ FEISHU_DEFAULT_BOT_ACCOUNT_ID=default
 ```bash
 .venv/bin/python -m mac_system.local_files "/本地路径/报告.pdf" --start 1 --limit 5
 .venv/bin/mac-read-file "/本地路径/数据.xlsx" --sheet "销售" --start 1 --limit 50
+.venv/bin/mac-read-file "/本地路径/报告.pdf" "/本地路径/数据.xlsx" "/本地路径/说明.docx"
 ```
 
 输出 JSON 保留页码、正文块或行号，并标记截断与继续位置。
+多个路径会输出 `files` 列表和 `succeeded`、`failed` 数量；单个文件解析失败不影响其他文件，
+有失败时退出码为 1，成功结果仍在标准输出中。一次最多读取 50 个文件，
+`--max-chars` 默认 24000，为整批正文的总字符预算，均分给各文件。
+截断时可按该文件的 `next_start` 单独继续读取；分页参数应用于整批，
+需要不同页码或工作表时请分别运行。单文件命令保留原有输出结构。
 Excel 默认读取首个工作表，同时列出全部工作表；不执行宏、公式或外部链接，
 XLSX/XLSM 保留公式原文，XLS 读取已保存的结果。
 扫描 PDF 没有文字时会提示需要 OCR 或图片工具；加密文件需提供已解密副本。

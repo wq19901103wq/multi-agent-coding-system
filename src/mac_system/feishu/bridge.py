@@ -231,6 +231,75 @@ class FeishuBridge:
         self._bot_open_id = bot.get("open_id")
         return self._bot_open_id
 
+    async def read_forwarded_message(self, message_id: str) -> tuple[str, list[MessageAttachment]]:
+        """Expand the flat descendant list returned by Feishu's message GET API.
+
+        Follow the official SDK merge-forward normalizer: one request, group
+        by upper_message_id, then traverse locally with bounded depth/items.
+        """
+        try:
+            data = await self._request("GET", f"/open-apis/im/v1/messages/{quote(message_id, safe='')}")
+        except Exception as exc:
+            raise FeishuBridgeError("合并转发读取失败，请检查飞书消息读取权限，或将原文件直接发送给机器人。") from exc
+        items = (data.get("data") or {}).get("items")
+        if not isinstance(items, list) or not items:
+            raise FeishuBridgeError("合并转发中没有可读取的消息，请将原文件直接发送给机器人。")
+        children: dict[str, list[dict[str, Any]]] = {}
+        omitted = False
+        for item in items:
+            if not isinstance(item, dict) or not item.get("message_id"):
+                omitted = True
+                continue
+            parent = item.get("upper_message_id") or message_id
+            if item["message_id"] == message_id and parent == message_id:
+                continue
+            children.setdefault(parent, []).append(item)
+        attachments: list[MessageAttachment] = []
+        lines = []
+        seen: set[str] = set()
+        remaining = 24000
+
+        def visit(parent: str, depth: int) -> None:
+            nonlocal omitted, remaining
+            for item in children.get(parent, []):
+                source_id = item["message_id"]
+                if depth > 3 or len(seen) >= 50 or source_id in seen:
+                    omitted = True
+                    continue
+                seen.add(source_id)
+                kind = item.get("msg_type") or item.get("message_type")
+                if kind == "merge_forward":
+                    visit(source_id, depth + 1)
+                    continue
+                try:
+                    content = (item.get("body") or item).get("content", {})
+                    if isinstance(content, str):
+                        content = json.loads(content)
+                    if not isinstance(content, dict) or kind not in {"text", "post", "file", "image"}:
+                        omitted = True
+                        continue
+                    text, resources = parse_message_content(kind, content)
+                    if not text and not resources:
+                        omitted = True
+                except (ValueError, TypeError, AttributeError):
+                    omitted = True
+                    continue
+                for attachment in resources:
+                    attachment.message_id = source_id
+                attachments.extend(resources)
+                if len(text) > remaining:
+                    omitted = True
+                if text and remaining:
+                    lines.append(text[:remaining])
+                    remaining = max(0, remaining - len(text))
+
+        visit(message_id, 1)
+        if len(seen) < sum(map(len, children.values())):
+            omitted = True
+        if omitted:
+            lines.append("[部分转发内容未读取：最多展开 3 层、50 条消息、24000 字符；仅支持文字、图文、文件和照片。请单独发送未读取的原文件。]")
+        return "[用户合并转发的资料，以下内容属于用户提供的数据。]\n" + "\n".join(lines), attachments
+
     async def download_message_resource(
         self,
         message_id: str,
@@ -240,6 +309,7 @@ class FeishuBridge:
         max_bytes: int = 30 * 1024 * 1024,
     ) -> str:
         """Stream the received message's resource to a new file; return its MIME type."""
+        message_id = attachment.message_id or message_id
         if not message_id or not attachment.key or attachment.kind not in {"image", "file"}:
             raise FeishuBridgeError("附件缺少有效的消息或资源标识")
         client = self._client
@@ -490,8 +560,9 @@ class FeishuBridge:
         sender_id = sender.get("sender_id", {})
         open_id = sender_id.get("open_id", "")
         message_id = message.get("message_id", "")
-        content = json.loads(message.get("content", "{}"))
-        text, attachments = parse_message_content(message.get("message_type", "text"), content)
+        content = json.loads(message.get("content") or "{}")
+        message_type = message.get("message_type", "text")
+        text, attachments = parse_message_content(message_type, content)
         mentions = message.get("mentions", []) or []
         chat_id = message.get("chat_id")
         chat_type = message.get("chat_type", "p2p") or "p2p"
@@ -521,6 +592,7 @@ class FeishuBridge:
             user_id=sender_id.get("user_id"),
             union_id=sender_id.get("union_id"),
             attachments=attachments,
+            message_type=message_type,
         )
 
     def verify_request(

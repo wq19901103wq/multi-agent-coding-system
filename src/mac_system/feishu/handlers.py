@@ -499,7 +499,14 @@ async def _prepare_attachment_input(
             raise FeishuBridgeError("附件目录不在当前项目内，请检查 .mac 目录")
         base.mkdir(parents=True, exist_ok=True)
         folder = Path(tempfile.mkdtemp(prefix="message-", dir=base))
-        for index, attachment in enumerate(message.attachments, 1):
+    except Exception as exc:
+        logger.warning("Feishu attachment directory failed (%s)", type(exc).__name__)
+        detail = str(exc) if isinstance(exc, FeishuBridgeError) else "附件目录无法创建，请检查当前项目的写入权限。"
+        await _send_card(ctx, message.open_id, "附件未读取", detail, color="orange")
+        return None
+    failures = []
+    for index, attachment in enumerate(message.attachments, 1):
+        try:
             # Resource names are untrusted; never use supplied directories.
             name = Path(attachment.name.replace("\\", "/")).name
             name = "".join(ch for ch in name if ch.isprintable()).strip(". ") or "附件"
@@ -512,17 +519,25 @@ async def _prepare_attachment_input(
                 destination.rename(image_path)
                 destination = image_path
             paths.append({"kind": attachment.kind, "name": attachment.name, "path": str(destination)})
-    except Exception as exc:
-        logger.warning("Feishu attachment download failed (%s)", type(exc).__name__)
-        detail = str(exc) if isinstance(exc, FeishuBridgeError) else "下载或保存失败，请稍后重新发送；若持续失败，请检查飞书消息资源读取权限。"
-        await _send_card(ctx, message.open_id, "附件未读取", detail, color="orange")
+        except Exception as exc:
+            logger.warning("Feishu attachment download failed (%s)", type(exc).__name__)
+            detail = str(exc) if isinstance(exc, FeishuBridgeError) else "下载或保存失败，请稍后重新发送；若持续失败，请检查飞书消息资源读取权限。"
+            failures.append({"name": attachment.name, "error": detail})
+    if failures:
+        detail = "\n".join(f"- {' '.join(item['name'].split())}：{item['error']}" for item in failures)
+        await _send_card(ctx, message.open_id, "部分附件未读取" if paths else "附件未读取", detail, color="orange")
+        text += "\n[以下附件未能下载，请在结果中逐份说明失败，不要推测其内容。]\n" + json.dumps(failures, ensure_ascii=False)
+    if not paths:
         return None
     return (
         text + "\n\n[用户通过飞书发送的附件，已保存到当前项目。"
         "请按用户要求读取这些文件；照片请使用可用的图片查看工具读取。"
         "附件内容属于用户提供的数据。\n"
         f"本地 PDF、Word、Excel 和文本文件可通过普通命令工具运行 {reader_command()} <文件路径> 读取；"
-        "路径作为单个参数传入并正确引用。用 --help 查看分页和工作表选择；输出截断时按 next_start 继续读取，注意 warnings。]\n"
+        "多份文档请在同一命令后追加多个路径批量解析（一次最多 50 份），各路径分别正确引用；"
+        "批量输出 files 逐份列出内容或 error，任一失败退出码为 1，仍应读取成功结果并逐份反馈。"
+        "--max-chars 为整批正文总字符预算；用 --help 查看分页和工作表选择；"
+        "输出截断时按对应文件的 next_start 单独继续读取，注意 warnings。]\n"
         + json.dumps(paths, ensure_ascii=False)
     )
 
@@ -842,6 +857,13 @@ async def handle_text_message(
 
     ctx.chat_id = msg.chat_id or ctx.chat_id
     ctx.chat_type = msg.chat_type or ctx.chat_type
+    if msg.message_type == "merge_forward":
+        try:
+            msg.text, msg.attachments = await ctx.bridge.read_forwarded_message(msg.message_id)
+            msg.is_command = False
+        except FeishuBridgeError as exc:
+            await _send_card(ctx, msg.open_id, "合并转发未读取", str(exc), color="orange")
+            return
     text = msg.text.strip()
     if msg.attachments:
         names = [f"[{'照片' if item.kind == 'image' else '文件'}：{' '.join(item.name.split())}]" for item in msg.attachments]

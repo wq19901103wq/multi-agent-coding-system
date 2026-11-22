@@ -17,6 +17,7 @@ from mac_system.feishu.ws_client import _parse_text_message
     ("post", {"title": "看看图片", "content": [[{"tag": "text", "text": "描述"}, {"tag": "img", "image_key": "img-1"}], [{"tag": "img", "image_key": "img-2"}]]}, "看看图片\n描述", [("img-1", "image", "照片"), ("img-2", "image", "照片")]),
     ("post", {"zh_cn": {"content": [[{"tag": "text", "text": "@_user_1 阅读"}, {"tag": "img", "image_key": "img-1"}]]}}, "阅读", [("img-1", "image", "照片")]),
     ("text", {"text": "原始问题"}, "原始问题", []),
+    ("merge_forward", {}, "", []),
 ])
 @pytest.mark.asyncio
 async def test_http_and_sdk_parse_the_same_attachments(kind, content, expected_text, expected):
@@ -35,6 +36,7 @@ async def test_http_and_sdk_parse_the_same_attachments(kind, content, expected_t
             assert parsed.open_id == "ou-user"
             assert parsed.user_id == "user-1"
             assert parsed.parent_id == "om-card"
+            assert parsed.message_type == kind
     finally:
         await bridge.close()
 
@@ -149,3 +151,107 @@ async def test_document_attachment_provides_a_working_native_read_command(tmp_pa
     assert "飞书文档正文" in result["sections"][0]["text"]
     assert result["truncated"] is False
     assert result["path"].startswith(str(workspace / ".mac" / "attachments" / "project-1"))
+
+
+def forwarded_item(message_id, kind, content, parent="om-forward"):
+    return {"message_id": message_id, "upper_message_id": parent, "msg_type": kind,
+            "body": {"content": json.dumps(content)}}
+
+
+@pytest.mark.asyncio
+async def test_forwarded_batch_downloads_and_parses_real_documents(tmp_path):
+    from docx import Document
+    from openpyxl import Workbook
+    from pypdf import PdfWriter
+    from mac_system.feishu.handlers import _prepare_attachment_input
+
+    pdf = tmp_path / "report.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.write(pdf)
+    word = tmp_path / "requirements.docx"
+    document = Document()
+    document.add_paragraph("批量 Word 正文")
+    document.save(word)
+    excel = tmp_path / "data.xlsx"
+    workbook = Workbook()
+    workbook.active.append(["批量 Excel 数据", 42])
+    workbook.save(excel)
+    sources = {"om-pdf": pdf, "om-word": word, "om-excel": excel}
+    items = [
+        {"message_id": "om-forward", "msg_type": "merge_forward"},
+        forwarded_item("om-text", "text", {"text": "读取这三份文件"}),
+        forwarded_item("om-pdf", "file", {"file_key": "key-pdf", "file_name": "报告.pdf"}),
+        forwarded_item("om-nested", "merge_forward", {}),
+        forwarded_item("om-word", "file", {"file_key": "key-word", "file_name": "需求.docx"}, "om-nested"),
+        forwarded_item("om-excel", "file", {"file_key": "key-excel", "file_name": "数据.xlsx"}),
+    ]
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        if request.url.path == "/open-apis/im/v1/messages/om-forward":
+            return httpx.Response(200, json={"code": 0, "data": {"items": items}})
+        source_id = request.url.path.split("/")[5]
+        assert request.url.path.endswith("/resources/key-" + source_id.removeprefix("om-"))
+        assert request.url.params["type"] == "file"
+        return httpx.Response(200, content=sources[source_id].read_bytes())
+
+    bridge = await resource_bridge(handler)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    try:
+        text, attachments = await bridge.read_forwarded_message("om-forward")
+        assert "读取这三份文件" in text
+        assert [item.message_id for item in attachments] == ["om-pdf", "om-word", "om-excel"]
+        root_text = await _prepare_attachment_input(
+            SimpleNamespace(bridge=bridge), SimpleNamespace(id="project-1", workspace_path=str(workspace)),
+            SimpleNamespace(message_id="om-forward", attachments=attachments), text,
+        )
+        saved = json.loads(root_text.rsplit("\n", 1)[1])
+        command = root_text.split("普通命令工具运行 ", 1)[1].split(" <文件路径>", 1)[0]
+        process = subprocess.run(shlex.split(command) + [item["path"] for item in saved],
+                                 cwd=workspace, capture_output=True, text=True)
+        assert process.returncode == 0, process.stderr
+        result = json.loads(process.stdout)
+        assert (result["succeeded"], result["failed"]) == (3, 0)
+        assert result["files"][0]["format"] == "pdf"
+        assert result["files"][0]["warnings"]  # Blank PDF must not pretend to contain text.
+        assert "批量 Word 正文" in result["files"][1]["sections"][0]["text"]
+        assert "批量 Excel 数据" in result["files"][2]["sections"][0]["text"]
+        assert len(requests) == 4  # One expansion fetch, three original-message downloads.
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["count", "depth", "malformed"])
+async def test_forwarded_omissions_are_bounded_and_visible(case):
+    if case == "count":
+        items = [forwarded_item(f"om-{i}", "file", {"file_key": f"key-{i}", "file_name": "same.pdf"}) for i in range(55)]
+    elif case == "depth":
+        items = [forwarded_item("om-1", "merge_forward", {}),
+                 forwarded_item("om-2", "merge_forward", {}, "om-1"),
+                 forwarded_item("om-3", "merge_forward", {}, "om-2"),
+                 forwarded_item("om-4", "file", {"file_key": "deep", "file_name": "deep.pdf"}, "om-3")]
+    else:
+        items = [forwarded_item("om-bad", "file", []), forwarded_item("om-audio", "audio", {}),
+                 {"message_id": "om-json", "body": {"content": "not json"}, "msg_type": "file"}]
+    bridge = await resource_bridge(lambda request: httpx.Response(200, json={"code": 0, "data": {"items": items}}))
+    try:
+        text, attachments = await bridge.read_forwarded_message("om-forward")
+        assert "部分转发内容未读取" in text
+        assert len(attachments) == (50 if case == "count" else 0)
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_forwarded_permission_failure_does_not_expose_api_body():
+    bridge = await resource_bridge(lambda request: httpx.Response(200, json={"code": 123, "msg": "private details"}))
+    try:
+        with pytest.raises(FeishuBridgeError, match="消息读取权限") as error:
+            await bridge.read_forwarded_message("om-forward")
+        assert "private details" not in str(error.value)
+    finally:
+        await bridge.close()

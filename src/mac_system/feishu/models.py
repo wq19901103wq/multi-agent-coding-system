@@ -39,6 +39,7 @@ class MessageAttachment:
     key: str
     kind: str
     name: str
+    message_id: str | None = None
 
 
 @dataclass
@@ -59,3 +60,4 @@ class TextMessage:
     user_id: str | None = None
     union_id: str | None = None
     attachments: list[MessageAttachment] = field(default_factory=list)
+    message_type: str = "text"
