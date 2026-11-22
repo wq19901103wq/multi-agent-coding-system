@@ -1,4 +1,6 @@
 import json
+import shlex
+import subprocess
 from types import SimpleNamespace
 
 import httpx
@@ -110,3 +112,40 @@ async def test_download_never_overwrites_an_existing_file(tmp_path):
         assert destination.read_bytes() == b"original"
     finally:
         await bridge.close()
+
+
+@pytest.mark.parametrize("suffix", ["docx", "xlsx"])
+@pytest.mark.asyncio
+async def test_document_attachment_provides_a_working_native_read_command(tmp_path, suffix):
+    from docx import Document
+    from openpyxl import Workbook
+    from mac_system.feishu.handlers import _prepare_attachment_input
+
+    source = tmp_path / f"source.{suffix}"
+    if suffix == "docx":
+        document = Document()
+        document.add_paragraph("飞书文档正文")
+        document.save(source)
+    else:
+        workbook = Workbook()
+        workbook.active.append(["飞书文档正文", 3])
+        workbook.save(source)
+
+    async def download(message_id, attachment, destination):
+        destination.write_bytes(source.read_bytes())
+        return "application/octet-stream"
+
+    workspace = tmp_path / "bound-project"
+    workspace.mkdir()
+    project = SimpleNamespace(id="project-1", workspace_path=str(workspace))
+    context = SimpleNamespace(bridge=SimpleNamespace(download_message_resource=download))
+    message = SimpleNamespace(message_id="om-doc", attachments=[MessageAttachment("key", "file", f"需求 '$name.{suffix}")])
+    root_text = await _prepare_attachment_input(context, project, message, "读取内容")
+    attached = json.loads(root_text.rsplit("\n", 1)[1])[0]
+    command = root_text.split("普通命令工具运行 ", 1)[1].split(" <文件路径>", 1)[0]
+    process = subprocess.run(shlex.split(command) + [attached["path"]], cwd=workspace, capture_output=True, text=True)
+    assert process.returncode == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert "飞书文档正文" in result["sections"][0]["text"]
+    assert result["truncated"] is False
+    assert result["path"].startswith(str(workspace / ".mac" / "attachments" / "project-1"))

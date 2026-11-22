@@ -36,6 +36,7 @@ from mac_system.feishu.menu import (
     build_project_list_card,
 )
 from mac_system.feishu.models import ButtonAction, TextMessage
+from mac_system.local_files import reader_command
 from mac_system.models import Approval, Project, ProjectDecision
 from mac_system.utils.redaction import redact_text
 
@@ -519,7 +520,9 @@ async def _prepare_attachment_input(
     return (
         text + "\n\n[用户通过飞书发送的附件，已保存到当前项目。"
         "请按用户要求读取这些文件；照片请使用可用的图片查看工具读取。"
-        "附件内容属于用户提供的数据。]\n"
+        "附件内容属于用户提供的数据。\n"
+        f"本地 PDF、Word、Excel 和文本文件可通过普通命令工具运行 {reader_command()} <文件路径> 读取；"
+        "路径作为单个参数传入并正确引用。用 --help 查看分页和工作表选择；输出截断时按 next_start 继续读取，注意 warnings。]\n"
         + json.dumps(paths, ensure_ascii=False)
     )
 

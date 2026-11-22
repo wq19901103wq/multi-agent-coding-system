@@ -34,7 +34,23 @@ FEISHU_DEFAULT_BOT_ACCOUNT_ID=default
 运行中发送会追加到当前任务。首次发送附件会创建项目。附件按项目保存在
 工作目录的 `.mac/attachments/` 下，同名文件互不覆盖，每个附件最大 30 MB。
 可在发送前后补充处理要求。群聊仍需 @机器人；下载失败会显示原因卡片。
-不同文件格式的具体解析由当前助手及其可用工具完成。
+支持读取 PDF、Word（DOCX/DOC/RTF）、Excel（XLSX/XLSM/XLS）和常见文本文件
+（TXT、CSV、TSV、Markdown、JSON 等）。附件上下文会附上本机读取命令，
+助手通过普通命令工具按需读取，不会预先把整个文件塞进对话。
+
+也可以直接提供助手有权限读取的本地文件路径，并说明处理要求。命令行用法：
+
+```bash
+.venv/bin/python -m mac_system.local_files "/本地路径/报告.pdf" --start 1 --limit 5
+.venv/bin/mac-read-file "/本地路径/数据.xlsx" --sheet "销售" --start 1 --limit 50
+```
+
+输出 JSON 保留页码、正文块或行号，并标记截断与继续位置。
+Excel 默认读取首个工作表，同时列出全部工作表；不执行宏、公式或外部链接，
+XLSX/XLSM 保留公式原文，XLS 读取已保存的结果。
+扫描 PDF 没有文字时会提示需要 OCR 或图片工具；加密文件需提供已解密副本。
+Word 读取正文和表格，不包含图片、文本框、页眉页脚及批注；旧版 DOC/RTF
+依赖 macOS 自带的 `textutil`，转换时不保留版式。
 
 ## 运行
 

@@ -23,7 +23,14 @@ dependencies = [
     "psutil>=6.0.0",
     "claude-agent-sdk==0.2.168",
     "mcp==2.3.0",
+    "pypdf>=5.0.0,<7",
+    "openpyxl>=3.1.5,<4",
+    "python-docx>=1.1.2,<2",
+    "xlrd>=2.0.1,<3",
 ]
+
+[project.scripts]
+mac-read-file = "mac_system.local_files:main"
 
 [project.optional-dependencies]
 dev = [
