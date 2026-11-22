@@ -43,7 +43,8 @@ def parse_message_content(message_type: str, content: dict[str, Any]) -> tuple[s
     elif message_type == "post":
         # Events normally contain a single post; tolerate localized payloads.
         post = content if "content" in content else next(
-            (value for value in content.values() if isinstance(value, dict) and "content" in value), {}
+            (value for value in content.values() if isinstance(value, dict) and ("content" in value or "files" in value)),
+            content,
         )
         lines = [str(post.get("title") or "")]
         for row in post.get("content", []):
@@ -55,6 +56,17 @@ def parse_message_content(message_type: str, content: dict[str, Any]) -> tuple[s
                     attachments.append(MessageAttachment(str(item["image_key"]), "image", "照片"))
             lines.append("".join(parts))
         text = "\n".join(line for line in lines if line)
+        # Feishu can send an attachment-only post with an empty rich-text body.
+        files = content.get("files", post.get("files"))
+        if isinstance(files, list):
+            for file in files:
+                if not isinstance(file, dict) or file.get("is_folder"):
+                    continue
+                key = file.get("file_key")
+                if not isinstance(key, str) or not key.strip():
+                    continue
+                name = file.get("file_name")
+                attachments.append(MessageAttachment(key, "file", name if isinstance(name, str) and name.strip() else "文件"))
     return _strip_mention_placeholders(text), attachments
 
 

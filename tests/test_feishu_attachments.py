@@ -16,6 +16,24 @@ from mac_system.feishu.ws_client import _parse_text_message
     ("image", {"image_key": "image-key"}, "", [("image-key", "image", "照片")]),
     ("post", {"title": "看看图片", "content": [[{"tag": "text", "text": "描述"}, {"tag": "img", "image_key": "img-1"}], [{"tag": "img", "image_key": "img-2"}]]}, "看看图片\n描述", [("img-1", "image", "照片"), ("img-2", "image", "照片")]),
     ("post", {"zh_cn": {"content": [[{"tag": "text", "text": "@_user_1 阅读"}, {"tag": "img", "image_key": "img-1"}]]}}, "阅读", [("img-1", "image", "照片")]),
+    (
+        "post",
+        {"title": "", "content": [[]], "content_v2": [[]], "files": [
+            {"file_key": "pdf-1", "file_name": "报告一.pdf", "is_folder": False},
+            {"file_key": "folder-1", "file_name": "目录", "is_folder": True},
+            {"file_key": "pdf-2", "file_name": "报告二.pdf", "is_folder": False},
+            {"file_key": " "}, {"file_key": 42}, {"file_name": "缺少标识.pdf"}, None,
+        ]},
+        "",
+        [("pdf-1", "file", "报告一.pdf"), ("pdf-2", "file", "报告二.pdf")],
+    ),
+    (
+        "post",
+        {"zh_cn": {"content": [[{"tag": "img", "image_key": "img-1"}]],
+                   "files": [{"file_key": "doc-1", "file_name": "需求.docx"}]}},
+        "",
+        [("img-1", "image", "照片"), ("doc-1", "file", "需求.docx")],
+    ),
     ("text", {"text": "原始问题"}, "原始问题", []),
     ("merge_forward", {}, "", []),
 ])
